@@ -4,6 +4,12 @@ Side-channel attacks are a subtle yet powerful class of vulnerabilities, where a
 
 In this guide, we'll explore how to use instruction-level execution tracing on small Rust or WebAssembly programs to detect potential timing side-channels. By running the program with different inputs and comparing the resulting execution traces, we can verify whether the program truly behaves independently of secret values, ensuring robust protection against side-channel attacks.
 
+## Documentation
+
+* [`docs/MILESTONE-01.md`](docs/MILESTONE-01.md) — planned Milestone 01: a reproducible, automated
+  trace comparison tool built around a MAC authentication-tag comparison example, using WABT's
+  `wasm-interp` as the tracing backend.
+
 ## Project Setup
 
 ### Prerequisites
