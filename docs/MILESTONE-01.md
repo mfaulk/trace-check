@@ -1,6 +1,6 @@
 # Milestone 01 — Reproducible side-channel trace comparison
 
-**Status:** Planned  
+**Status:** Implemented — see [Implementation status](#implementation-status)  
 **Target branch:** `main`  
 **Primary backend:** WebAssembly, using WABT `wasm-interp`  
 **Primary example:** MAC authentication-tag comparison
@@ -15,7 +15,9 @@ This milestone is a **vertical slice**, not a general constant-time verification
 
 On a pinned Linux toolchain, `cargo run -p trace-check -- demo mac-compare` builds the WASM example, runs paired secret inputs, detects the expected control-flow difference in the vulnerable verifier, reports no control-flow difference for the chosen `subtle`-based comparison cases, and produces a reproducible report.
 
-The command is a **proposed interface**, not functionality that exists yet.
+This command now exists and reproduces the controls; see
+[Implementation status](#implementation-status) for where the observed results
+differed from the predictions below.
 
 ## Baseline
 
@@ -307,3 +309,59 @@ This boundary is central to the project and must be explicit in the CLI, JSON re
 - [WebAssembly Binary Toolkit (WABT)](https://github.com/WebAssembly/wabt) — interpreter and tracing tools.
 - [WABT interpreter CLI](https://github.com/WebAssembly/wabt/blob/main/src/tools/wasm-interp.cc) — `--trace`, `--run-export`, and `--argument` handling.
 - [Rust `subtle` crate](https://docs.rs/subtle/latest/subtle/) — constant-time-oriented comparison primitives and their compiler/platform caveats.
+
+## Implementation status
+
+Delivered. `cargo run -p trace-check -- demo mac-compare` builds the example,
+runs every variant and case, and reproduces all eight declared expectations.
+Where the implementation differs from the plan above, this is what changed and
+why.
+
+### The feasibility gate passed, with one prediction invalidated
+
+WABT 1.0.42's `--trace` emits stable executed instruction locations in the form
+`#<call_depth>. <istream_offset>: V:<stack> | <opcode> <operands>`, followed by
+a result line `export(args) => i32:V`. Call depth and instruction-stream offset
+became the comparison key; operands and value-stack depth are discarded.
+
+The plan's **expected observation** for the vulnerable comparator did not hold.
+At `opt-level = 3`, `verify_early_exit` is vectorized into a branchless
+`i64.xor`/`i64.or` tree with a final `i64.eqz` — no branch survives, and its
+normalized path is identical for early and late mismatch. Per the plan's own
+Risk 1 mitigation, the artifact was inspected and the actual result reported
+rather than the expectation hard-coded.
+
+A third variant, `early_exit_opaque`, was therefore added: the same loop with
+per-byte `read_volatile` loads, which the vectorizer cannot coalesce. It retains
+the secret-dependent branch and is what demonstrates the vulnerability, with
+executed work growing 6 instructions per compared byte (104 / 152 / 200 / 248 /
+289 events for mismatches at bytes 0 / 8 / 16 / 24 / 31). The naive variant is
+kept deliberately: the fixture declares `NO_DIFFERENCE_OBSERVED` for it, which
+records the compiler erasure as a finding.
+
+`subtle::ConstantTimeEq` behaved as predicted — a flat 1138 events regardless of
+mismatch position — and is a working negative control.
+
+### Other deviations from the plan
+
+* **Tests live in `crates/trace-check/tests/`**, not a workspace-root `tests/`,
+  because integration tests belong to the crate under Cargo's layout.
+* **Six cases, not five.** A `MATCH` case was added so the accept decision is
+  exercised for every variant, per the verification matrix row "Both
+  implementations, exactly matching tags".
+* **An extra `capture` subcommand** writes a single raw trace. The plan called
+  for opt-in raw capture; a subcommand was the simplest way to expose it, and it
+  is also how the checked-in parser fixtures were produced.
+* **`examples/mac-compare` is a dual-target crate** (`cdylib` + `rlib`). The
+  `rlib` lets the host test suite verify that all three verifiers agree on every
+  authentication decision without involving the interpreter.
+* **An empty-output guard was added** beyond the planned failure modes. WABT
+  1.0.42 exits 0 and prints nothing for an unknown export, which would otherwise
+  have read as an equivalent trace — a false pass.
+
+### Definition of done
+
+All items are met, with one clarification: "the vulnerable comparator
+demonstrably produces different executed instruction paths" is satisfied by
+`early_exit_opaque`. The naive `early_exit` comparator provably does *not*, and
+reporting that is part of the result.
