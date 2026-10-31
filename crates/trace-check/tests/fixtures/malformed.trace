@@ -1,0 +1,4 @@
+>>> running export "verify_early_exit_opaque_export":
+#0. 1368: V:8  | alloca 2
+!! interpreter emitted something unexpected
+verify_early_exit_opaque_export(i64:1) => i32:0
