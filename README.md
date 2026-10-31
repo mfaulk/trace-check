@@ -1,55 +1,176 @@
-# Detecting Side-Channel Vulnerabilities with Execution Traces
+# trace-check — detecting secret-dependent execution paths with execution traces
 
-Side-channel attacks are a subtle yet powerful class of vulnerabilities, where an attacker can infer secret information from indirect signals such as timing differences, power consumption, or electromagnetic radiation emitted during program execution. One of the most common forms is a timing side-channel, where variations in how long a computation takes—depending on secret inputs like cryptographic keys—can expose sensitive information to an attacker. This makes it critical that cryptographic software operates in "constant time," meaning its execution path, memory accesses, and runtime should not depend on secret inputs.
+A timing side channel exists when the work a program does depends on a secret.
+The classic example is an authentication-tag comparison that stops at the first
+differing byte: how long it runs tells an attacker how much of their guess was
+correct.
 
-In this guide, we'll explore how to use instruction-level execution tracing on small Rust or WebAssembly programs to detect potential timing side-channels. By running the program with different inputs and comparing the resulting execution traces, we can verify whether the program truly behaves independently of secret values, ensuring robust protection against side-channel attacks.
+`trace-check` turns that idea into a reproducible experiment. It builds a small
+WebAssembly module, runs it under WABT's interpreter with paired inputs that
+differ **only** in a modeled secret, reduces each raw trace to an ordered
+sequence of executed instruction locations, and reports where the two paths
+diverge.
 
-## Documentation
-
-* [`docs/MILESTONE-01.md`](docs/MILESTONE-01.md) — planned Milestone 01: a reproducible, automated
-  trace comparison tool built around a MAC authentication-tag comparison example, using WABT's
-  `wasm-interp` as the tracing backend.
-
-## Project Setup
-
-### Prerequisites
-
-* Rust: [Install Rust](https://rustup.rs)
-* WebAssembly target: `rustup target add wasm32-wasi`
-* Valgrind: `sudo apt-get install valgrind`
-* WABT (WebAssembly Binary Toolkit): [Installation Instructions](https://github.com/WebAssembly/wabt)
-
-### Compiling the Rust Example
+One command runs the whole thing:
 
 ```sh
-cargo build
+cargo run -p trace-check -- demo mac-compare
 ```
 
-### Compiling to WebAssembly
+## What it actually shows — and what it does not
+
+The property analyzed is **instruction-path equivalence**: whether two runs
+execute the same ordered sequence of instruction locations. That is a real,
+checkable property, and it is much narrower than "constant time".
+
+Results are reported as one of three outcomes:
+
+| Outcome | Meaning |
+| --- | --- |
+| `DIFFERENCE_DETECTED` | The instruction path changed when only the secret changed. Evidence of secret-dependent behavior. |
+| `NO_DIFFERENCE_OBSERVED` | Paths matched **for the tested inputs**. Not proof of constant-time security. |
+| `INCONCLUSIVE` | Capture, parsing, nondeterminism, or a confounded decision prevented a trustworthy answer. |
+
+See [docs/limitations.md](docs/limitations.md) for the full boundary, and
+[docs/methodology.md](docs/methodology.md) for the threat model and procedure.
+
+## The example and its result
+
+`examples/mac-compare` exports three verifiers that compare a 32-byte expected
+tag (the modeled secret) against a fixed public supplied tag. All three agree on
+every authentication decision, so a trace difference cannot be explained by one
+of them accepting where another rejects.
+
+| Variant | Implementation | Observed result |
+| --- | --- | --- |
+| `early_exit` | naive per-byte loop with `return false` | **no path difference** — LLVM vectorizes it into a branchless XOR/OR tree at `opt-level = 3` |
+| `early_exit_opaque` | same loop, per-byte `read_volatile` loads | **path difference** — the branch survives; executed work grows by 6 instructions per compared byte |
+| `constant_time` | `subtle::ConstantTimeEq` | **no path difference** — flat at 1138 events regardless of mismatch position |
+
+The `early_exit` row is the point of keeping it. A secret-dependent `if` in
+Rust source is *not* evidence of a secret-dependent branch in the compiled
+module, and the tool reports what the artifact does rather than what the source
+suggests. Each expectation is declared in
+[`examples/mac-compare/cases.json`](examples/mac-compare/cases.json), so a
+compiler change that invalidates a prediction surfaces as an unmet expectation
+instead of being silently absorbed.
+
+Observed event counts for `early_exit_opaque`, by mismatch position:
+
+| Mismatch at byte | 0 | 8 | 16 | 24 | 31 |
+| --- | --- | --- | --- | --- | --- |
+| Instructions executed | 104 | 152 | 200 | 248 | 289 |
+
+## Prerequisites
+
+* **Rust** — pinned by [`rust-toolchain.toml`](rust-toolchain.toml) (1.97.0 plus
+  the `wasm32-unknown-unknown` target). `rustup` installs both automatically.
+* **WABT 1.0.42** — the trace grammar and instruction offsets are specific to
+  this release, so the version is checked at startup:
+
+  ```sh
+  curl -fsSLO https://github.com/WebAssembly/wabt/releases/download/1.0.42/wabt-1.0.42-linux-x64.tar.gz
+  echo "84895407a6bbb80e918f33b16b2fb2206021c150b6bc9ff6f761263a745ab131  wabt-1.0.42-linux-x64.tar.gz" | sha256sum --check
+  tar -xzf wabt-1.0.42-linux-x64.tar.gz -C ~/.local/share
+  export PATH="$HOME/.local/share/wabt-1.0.42/bin:$PATH"
+  ```
+
+  Pass `--allow-wabt-version-mismatch` to run against another version; results
+  are then not comparable to recorded ones.
+
+## Commands
+
+### `demo` — build, run and compare an example end to end
 
 ```sh
-cargo build --target wasm32-wasi
+cargo run -p trace-check -- demo mac-compare
+cargo run -p trace-check -- demo mac-compare --format json > report.json
 ```
 
-### Creating Execution Traces
+Builds the example as optimized WASM, executes every variant and case **twice**
+to confirm the normalized trace is reproducible, checks every authentication
+decision against the fixture, then runs the declared comparisons.
 
-#### Rust Binary Trace
+Options: `--format text|json`, `--workspace-root PATH`, `--timeout-secs N`,
+`--max-output-bytes N`, `--allow-wabt-version-mismatch`.
+
+### `compare` — analyze two stored traces
 
 ```sh
-valgrind --tool=lackey --trace-mem=yes --trace-superblocks=yes \
-    ./target/debug/ai-const-time input_value 2> trace.log
+cargo run -p trace-check -- compare a.trace b.trace
 ```
 
-#### WebAssembly Trace
+Compares previously captured raw traces without rebuilding or rerunning.
+Determinism cannot be established from stored files, so the output says so.
+
+### `capture` — write one raw trace
 
 ```sh
-wasm-interp ./target/wasm32-wasi/debug/ai-const-time.wasm --run-all-exports --trace > wasm_trace.log
+cargo run -p trace-check -- capture mac-compare \
+  --variant early_exit_opaque --case A --out byte0.trace
 ```
 
-### Evaluating Execution Traces
+Opt-in debugging aid. Raw traces embed the case input values, including the
+modeled secret, and are git-ignored except for the compact fixtures under
+`crates/trace-check/tests/fixtures/`.
+
+### Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | `demo`: every declared expectation reproduced. `compare`: `NO_DIFFERENCE_OBSERVED`. |
+| `1` | `demo`: an expectation was not reproduced. `compare`: `DIFFERENCE_DETECTED`. |
+| `2` | Error or `INCONCLUSIVE`: missing backend, build failure, timeout, trap, unparseable trace. |
+
+A missing tool, a trap, a timeout, an oversized capture, an unknown export, a
+truncated trace, or a wrong authentication decision is always an explicit
+failure — never a silent pass.
+
+## Repository layout
+
+```text
+Cargo.toml                       workspace and the pinned release profile
+rust-toolchain.toml              pinned Rust channel and wasm32 target
+crates/trace-check/
+  src/main.rs                    CLI: demo, compare, capture
+  src/lib.rs                     end-to-end pipeline
+  src/experiment.rs              cases.json loading and validation
+  src/runner.rs                  WASM build, bounded wasm-interp execution
+  src/parser.rs                  wasm-interp --trace grammar -> ExecutionEvent
+  src/compare.rs                 differential analysis and outcomes
+  src/report.rs                  text and versioned JSON reporting
+  tests/integration.rs           fixture and end-to-end tests
+  tests/fixtures/                compact captured traces
+examples/mac-compare/            the traced example and its cases.json
+examples/legacy-branch-demo/     original proof of concept, kept for context
+docs/                            milestone plan, methodology, limitations
+.github/workflows/ci.yml         pinned Linux CI
+```
+
+## Development
 
 ```sh
-diff trace_input1.log trace_input2.log
+cargo test --workspace                    # 54 tests; end-to-end tests skip without WABT
+TRACE_CHECK_REQUIRE_BACKEND=1 cargo test --workspace   # a missing backend fails instead
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo fmt --all
 ```
 
-Differences indicate potential side-channel vulnerabilities where execution depends on secret input values.
+`TRACE_CHECK_REQUIRE_BACKEND=1` is what CI sets, so a skipped backend can never
+be mistaken for a pass.
+
+### Adding a case or comparison
+
+Edit `examples/mac-compare/cases.json`: add a case (32-byte hex tag plus its
+expected decision) or a comparison (variant, two case ids, expected outcome, and
+the reasoning). The fixture is validated before anything is executed — unknown
+references, duplicate ids, self-comparisons and malformed tags are rejected up
+front.
+
+### The legacy example
+
+`examples/legacy-branch-demo` is the original single-branch program, kept as
+historical context. It has no automated runner and is not part of the demo; the
+multi-megabyte trace logs that accompanied it were removed from the working tree
+(they remain in history at commit `2171580`) and generated traces are now
+git-ignored.
