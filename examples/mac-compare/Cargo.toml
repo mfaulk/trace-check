@@ -1,0 +1,15 @@
+[package]
+name = "mac-compare"
+description = "MAC authentication-tag comparison variants, exported for WASM tracing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# cdylib is the traced artifact; rlib lets the host test suite check that every
+# variant agrees on the authentication decision.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+subtle = { version = "2.6", default-features = false }
