@@ -1,4 +1,3 @@
-
 // Example: secret-dependent branch (not constant-time)
 fn check_secret(byte: u8) -> u8 {
     if byte == 0 {

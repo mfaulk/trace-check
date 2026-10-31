@@ -1,2 +1,12 @@
 /target
 .idea
+
+# Generated trace output. Raw traces are large and contain the case input
+# values, so only the compact fixtures under tests/fixtures are tracked.
+*.trace
+!crates/trace-check/tests/fixtures/*.trace
+*.log
+/traces/
+
+# Generated reports.
+*-report.json
