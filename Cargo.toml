@@ -1,5 +1,5 @@
 [workspace]
-members = ["examples/legacy-branch-demo"]
+members = ["examples/mac-compare", "examples/legacy-branch-demo"]
 resolver = "2"
 
 [workspace.package]
