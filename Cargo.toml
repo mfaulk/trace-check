@@ -1,6 +1,17 @@
-[package]
-name = "ai-const-time"
+[workspace]
+members = ["examples/legacy-branch-demo"]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
+license = "MIT OR Apache-2.0"
 
-[dependencies]
+# The traced example must be built with a fixed, optimized profile: the whole
+# experiment is a claim about one specific compiled artifact, so the profile is
+# part of the pinned configuration and must not vary between runs.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
