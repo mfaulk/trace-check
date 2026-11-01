@@ -7,8 +7,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use trace_check::census::Baseline;
 use trace_check::compare::{compare, Outcome};
 use trace_check::experiment::Experiment;
+use trace_check::native::{self, NativeManifest};
 use trace_check::parser::parse_trace;
 use trace_check::run_experiment;
+use trace_check::run_native;
 use trace_check::runner::{self, Limits, Runner, CARGO_PROFILE, WASM_TARGET};
 use trace_check::screen::{self, ScreenConfig, ScreenInputs};
 
@@ -47,6 +49,26 @@ enum Command {
         trace_b: PathBuf,
         #[arg(long, value_enum, default_value_t = Format::Text)]
         format: Format,
+    },
+    /// Analyze native Rust code for secret-dependent branches and memory
+    /// addresses, using Valgrind Memcheck undefined-value tracking.
+    Native {
+        /// Run only the case with this id.
+        #[arg(long)]
+        case: Option<String>,
+        /// Case manifest; defaults to examples/native-cases.json.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = Format::Text)]
+        format: Format,
+        #[arg(long)]
+        workspace_root: Option<PathBuf>,
+        /// Per-case wall-clock limit in seconds. Memcheck is roughly an order
+        /// of magnitude slower than native execution.
+        #[arg(long, default_value_t = 300)]
+        timeout_secs: u64,
+        #[arg(long, default_value_t = 64 * 1024 * 1024)]
+        max_output_bytes: usize,
     },
     /// Statically screen the compiled artifact for secret-dependent control
     /// flow, and gate its structural census against a recorded baseline.
@@ -162,6 +184,23 @@ fn run() -> Result<u8, String> {
             trace_b,
             format,
         } => compare_files(&trace_a, &trace_b, format),
+        Command::Native {
+            case,
+            manifest,
+            format,
+            workspace_root,
+            timeout_secs,
+            max_output_bytes,
+        } => native_analysis(
+            case.as_deref(),
+            manifest.as_deref(),
+            format,
+            workspace_root.as_deref(),
+            native::Limits {
+                timeout: Duration::from_secs(timeout_secs),
+                max_output_bytes,
+            },
+        ),
         Command::Screen {
             example,
             module,
@@ -205,6 +244,42 @@ fn demo(example: ExampleName, options: &DemoOptions) -> Result<u8, String> {
     }
 
     Ok(if report.summary.controls_reproduced {
+        EXIT_OK
+    } else {
+        EXIT_FINDING
+    })
+}
+
+fn native_analysis(
+    case_filter: Option<&str>,
+    manifest_path: Option<&Path>,
+    format: Format,
+    workspace_root_override: Option<&Path>,
+    limits: native::Limits,
+) -> Result<u8, String> {
+    let root = resolve_workspace_root(workspace_root_override)?;
+    let manifest_path = manifest_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| root.join("examples/native-cases.json"));
+    let mut manifest = NativeManifest::load(&manifest_path).map_err(|e| e.to_string())?;
+
+    if let Some(wanted) = case_filter {
+        manifest.cases.retain(|case| case.id == wanted);
+        if manifest.cases.is_empty() {
+            return Err(format!(
+                "no native case with id {wanted:?} in {}",
+                manifest_path.display()
+            ));
+        }
+    }
+
+    let report =
+        run_native(&root.join("Cargo.toml"), &manifest, limits).map_err(|e| e.to_string())?;
+    match format {
+        Format::Text => print!("{}", report.to_text()),
+        Format::Json => println!("{}", report.to_json()),
+    }
+    Ok(if report.summary.expectations_reproduced {
         EXIT_OK
     } else {
         EXIT_FINDING
@@ -370,8 +445,12 @@ fn limits(options: &DemoOptions) -> Limits {
 /// Resolves the workspace root, preferring an explicit flag. The compile-time
 /// manifest directory is the fallback so `cargo run` works from anywhere.
 fn workspace_root(options: &DemoOptions) -> Result<PathBuf, String> {
-    let root = match &options.workspace_root {
-        Some(path) => path.clone(),
+    resolve_workspace_root(options.workspace_root.as_deref())
+}
+
+fn resolve_workspace_root(override_path: Option<&Path>) -> Result<PathBuf, String> {
+    let root = match override_path {
+        Some(path) => path.to_path_buf(),
         None => Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
             .nth(2)
