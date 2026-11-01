@@ -190,9 +190,14 @@ Two rules keep a result trustworthy, and both are enforced rather than assumed:
   request is a no-op, so the harness reports its run mode and a clean
   uninstrumented run is `INCONCLUSIVE`, never a pass.
 * **Not every Memcheck error is a leak.** `UninitCondition` and `UninitValue`
-  are secret dependency; an `InvalidRead` is a memory bug and is reported as
-  one. Findings are attributed to the function under test by stack frame, so a
-  secret-derived value formatted by `println!` is not counted.
+  are secret dependency *only when their origin is the client request that
+  marked the secret* — Memcheck emits the same kinds for genuinely
+  uninitialized memory, which is an ordinary bug. An `InvalidRead` is a memory
+  bug and is reported as one. Anything else is retained and makes the run
+  `INCONCLUSIVE`.
+* **Attribution uses the primary stack.** An error also carries an origin
+  stack naming where the value was created, which for a marked secret is the
+  harness. Matching against it would blame the wrong function.
 
 Cases live in [`examples/native-cases.json`](examples/native-cases.json) with
 their expected outcomes, so a compiler change that invalidates a prediction

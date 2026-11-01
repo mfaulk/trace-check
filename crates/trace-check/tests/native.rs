@@ -335,8 +335,12 @@ fn no_prefix_of_real_memcheck_output_parses_as_clean() {
         std::process::id()
     ));
     let status = Command::new("valgrind")
+        // --track-origins=yes is required: without it Memcheck reports no
+        // origin, and an undefined value with no origin is deliberately not
+        // claimed as secret dependency. The backend always passes it.
         .args([
             "--tool=memcheck",
+            "--track-origins=yes",
             "--xml=yes",
             &format!("--xml-file={}", xml_path.display()),
         ])
@@ -419,5 +423,142 @@ fn a_timed_out_run_is_never_clean() {
             "a killed run must not produce a verdict, got {}",
             report.cases[0].result.outcome
         ),
+    }
+}
+
+/// An ordinary uninitialized-variable bug is not reported as a timing leak.
+///
+/// Memcheck emits `UninitCondition` for this exactly as it does for a marked
+/// secret, so the error kind alone cannot discriminate. The origin can: this
+/// value reports a heap allocation rather than a client request. Before origin
+/// was consulted, this case was reported as LEAK_DETECTED — a false positive
+/// claiming an ordinary bug was a secret-dependent leak.
+#[test]
+fn unrelated_undefined_value_is_not_a_timing_leak() {
+    if !valgrind_available() {
+        return;
+    }
+    let (outcome, report) = analyze("control-unrelated-undefined");
+    assert_eq!(outcome, Outcome::Inconclusive);
+
+    let result = &report.cases[0].result;
+    assert!(
+        result.findings.is_empty(),
+        "an unrelated undefined value must not be a secret-dependency finding"
+    );
+    assert!(!result.other_diagnostics.is_empty());
+    assert!(
+        result
+            .other_diagnostics
+            .iter()
+            .any(|d| d.classification == Classification::UnrelatedUndefinedValue),
+        "expected an unrelated-undefined-value diagnostic, got {:?}",
+        result
+            .other_diagnostics
+            .iter()
+            .map(|d| d.classification)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Real findings carry a client-request origin and an origin stack, which is
+/// what distinguishes them from ordinary uninitialized memory.
+#[test]
+fn real_findings_carry_a_client_request_origin() {
+    if !valgrind_available() {
+        return;
+    }
+    for case in ["mac-early-exit-opaque", "table-secret-index"] {
+        let (_, report) = analyze(case);
+        let finding = &report.cases[0].result.findings[0];
+        assert!(
+            finding.origin.contains("client request"),
+            "{case}: expected a client-request origin, got {:?}",
+            finding.origin
+        );
+        assert!(
+            !finding.origin_stack.is_empty(),
+            "{case}: the origin stack should name where the secret was marked"
+        );
+    }
+}
+
+/// Attribution uses the primary stack, so a finding is never attributed to the
+/// marking site that appears in its origin stack.
+#[test]
+fn findings_are_not_attributed_to_the_marking_site() {
+    if !valgrind_available() {
+        return;
+    }
+    let (_, report) = analyze("table-secret-index");
+    let finding = &report.cases[0].result.findings[0];
+    assert!(
+        finding.attributed,
+        "the finding should attribute to the function under test"
+    );
+    let location = finding.location.as_deref().unwrap_or_default();
+    assert!(
+        location.contains("table-lookup") || location.contains("lib.rs"),
+        "expected the primary location in the example, got {location:?}"
+    );
+    assert!(
+        finding
+            .origin_stack
+            .iter()
+            .any(|frame| frame.contains("Secret") || frame.contains("mark")),
+        "the origin stack should name the marking site, separately: {:?}",
+        finding.origin_stack
+    );
+}
+
+/// A manifest case id containing path separators or `..` is rejected on load,
+/// so no analysis path can be built from untrusted manifest data.
+#[test]
+fn unsafe_case_ids_are_rejected() {
+    for bad in [
+        "../../etc",
+        "a/b",
+        "a\\b",
+        "..",
+        "",
+        "has space",
+        "weird$char",
+    ] {
+        let json = serde_json::json!({
+            "schema_version": 1,
+            "cases": [{
+                "id": bad,
+                "package": "p",
+                "binary": "b",
+                "case": "c",
+                "function": "f",
+                "expected_outcome": "NO_LEAK_OBSERVED"
+            }]
+        });
+        let path =
+            std::env::temp_dir().join(format!("trace-check-bad-id-{}.json", std::process::id()));
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+        let error = NativeManifest::load(&path).expect_err("an unsafe case id must be rejected");
+        assert!(
+            error.to_string().contains("is invalid"),
+            "id {bad:?} should be rejected as invalid, got: {error}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Ordinary case ids still load.
+#[test]
+fn safe_case_ids_are_accepted() {
+    let manifest = manifest();
+    assert!(manifest.cases.len() >= 10);
+    for case in &manifest.cases {
+        assert!(
+            case.id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')),
+            "bundled id {:?} should already satisfy the rule",
+            case.id
+        );
     }
 }
