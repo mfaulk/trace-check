@@ -24,16 +24,20 @@ const LIMITATIONS: [&str; 6] = [
     "Attribution matches stack frames by function name, so aggressive inlining can blur which function owns a finding.",
 ];
 
+/// One analyzed case.
+///
+/// `result` is nested rather than flattened. Flattening duplicated `case`,
+/// `function` and `secret_source`, which `NativeResult` also defines, and
+/// serde emits duplicate JSON object keys without complaint. Parsers handle
+/// those inconsistently, and this report is meant for CI and the eventual
+/// assertion API, so the schema has to be unambiguous. Nesting makes the
+/// collision impossible rather than merely fixing today's instance.
 #[derive(Debug, Clone, Serialize)]
 pub struct NativeCaseReport {
-    pub case: String,
     pub description: String,
     pub package: String,
-    pub function: String,
-    pub secret_source: String,
     pub rationale: String,
     pub provenance: Provenance,
-    #[serde(flatten)]
     pub result: NativeResult,
     pub expectation: Expectation,
 }
@@ -66,11 +70,8 @@ pub fn build(entries: Vec<(NativeCase, NativeResult, Provenance)>) -> NativeRepo
             let expected =
                 Outcome::parse(&case.expected_outcome).expect("the manifest was validated on load");
             NativeCaseReport {
-                case: case.id,
                 description: case.description,
                 package: case.package,
-                function: case.function,
-                secret_source: case.secret_source,
                 rationale: case.rationale,
                 expectation: Expectation::new(expected, result.outcome),
                 provenance,
@@ -91,7 +92,7 @@ pub fn build(entries: Vec<(NativeCase, NativeResult, Provenance)>) -> NativeRepo
         .map(|entry| {
             format!(
                 "{}: expected {} but observed {}",
-                entry.case, entry.expectation.expected, entry.expectation.observed
+                entry.result.case, entry.expectation.expected, entry.expectation.observed
             )
         })
         .collect();
@@ -141,15 +142,16 @@ impl NativeReport {
                 "UNEXPECTED"
             };
             line!("");
-            line!(
-                "{}: {}",
-                if entry.result.outcome == Outcome::LeakDetected {
-                    "FAIL"
-                } else {
-                    "PASS"
-                },
-                entry.case
-            );
+            // Three labels, because displaying INCONCLUSIVE as PASS would be
+            // actively misleading in a security CLI. Whether the regression
+            // test behaved as predicted is the separate [ok]/[UNEXPECTED] mark
+            // on the Result line.
+            let label = match entry.result.outcome {
+                Outcome::LeakDetected => "LEAK",
+                Outcome::NoLeakObserved => "NO LEAK OBSERVED",
+                Outcome::Inconclusive => "INCONCLUSIVE",
+            };
+            line!("{label}: {}", entry.result.case);
             line!("");
             line!("Backend: {}", entry.result.backend);
             line!("Target:  {}", entry.provenance.target);
@@ -183,15 +185,18 @@ impl NativeReport {
                     line!("Location:");
                     line!("  {location}");
                 }
-                if !entry.secret_source.is_empty() {
+                if !entry.result.secret_source.is_empty() {
                     line!("");
                     line!("Secret source:");
-                    line!("  {}", entry.secret_source);
+                    line!("  {}", entry.result.secret_source);
                 }
-                if let Some(origin) = &finding.origin {
+                if !finding.origin.is_empty() {
                     line!("");
                     line!("Origin:");
-                    line!("  {origin}");
+                    line!("  {}", finding.origin);
+                    for frame in &finding.origin_stack {
+                        line!("    {frame}");
+                    }
                 }
                 if !finding.stack.is_empty() {
                     line!("");
@@ -283,9 +288,9 @@ mod tests {
         }
     }
 
-    fn result(outcome: Outcome, findings: Vec<NativeFinding>) -> NativeResult {
+    fn result_named(id: &str, outcome: Outcome, findings: Vec<NativeFinding>) -> NativeResult {
         NativeResult {
-            case: "c".to_string(),
+            case: id.to_string(),
             function: "f".to_string(),
             secret_source: "index".to_string(),
             backend: BACKEND,
@@ -298,6 +303,10 @@ mod tests {
         }
     }
 
+    fn result(outcome: Outcome, findings: Vec<NativeFinding>) -> NativeResult {
+        result_named("c", outcome, findings)
+    }
+
     fn finding() -> NativeFinding {
         NativeFinding {
             classification: crate::memcheck::Classification::SecretDependentValue,
@@ -305,8 +314,9 @@ mod tests {
             what: "Use of uninitialised value of size 8".to_string(),
             location: Some("examples/table-lookup/src/lib.rs:27".to_string()),
             function: Some("lookup_secret_index".to_string()),
-            origin: None,
+            origin: "created by a client request (the marked secret)".to_string(),
             stack: vec!["lookup_secret_index (lib.rs:27)".to_string()],
+            origin_stack: vec!["Secret::new (lib.rs:126)".to_string()],
             attributed: true,
         }
     }
@@ -344,12 +354,16 @@ mod tests {
     fn text_output_is_actionable() {
         let report = build(vec![(
             case("secret_table_lookup", "LEAK_DETECTED"),
-            result(Outcome::LeakDetected, vec![finding()]),
+            result_named(
+                "secret_table_lookup",
+                Outcome::LeakDetected,
+                vec![finding()],
+            ),
             provenance(),
         )]);
         let text = report.to_text();
         for expected in [
-            "FAIL: secret_table_lookup",
+            "LEAK: secret_table_lookup",
             "Backend: native-memcheck",
             "Target:  x86_64-unknown-linux-gnu",
             "Secret-dependent memory address",
@@ -366,11 +380,11 @@ mod tests {
     fn clean_case_renders_as_pass() {
         let report = build(vec![(
             case("control", "NO_LEAK_OBSERVED"),
-            result(Outcome::NoLeakObserved, vec![]),
+            result_named("control", Outcome::NoLeakObserved, vec![]),
             provenance(),
         )]);
         let text = report.to_text();
-        assert!(text.contains("PASS: control"));
+        assert!(text.contains("NO LEAK OBSERVED: control"));
         assert!(text.contains("none"));
     }
 
@@ -404,6 +418,58 @@ mod tests {
             .contains("did not report running under Valgrind"));
     }
 
+    /// `NativeResult`'s field names must not also appear at the case object's
+    /// top level, or serde would emit duplicate JSON object keys. Nesting
+    /// `result` makes this structural, and this test fails if someone
+    /// reintroduces `#[serde(flatten)]` plus an overlapping field.
+    #[test]
+    fn case_report_and_result_keys_do_not_collide() {
+        let report = build(vec![(
+            case("c", "LEAK_DETECTED"),
+            result(Outcome::LeakDetected, vec![finding()]),
+            provenance(),
+        )]);
+        let value: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+        let case_object = value["cases"][0].as_object().expect("a case object");
+
+        let result_json = serde_json::to_value(result(Outcome::LeakDetected, vec![])).unwrap();
+        let result_keys: Vec<&String> = result_json
+            .as_object()
+            .expect("a result object")
+            .keys()
+            .collect();
+        assert!(!result_keys.is_empty());
+
+        for key in result_keys {
+            assert!(
+                !case_object.contains_key(key.as_str()),
+                "key {key:?} appears both on the case object and inside `result`, which \
+                 would serialize as a duplicate JSON key"
+            );
+        }
+        assert!(case_object.contains_key("result"));
+    }
+
+    /// Each outcome renders as its own label. Displaying INCONCLUSIVE as PASS
+    /// would be actively misleading in a security CLI.
+    #[test]
+    fn each_outcome_has_a_distinct_label() {
+        for (outcome, expected) in [
+            (Outcome::LeakDetected, "LEAK: c"),
+            (Outcome::NoLeakObserved, "NO LEAK OBSERVED: c"),
+            (Outcome::Inconclusive, "INCONCLUSIVE: c"),
+        ] {
+            let report = build(vec![(
+                case("c", outcome.as_str()),
+                result(outcome, vec![]),
+                provenance(),
+            )]);
+            let text = report.to_text();
+            assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+            assert!(!text.contains("PASS: c"), "PASS must not be used");
+        }
+    }
+
     /// The JSON report is valid and carries its schema version and provenance.
     #[test]
     fn json_report_carries_schema_and_provenance() {
@@ -419,7 +485,11 @@ mod tests {
             value["cases"][0]["provenance"]["analyzer"],
             "valgrind 3.28.0"
         );
-        assert_eq!(value["cases"][0]["outcome"], "LEAK_DETECTED");
-        assert_eq!(value["cases"][0]["evidence"], "dynamic_secret_dependency");
+        assert_eq!(value["cases"][0]["result"]["outcome"], "LEAK_DETECTED");
+        assert_eq!(
+            value["cases"][0]["result"]["evidence"],
+            "dynamic_secret_dependency"
+        );
+        assert_eq!(value["cases"][0]["result"]["case"], "c");
     }
 }

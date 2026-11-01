@@ -34,6 +34,7 @@ fn main() {
         "declassified_output" => declassified_output(),
         "unmarked_secret" => unmarked_secret(),
         "genuine_memory_error" => genuine_memory_error(),
+        "unrelated_undefined_value" => unrelated_undefined_value(),
         other => {
             eprintln!("unknown case {other:?}");
             std::process::exit(64);
@@ -112,6 +113,32 @@ fn unmarked_secret() {
         black_box(SECRET_INDEX),
     ));
     println!("selected={selected}");
+}
+
+/// Control: an ordinary uninitialized-variable bug, with no secret marked.
+///
+/// Memcheck reports `UninitCondition` here exactly as it does for a marked
+/// secret, so error kind alone cannot tell the two apart. The origin can:
+/// this value reports "created by a heap allocation" rather than "created by
+/// a client request". The analysis must therefore classify it as an unrelated
+/// undefined value and return INCONCLUSIVE, not LEAK_DETECTED.
+fn unrelated_undefined_value() {
+    use std::alloc::{alloc, dealloc, Layout};
+
+    let layout = Layout::from_size_align(16, 1).expect("valid layout");
+    // SAFETY: deliberately reads uninitialized heap memory to produce a
+    // genuine UninitCondition. The allocation is non-zero-sized, the read is
+    // in bounds, and the block is freed exactly once.
+    let branched = unsafe {
+        let pointer = alloc(layout);
+        assert!(!pointer.is_null(), "allocation failed");
+        // Volatile so the read is not elided.
+        let uninitialized = core::ptr::read_volatile(pointer.add(4));
+        let taken = if uninitialized > 128 { 1u8 } else { 0u8 };
+        dealloc(pointer, layout);
+        taken
+    };
+    println!("branched={}", black_box(branched));
 }
 
 /// A genuine memory error, unrelated to secrecy. The backend must report this

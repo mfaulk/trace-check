@@ -127,6 +127,20 @@
       "case": "genuine_memory_error",
       "function": "genuine_memory_error",
       "expected_outcome": "INCONCLUSIVE"
+    },
+    {
+      "id": "control-unrelated-undefined",
+      "description": "control: an ordinary uninitialized heap variable reaching a branch, with no secret marked",
+      "package": "table-lookup",
+      "binary": "table-lookup-native",
+      "features": [
+        "native-harness"
+      ],
+      "case": "unrelated_undefined_value",
+      "function": "unrelated_undefined_value",
+      "secret_source": "none",
+      "expected_outcome": "INCONCLUSIVE",
+      "rationale": "Memcheck reports UninitCondition for this exactly as it does for a marked secret, so the error kind alone cannot discriminate. The origin can: this reports a heap allocation rather than a client request, so it must be classified as an unrelated undefined value and not as a timing leak"
     }
   ]
 }

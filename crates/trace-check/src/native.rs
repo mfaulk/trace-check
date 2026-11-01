@@ -21,7 +21,6 @@ use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -46,10 +45,12 @@ pub const SUPPORTED_TARGET: &str = "x86_64-unknown-linux-gnu";
 /// or a signal would produce naturally.
 const MEMCHECK_ERROR_EXITCODE: i32 = 42;
 
-/// Distinguishes concurrent analyses within one process. Keying the scratch
-/// directory on the case id alone let two parallel runs of the same case
-/// delete each other's XML before it was read.
-static INVOCATION: AtomicU64 = AtomicU64::new(0);
+/// Hard cap on the XML report, checked before it is read into memory.
+///
+/// Valgrind writes its report to a file, so the subprocess output limit does
+/// not cover it. Without this check a pathological run could produce a report
+/// far larger than the configured bound and exhaust memory at parse time.
+const MAX_XML_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
@@ -118,6 +119,7 @@ impl NativeManifest {
             });
         }
         for case in &manifest.cases {
+            validate_case_id(&case.id)?;
             if Outcome::parse(&case.expected_outcome).is_none() {
                 return Err(NativeError::UnknownExpectedOutcome {
                     case: case.id.clone(),
@@ -127,6 +129,35 @@ impl NativeManifest {
         }
         Ok(manifest)
     }
+}
+
+/// Case ids appear in reports and are matched by `--case`, so they are
+/// restricted to a conservative character set. Paths are never built from
+/// them, but rejecting separators and `..` keeps that true if someone later
+/// reintroduces such a path.
+fn validate_case_id(id: &str) -> Result<(), NativeError> {
+    let invalid = |reason| {
+        Err(NativeError::InvalidCaseId {
+            case: id.to_string(),
+            reason,
+        })
+    };
+    if id.is_empty() {
+        return invalid("it is empty");
+    }
+    if id.len() > 128 {
+        return invalid("it is longer than 128 characters");
+    }
+    if id.contains("..") {
+        return invalid("it contains \"..\"");
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return invalid("only ASCII letters, digits, '-', '_' and '.' are allowed");
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -179,6 +210,16 @@ pub enum NativeError {
     XmlUnreadable {
         path: String,
         source: String,
+    },
+    XmlTooLarge {
+        path: String,
+        size: u64,
+        limit: u64,
+    },
+    /// A manifest case id that cannot be used safely in reports or paths.
+    InvalidCaseId {
+        case: String,
+        reason: &'static str,
     },
 }
 
@@ -235,6 +276,14 @@ impl fmt::Display for NativeError {
             NativeError::XmlUnreadable { path, source } => {
                 write!(f, "cannot read Memcheck XML at {path}: {source}")
             }
+            NativeError::XmlTooLarge { path, size, limit } => write!(
+                f,
+                "Memcheck XML at {path} is {size} bytes, above the {limit}-byte limit; refusing \
+                 to read it rather than risk exhausting memory"
+            ),
+            NativeError::InvalidCaseId { case, reason } => {
+                write!(f, "case id {case:?} is invalid: {reason}")
+            }
         }
     }
 }
@@ -251,10 +300,14 @@ pub struct NativeFinding {
     pub location: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub origin: Option<String>,
-    /// Shallow stack context, rendered for readability.
+    /// Where Memcheck says the undefined value came from. A finding only
+    /// counts as a leak when this is the client request that marked the
+    /// secret.
+    pub origin: String,
+    /// Shallow primary-stack context, rendered for readability.
     pub stack: Vec<String>,
+    /// Origin-stack context: where the value was created.
+    pub origin_stack: Vec<String>,
     /// Whether a frame naming the function under test was found.
     pub attributed: bool,
 }
@@ -273,11 +326,17 @@ impl NativeFinding {
                 })
             }),
             function: primary.and_then(|frame| frame.function.clone()),
-            origin: error.origin.clone(),
+            origin: error.origin.describe(),
             stack: error
-                .stack
+                .primary_stack
                 .iter()
                 .take(6)
+                .map(ToString::to_string)
+                .collect(),
+            origin_stack: error
+                .origin_frames()
+                .iter()
+                .take(4)
                 .map(ToString::to_string)
                 .collect(),
             attributed: error.attributable_to(function),
@@ -405,15 +464,16 @@ impl NativeRunner {
     pub fn analyze(&self, case: &NativeCase) -> Result<(NativeResult, Provenance), NativeError> {
         let (binary, hash) = self.build(case)?;
 
-        let xml_dir = std::env::temp_dir().join(format!(
-            "trace-check-memcheck-{}-{}-{}",
-            std::process::id(),
-            INVOCATION.fetch_add(1, Ordering::Relaxed),
-            case.id
-        ));
-        std::fs::create_dir_all(&xml_dir)
-            .map_err(|e| NativeError::Io(format!("{}: {e}", xml_dir.display())))?;
-        let xml_path = xml_dir.join("memcheck.xml");
+        // A randomly named TempDir, never a path built from manifest data.
+        // Case ids come from an arbitrary --manifest, and this directory is
+        // removed recursively; a crafted id containing path separators could
+        // otherwise redirect that deletion. The RAII guard also cleans up on
+        // the error and timeout paths, which an explicit remove did not.
+        let xml_dir = tempfile::Builder::new()
+            .prefix("trace-check-memcheck-")
+            .tempdir()
+            .map_err(|e| NativeError::Io(format!("cannot create a scratch directory: {e}")))?;
+        let xml_path = xml_dir.path().join("memcheck.xml");
 
         let args = vec![
             "--tool=memcheck".to_string(),
@@ -453,11 +513,23 @@ impl NativeRunner {
             });
         }
 
+        let metadata = std::fs::metadata(&xml_path).map_err(|e| NativeError::XmlUnreadable {
+            path: xml_path.display().to_string(),
+            source: e.to_string(),
+        })?;
+        let cap = (self.limits.max_output_bytes as u64).min(MAX_XML_BYTES);
+        if metadata.len() > cap {
+            return Err(NativeError::XmlTooLarge {
+                path: xml_path.display().to_string(),
+                size: metadata.len(),
+                limit: cap,
+            });
+        }
         let xml = std::fs::read_to_string(&xml_path).map_err(|e| NativeError::XmlUnreadable {
             path: xml_path.display().to_string(),
             source: e.to_string(),
         })?;
-        let _ = std::fs::remove_dir_all(&xml_dir);
+        // `xml_dir` is dropped at the end of this function, removing the file.
 
         let instrumented = harness_was_instrumented(&captured.stdout);
         let result = match memcheck::parse(&xml) {
@@ -514,9 +586,12 @@ fn classify(case: &NativeCase, run: &MemcheckRun, instrumented: bool) -> NativeR
         .secret_dependency_errors()
         .map(|error| NativeFinding::from_error(error, &case.function))
         .collect();
+    // Everything that is not secret dependency: genuine memory errors,
+    // undefined values whose origin is not our marking, and kinds this build
+    // does not classify. Retained rather than dropped, and each one makes the
+    // run inconclusive.
     let other: Vec<NativeFinding> = run
-        .memory_errors()
-        .chain(run.unclassified_errors())
+        .non_secret_errors()
         .map(|error| NativeFinding::from_error(error, &case.function))
         .collect();
 
@@ -531,11 +606,20 @@ fn classify(case: &NativeCase, run: &MemcheckRun, instrumented: bool) -> NativeR
                 .to_string(),
         )
     } else if !other.is_empty() {
+        let unrelated = other
+            .iter()
+            .filter(|f| f.classification == Classification::UnrelatedUndefinedValue)
+            .count();
+        let memory = other
+            .iter()
+            .filter(|f| f.classification == Classification::MemoryError)
+            .count();
         (
             Outcome::Inconclusive,
             format!(
-                "Memcheck reported {} diagnostic(s) that are not secret dependency (e.g. a \
-                 genuine memory error); these are retained but must be resolved before a \
+                "Memcheck reported {} diagnostic(s) that are not secret dependency \
+                 ({memory} memory error(s), {unrelated} undefined value(s) not traceable to \
+                 the marked secret); these are retained but must be resolved before a \
                  security conclusion is meaningful",
                 other.len()
             ),
@@ -759,7 +843,9 @@ mod tests {
 <error><kind>UninitCondition</kind>
 <what>Conditional jump or move depends on uninitialised value(s)</what><stack>
 <frame><fn>mac_compare::verify_early_exit_opaque</fn><file>lib.rs</file><line>70</line></frame>
-</stack></error>
+</stack>
+<auxwhat>Uninitialised value was created by a client request</auxwhat>\n<stack><frame><fn>trace_check_secret::Secret::new</fn><file>secret.rs</file><line>126</line></frame></stack>
+</error>
 <status><state>FINISHED</state></status></valgrindoutput>"#;
 
     const CLEAN_XML: &str = r#"<?xml version="1.0"?><valgrindoutput>
@@ -848,7 +934,9 @@ mod tests {
 <protocolversion>6</protocolversion><tool>memcheck</tool>
 <error><kind>UninitValue</kind><what>Use of uninitialised value of size 8</what><stack>
 <frame><fn>table_lookup::lookup_secret_index</fn><file>lib.rs</file><line>44</line></frame>
-</stack></error>
+</stack>
+<auxwhat>Uninitialised value was created by a client request</auxwhat>\n<stack><frame><fn>trace_check_secret::Secret::new</fn><file>secret.rs</file><line>126</line></frame></stack>
+</error>
 <status><state>FINISHED</state></status></valgrindoutput>"#;
         let mut target = case();
         target.function = "lookup_secret_index".to_string();

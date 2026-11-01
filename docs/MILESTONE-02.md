@@ -245,14 +245,39 @@ runtime or formatting frames are retained as diagnostics and make the result
 
 Memcheck kinds map as:
 
-| Kind | Classification |
-| --- | --- |
-| `UninitCondition` | secret-dependent **branch** |
-| `UninitValue` | secret-dependent **value use** — typically an address |
-| `InvalidRead`, `InvalidWrite`, `InvalidFree`, `Leak_*`, `SyscallParam`, … | genuine memory error — **not** a timing leak |
+Classification needs **two** facts, not one. The error kind says what kind of
+operation was affected; the **origin** says whether the value was ours.
 
-A genuine memory error is reported as a memory error and makes the run
-`INCONCLUSIVE`. Mislabelling one as a timing leak would be worse than missing it.
+| Kind | Origin | Classification |
+| --- | --- | --- |
+| `UninitCondition` | client request | secret-dependent **branch** |
+| `UninitValue` | client request | secret-dependent **value use** — typically an address |
+| `UninitCondition` / `UninitValue` | heap, stack, absent | **unrelated undefined value** — an ordinary bug, not a leak |
+| `InvalidRead`, `InvalidWrite`, `InvalidFree`, `Leak_*`, `SyscallParam`, … | any | genuine memory error — **not** a timing leak |
+
+`VALGRIND_MAKE_MEM_UNDEFINED` is a client request, so a value we marked reports
+"created by a client request". Memcheck emits the *same error kinds* for
+genuinely uninitialized heap or stack memory, which is a real defect but not a
+secret dependency. Kind alone therefore cannot discriminate, and claiming it
+could would report ordinary bugs as timing leaks.
+
+An absent origin is treated as undiscriminated rather than assumed to be ours,
+which is also why `--track-origins=yes` is mandatory for this backend.
+
+Anything that is not secret dependency is retained as a diagnostic and makes
+the run `INCONCLUSIVE`. Mislabelling a memory error as a timing leak would be
+worse than missing it.
+
+### Stacks are not interchangeable
+
+Under `--track-origins=yes` an error carries a primary `<stack>` and then, after
+each `<auxwhat>`, a further `<stack>`. For an undefined-value error that second
+stack is the **origin stack**: where the value was created. For a marked secret
+that is the harness's `Secret::new` call site, not the code under test.
+
+Primary and auxiliary stacks are parsed separately, and attribution consults
+the primary stack only. Merging them would let a finding be attributed to the
+marking site rather than to the operation that consumed the secret.
 
 ## Example programs
 
@@ -441,7 +466,7 @@ artifact's SHA-256 is unchanged.
 * **Nine cases, not the eight listed above**, after splitting the
   declassification control from the permitted-arithmetic control.
 
-### Correction after review (PR #2)
+### Corrections after review (PR #2)
 
 **Truncated XML could be accepted as a clean result.** The parser stopped at
 `Event::Eof` without checking that the document was closed. A document cut at a
@@ -453,6 +478,46 @@ unrelated syntactic reasons.
 
 Fixed by the four completeness checks above. See
 [Output completeness](#output-completeness).
+
+**Origin stacks were merged into the primary stack, and origin was ignored.**
+Two defects with one root cause — treating all `<frame>` elements inside an
+`<error>` as one stack, and classifying on error kind alone.
+
+The first meant a finding could be attributed to a function that appeared only
+in the origin stack, i.e. to the harness's marking site rather than to the code
+that consumed the secret. The second was worse: Memcheck emits
+`UninitCondition` for genuinely uninitialized heap and stack memory exactly as
+it does for a marked secret, so an ordinary uninitialized-variable bug was
+reported as `LEAK_DETECTED`. A new control case (`control-unrelated-undefined`)
+reproduces that shape and now correctly returns `INCONCLUSIVE`.
+
+Both are fixed: stacks are parsed separately, attribution uses the primary
+stack only, and an undefined-value diagnostic is secret dependency only when
+its origin is a client request. See
+[How Memcheck is repurposed](#how-memcheck-is-repurposed).
+
+**The scratch directory was built from manifest data.** The Memcheck XML path
+embedded `case.id`, and the directory was removed with `remove_dir_all`. Case
+ids come from an arbitrary `--manifest`, so an id containing path separators
+could have redirected that deletion outside the temporary directory. Replaced
+with a randomly named `tempfile::TempDir`, which also cleans up on the error
+and timeout paths that the explicit removal missed. Case ids are additionally
+validated on load as defence in depth.
+
+**The output cap did not cover the XML report.** Valgrind writes it to a file,
+outside the bounded stdout/stderr reader. The file's size is now checked
+against the configured limit before it is read into memory.
+
+**`INCONCLUSIVE` was displayed as `PASS`.** The text report used a two-way
+PASS/FAIL label, which rendered the deliberate memory-error control as a pass.
+There are now three labels — `LEAK`, `NO LEAK OBSERVED`, `INCONCLUSIVE` — with
+the fixture expectation reported separately as `[ok]`/`[UNEXPECTED]`.
+
+**The JSON report emitted duplicate object keys.** `NativeCaseReport` defined
+`case`, `function` and `secret_source` and then flattened `NativeResult`, which
+defines the same three. `result` is now nested, which makes the collision
+structurally impossible rather than fixing the instance, and a test asserts the
+key sets stay disjoint.
 
 ### Corrections made during implementation
 
