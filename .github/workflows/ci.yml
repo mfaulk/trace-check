@@ -53,15 +53,25 @@ jobs:
           TRACE_CHECK_REQUIRE_BACKEND: "1"
         run: cargo test --workspace --all-features
 
+      # Tier 0 + Tier 1. The baseline gate is active because the baseline file
+      # is committed, so a toolchain change that alters the compiled shape of a
+      # screened function fails here rather than passing unnoticed.
+      - name: Screen the artifact (static)
+        run: cargo run --locked --release -p trace-check -- screen mac-compare
+
       - name: Reproduce the demonstration
         run: cargo run --locked --release -p trace-check -- demo mac-compare
 
-      - name: Emit the JSON report
+      - name: Emit the JSON reports
         run: |
           cargo run --locked --release -p trace-check -- demo mac-compare --format json \
             > mac-compare-report.json
+          cargo run --locked --release -p trace-check -- screen mac-compare --format json \
+            > mac-compare-screen.json
 
       - uses: actions/upload-artifact@v4
         with:
           name: mac-compare-report
-          path: mac-compare-report.json
+          path: |
+            mac-compare-report.json
+            mac-compare-screen.json
