@@ -353,6 +353,28 @@ debug symbols, because source locations are what make a finding actionable.
 * **Memcheck slows execution by roughly an order of magnitude**, which is why
   instrumented tests are separated from the fast suite.
 
+## Output completeness
+
+A truncated Memcheck report must never read as a clean result. Four
+independent checks run before any parsed content is trusted:
+
+1. the XML is syntactically valid and every element is closed, with the
+   `<valgrindoutput>` root closed at depth zero,
+2. `<protocolversion>` is present and known,
+3. `<tool>` is `memcheck` — other Valgrind tools use error kinds this
+   classifier does not model,
+4. a terminal `<status><state>FINISHED</state>` was seen.
+
+The `FINISHED` marker is the strongest of the four. Balanced tags only prove
+the bytes received were well-formed; `FINISHED` proves Valgrind ran to
+completion and wrote its whole report. A run killed by the timeout, a Valgrind
+crash, or output read mid-write all fail this check and become `INCONCLUSIVE`.
+
+Any failure is a parse error, which the backend maps to `INCONCLUSIVE` — never
+to a shorter error list and never to `NO_LEAK_OBSERVED`. An end-to-end test
+captures real Memcheck output and asserts that **no strict prefix of it
+parses**.
+
 ## Implications for the eventual Rust annotation API
 
 M2 deliberately builds the primitives an M3 macro would need, without building
@@ -418,6 +440,19 @@ artifact's SHA-256 is unchanged.
   `panic = "unwind"`.
 * **Nine cases, not the eight listed above**, after splitting the
   declassification control from the permitted-arithmetic control.
+
+### Correction after review (PR #2)
+
+**Truncated XML could be accepted as a clean result.** The parser stopped at
+`Event::Eof` without checking that the document was closed. A document cut at a
+clean element boundary — `<valgrindoutput><protocolversion>6</protocolversion>`
+— satisfied the root and protocol checks, parsed to zero errors, and would have
+been classified `NO_LEAK_OBSERVED` by the backend. The existing truncation test
+gave false confidence because it cut mid-tag, which quick-xml rejects for
+unrelated syntactic reasons.
+
+Fixed by the four completeness checks above. See
+[Output completeness](#output-completeness).
 
 ### Corrections made during implementation
 

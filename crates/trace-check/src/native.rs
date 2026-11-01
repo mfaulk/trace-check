@@ -755,13 +755,16 @@ mod tests {
     }
 
     const BRANCH_XML: &str = r#"<?xml version="1.0"?><valgrindoutput>
-<protocolversion>6</protocolversion><error><kind>UninitCondition</kind>
+<protocolversion>6</protocolversion><tool>memcheck</tool>
+<error><kind>UninitCondition</kind>
 <what>Conditional jump or move depends on uninitialised value(s)</what><stack>
 <frame><fn>mac_compare::verify_early_exit_opaque</fn><file>lib.rs</file><line>70</line></frame>
-</stack></error></valgrindoutput>"#;
+</stack></error>
+<status><state>FINISHED</state></status></valgrindoutput>"#;
 
     const CLEAN_XML: &str = r#"<?xml version="1.0"?><valgrindoutput>
-<protocolversion>6</protocolversion></valgrindoutput>"#;
+<protocolversion>6</protocolversion><tool>memcheck</tool>
+<status><state>FINISHED</state></status></valgrindoutput>"#;
 
     /// An attributed secret-dependent branch yields LEAK_DETECTED.
     #[test]
@@ -803,10 +806,12 @@ mod tests {
     /// the run inconclusive rather than being labelled a timing leak.
     #[test]
     fn genuine_memory_error_is_not_a_timing_leak() {
-        let xml = r#"<?xml version="1.0"?><valgrindoutput><protocolversion>6</protocolversion>
+        let xml = r#"<?xml version="1.0"?><valgrindoutput>
+<protocolversion>6</protocolversion><tool>memcheck</tool>
 <error><kind>InvalidRead</kind><what>Invalid read of size 1</what><stack>
 <frame><fn>table_lookup::genuine_memory_error</fn><file>h.rs</file><line>9</line></frame>
-</stack></error></valgrindoutput>"#;
+</stack></error>
+<status><state>FINISHED</state></status></valgrindoutput>"#;
         let result = classify(&case(), &run_from(xml), true);
         assert_eq!(result.outcome, Outcome::Inconclusive);
         assert!(
@@ -839,10 +844,12 @@ mod tests {
     /// A secret-dependent address is classified as a value use and counted.
     #[test]
     fn secret_dependent_address_is_detected() {
-        let xml = r#"<?xml version="1.0"?><valgrindoutput><protocolversion>6</protocolversion>
+        let xml = r#"<?xml version="1.0"?><valgrindoutput>
+<protocolversion>6</protocolversion><tool>memcheck</tool>
 <error><kind>UninitValue</kind><what>Use of uninitialised value of size 8</what><stack>
 <frame><fn>table_lookup::lookup_secret_index</fn><file>lib.rs</file><line>44</line></frame>
-</stack></error></valgrindoutput>"#;
+</stack></error>
+<status><state>FINISHED</state></status></valgrindoutput>"#;
         let mut target = case();
         target.function = "lookup_secret_index".to_string();
         let result = classify(&target, &run_from(xml), true);
