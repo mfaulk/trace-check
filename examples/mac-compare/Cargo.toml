@@ -11,5 +11,17 @@ publish = false
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+# Gated so `cargo build -p mac-compare --target wasm32-unknown-unknown` still
+# builds only the cdylib: a harness `main` would not compile under no_std, and
+# M1's traced artifact must stay byte-identical.
+[[bin]]
+name = "mac-compare-native"
+path = "src/bin/native_harness.rs"
+required-features = ["native-harness"]
+
+[features]
+native-harness = ["dep:trace-check-secret"]
+
 [dependencies]
 subtle = { version = "2.6", default-features = false }
+trace-check-secret = { path = "../../crates/trace-check-secret", optional = true }

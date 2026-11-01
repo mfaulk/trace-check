@@ -1,0 +1,132 @@
+{
+  "schema_version": 1,
+  "description": "Native Memcheck cases. Each case runs one function under test so findings attribute unambiguously. Expectations live here rather than in code, so a compiler change that invalidates one surfaces as an unmet expectation.",
+  "cases": [
+    {
+      "features": [
+        "native-harness"
+      ],
+      "secret_source": "expected (parameter 0)",
+      "rationale": "LLVM vectorizes the loop into two pcmpeqb compares with a single test, so no secret-dependent branch survives; this records the erasure rather than assuming a vulnerability",
+      "description": "naive per-byte early-exit comparison",
+      "id": "mac-early-exit",
+      "package": "mac-compare",
+      "binary": "mac-compare-native",
+      "case": "early_exit",
+      "function": "verify_early_exit",
+      "expected_outcome": "NO_LEAK_OBSERVED"
+    },
+    {
+      "features": [
+        "native-harness"
+      ],
+      "secret_source": "expected (parameter 0)",
+      "rationale": "volatile loads block the vectorizer, so the per-byte branch survives and the secret reaches a conditional jump",
+      "description": "early-exit comparison with volatile per-byte loads",
+      "id": "mac-early-exit-opaque",
+      "package": "mac-compare",
+      "binary": "mac-compare-native",
+      "case": "early_exit_opaque",
+      "function": "verify_early_exit_opaque",
+      "expected_outcome": "LEAK_DETECTED"
+    },
+    {
+      "features": [
+        "native-harness"
+      ],
+      "secret_source": "expected (parameter 0)",
+      "rationale": "accumulates over all 32 bytes with no secret-dependent branch or address",
+      "description": "subtle::ConstantTimeEq comparison",
+      "id": "mac-constant-time",
+      "package": "mac-compare",
+      "binary": "mac-compare-native",
+      "case": "constant_time",
+      "function": "verify_constant_time",
+      "expected_outcome": "NO_LEAK_OBSERVED"
+    },
+    {
+      "features": [
+        "native-harness"
+      ],
+      "secret_source": "secret (parameter 1)",
+      "rationale": "the secret becomes part of a load address; the instruction path is identical for every secret, so M1's comparator cannot see this and M2 can",
+      "description": "secret-indexed table lookup",
+      "id": "table-secret-index",
+      "package": "table-lookup",
+      "binary": "table-lookup-native",
+      "case": "secret_index",
+      "function": "lookup_secret_index",
+      "expected_outcome": "LEAK_DETECTED"
+    },
+    {
+      "features": [
+        "native-harness"
+      ],
+      "secret_source": "secret (parameter 1)",
+      "rationale": "reads every entry and selects with a subtle-derived mask, so neither the address nor any branch depends on the secret",
+      "description": "constant-time table scan with mask selection",
+      "id": "table-constant-time-scan",
+      "package": "table-lookup",
+      "binary": "table-lookup-native",
+      "case": "constant_time_scan",
+      "function": "lookup_constant_time_scan",
+      "expected_outcome": "NO_LEAK_OBSERVED"
+    },
+    {
+      "features": [
+        "native-harness"
+      ],
+      "secret_source": "secret (parameter 0)",
+      "rationale": "propagating secrecy through computation is expected and permitted; only branches and addresses are prohibited",
+      "description": "secret used only in arithmetic",
+      "id": "permitted-arithmetic",
+      "package": "table-lookup",
+      "binary": "table-lookup-native",
+      "case": "permitted_arithmetic",
+      "function": "permitted_arithmetic",
+      "expected_outcome": "NO_LEAK_OBSERVED"
+    },
+    {
+      "features": [
+        "native-harness"
+      ],
+      "secret_source": "secret (parameter 0)",
+      "rationale": "proves declassification actually restores definedness rather than merely being called; without it, core::fmt would report spurious findings",
+      "description": "secret-derived result declassified, then branched on and printed",
+      "id": "declassified-output",
+      "package": "table-lookup",
+      "binary": "table-lookup-native",
+      "case": "declassified_output",
+      "function": "permitted_arithmetic",
+      "expected_outcome": "NO_LEAK_OBSERVED"
+    },
+    {
+      "features": [
+        "native-harness"
+      ],
+      "secret_source": "none (deliberately unmarked)",
+      "rationale": "must be silent; a finding here would mean detection is caused by something other than the secret marking, and a leak detected in the marked case would be meaningless",
+      "description": "instrumentation control: the vulnerable lookup with no marking",
+      "id": "control-unmarked-secret",
+      "package": "table-lookup",
+      "binary": "table-lookup-native",
+      "case": "unmarked_secret",
+      "function": "lookup_secret_index",
+      "expected_outcome": "NO_LEAK_OBSERVED"
+    },
+    {
+      "features": [
+        "native-harness"
+      ],
+      "secret_source": "none",
+      "rationale": "Memcheck reports a real memory bug; it must be classified as a memory error and make the run inconclusive, never labelled a timing leak",
+      "description": "control: a genuine out-of-bounds read, unrelated to secrecy",
+      "id": "control-memory-error",
+      "package": "table-lookup",
+      "binary": "table-lookup-native",
+      "case": "genuine_memory_error",
+      "function": "genuine_memory_error",
+      "expected_outcome": "INCONCLUSIVE"
+    }
+  ]
+}
