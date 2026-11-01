@@ -1,11 +1,31 @@
-# trace-check — detecting secret-dependent execution paths with execution traces
+# trace-check — constant-time verification and regression testing for Rust
 
 A timing side channel exists when the work a program does depends on a secret.
 The classic example is an authentication-tag comparison that stops at the first
 differing byte: how long it runs tells an attacker how much of their guess was
 correct.
 
-`trace-check` turns that idea into reproducible analysis, from two directions:
+**Where this is going.** The goal is a framework where a Rust developer can
+declare that a function must execute in constant time with respect to designated
+secret parameters, and have automated tests detect violations — an experience
+close to `cargo test`, but for a security property rather than functional
+correctness. See [docs/MILESTONE-02.md](docs/MILESTONE-02.md) for the vision,
+the formal noninterference property, and the roadmap.
+
+| Milestone | Scope | State |
+| --- | --- | --- |
+| M1 | Differential execution tracing (WASM, WABT) | complete |
+| M2 | Native secret-dependency analysis (Valgrind Memcheck) | complete |
+| M3 | Rust developer API — annotations, assertions, CI | next |
+| M4 | Symbolic verification — no concrete vectors | future |
+| M5 | Hardware-oriented validation — statistical timing | future |
+
+`trace-check` turns that idea into reproducible analysis, from three directions:
+
+* **Native secret-dependency analysis** (`native`) — mark a secret's shadow
+  state as undefined, run under Valgrind Memcheck, and let it report wherever a
+  secret-derived value reaches a conditional branch **or a memory address**.
+  This is the only backend that sees secret-dependent *addressing*.
 
 * **Statically** (`screen`) — parse the compiled WASM, count the control-flow
   shapes of each screened function against a committed baseline, and track
@@ -17,11 +37,12 @@ correct.
   two paths diverge.
 
 ```sh
+cargo run -p trace-check -- native               # native, under Memcheck
 cargo run -p trace-check -- screen mac-compare   # static, no execution
-cargo run -p trace-check -- demo mac-compare     # dynamic, builds and runs
+cargo run -p trace-check -- demo mac-compare     # dynamic WASM tracing
 ```
 
-The two are deliberately complementary. The static screen quantifies over *all*
+These are deliberately complementary. The static screen quantifies over *all*
 inputs but over-approximates, so it can report candidates that are not real.
 Differential tracing is exact for the inputs it runs but says nothing about the
 inputs it did not. The `subtle` control in the bundled example shows why you
@@ -50,6 +71,48 @@ as informational, not a leak: it is branchless, which is the point.
 
 See [docs/limitations.md](docs/limitations.md) for the full boundary, and
 [docs/methodology.md](docs/methodology.md) for the threat model and procedure.
+
+## Why three backends: the gap each one closes
+
+```rust
+fn lookup(secret: u8, table: &[u8; 256]) -> u8 {
+    table[secret as usize]
+}
+```
+
+At `-O3` on x86-64 this is three instructions — `movzbl %sil,%eax;
+movzbl (%rdi,%rax,1),%eax; ret` — and **every secret value executes the same
+three in the same order**. Only the effective address differs.
+
+M1's comparator reports `NO_DIFFERENCE_OBSERVED` and is correct: the property it
+checks genuinely holds. The vulnerability is outside that property. This is the
+AES S-box leakage class, and M2 catches it:
+
+```text
+FAIL: table-secret-index
+
+Backend: native-memcheck
+Target:  x86_64-unknown-linux-gnu
+
+Finding:
+  Secret-dependent memory address or value use
+
+Location:
+  examples/table-lookup/src/lib.rs:47
+
+Secret source:
+  secret (parameter 1)
+
+Result:
+  LEAK_DETECTED
+```
+
+| Leak | M1 differential tracing | M1 static screen | M2 native Memcheck |
+| --- | --- | --- | --- |
+| secret-dependent branch | detected | flagged structurally | detected, with source location |
+| secret-dependent address | **invisible** | flagged structurally | **detected** |
+| quantified over all inputs | no | yes | no (executed paths only) |
+| analyzes native code | no (WASM) | no (WASM) | yes |
 
 ## The example and its result
 
@@ -102,6 +165,42 @@ Observed event counts for `early_exit_opaque`, by mismatch position:
   are then not comparable to recorded ones.
 
 ## Commands
+
+### `native` — secret-dependency analysis of native code
+
+```sh
+cargo run -p trace-check -- native
+cargo run -p trace-check -- native --case table-secret-index
+cargo run -p trace-check -- native --format json
+```
+
+Builds each harness with production-like optimization plus debug symbols, marks
+the declared secret's shadow state as undefined, runs under Memcheck, and
+classifies the diagnostics.
+
+| Outcome | Meaning |
+| --- | --- |
+| `LEAK_DETECTED` | A secret-derived value reached a branch or an address on the executed path. |
+| `NO_LEAK_OBSERVED` | No such diagnostic **for the paths these inputs executed**. Not proof. |
+| `INCONCLUSIVE` | Instrumentation inactive, unparseable output, a genuine memory error, or an unattributable finding. |
+
+Two rules keep a result trustworthy, and both are enforced rather than assumed:
+
+* **Instrumentation must be confirmed active.** Outside Valgrind every client
+  request is a no-op, so the harness reports its run mode and a clean
+  uninstrumented run is `INCONCLUSIVE`, never a pass.
+* **Not every Memcheck error is a leak.** `UninitCondition` and `UninitValue`
+  are secret dependency; an `InvalidRead` is a memory bug and is reported as
+  one. Findings are attributed to the function under test by stack frame, so a
+  secret-derived value formatted by `println!` is not counted.
+
+Cases live in [`examples/native-cases.json`](examples/native-cases.json) with
+their expected outcomes, so a compiler change that invalidates a prediction
+surfaces as an unmet expectation.
+
+Requires **Valgrind** on Linux x86-64 (`apt-get install valgrind` or
+`dnf install valgrind valgrind-devel`). Ubuntu's `valgrind` package also ships
+the client-request headers the instrumentation shim needs at build time.
 
 ### `screen` — static screening and the regression gate
 
@@ -197,7 +296,7 @@ failure — never a silent pass.
 Cargo.toml                       workspace and the pinned release profile
 rust-toolchain.toml              pinned Rust channel and wasm32 target
 crates/trace-check/
-  src/main.rs                    CLI: screen, demo, compare, capture
+  src/main.rs                    CLI: native, screen, demo, compare, capture
   src/lib.rs                     end-to-end pipeline
   src/experiment.rs              cases.json loading and validation
   src/runner.rs                  WASM build, bounded wasm-interp execution
@@ -208,10 +307,17 @@ crates/trace-check/
   src/census.rs                  Tier 0 census and baseline regression gate
   src/taint.rs                   Tier 1 secret-dependence abstract interpreter
   src/screen.rs                  screening orchestration and reporting
+  src/security.rs                outcome vocabulary shared by all backends
+  src/memcheck.rs                Valgrind XML parsing and classification
+  src/native.rs                  native build + bounded Memcheck execution
+  src/native_report.rs           native text and JSON reporting
+crates/trace-check-secret/       secret marking for Memcheck (C shim)
   tests/integration.rs           fixture and end-to-end tests
   tests/fixtures/                compact captured traces
 examples/mac-compare/            the example, its cases.json, screen.json
                                  and committed artifact-baseline.json
+examples/table-lookup/           the secret-indexed address-leak example
+examples/native-cases.json       native case manifest with expectations
 examples/legacy-branch-demo/     original proof of concept, kept for context
 docs/                            milestone plan, methodology, limitations
 .github/workflows/ci.yml         pinned Linux CI
@@ -220,7 +326,8 @@ docs/                            milestone plan, methodology, limitations
 ## Development
 
 ```sh
-cargo test --workspace                    # 91 tests; backend tests skip without WABT
+cargo test --workspace --lib --bins       # fast suite, no backends needed
+cargo test --workspace                    # 153 tests; backend tests skip without WABT/Valgrind
 TRACE_CHECK_REQUIRE_BACKEND=1 cargo test --workspace   # a missing backend fails instead
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all
@@ -228,7 +335,12 @@ cargo fmt --all
 
 `TRACE_CHECK_REQUIRE_BACKEND=1` is what CI sets, so a skipped backend can never
 be mistaken for a pass. Some unit tests assemble inline `.wat` and therefore
-need `wat2wasm`; they follow the same skip-or-require contract.
+need `wat2wasm`; the native tests need Valgrind. All follow the same
+skip-or-require contract.
+
+Memcheck costs roughly an order of magnitude in runtime, so the instrumented
+tests live in their own integration target (`--test native`) and CI runs the
+fast suite first.
 
 ### When the baseline legitimately changes
 
@@ -240,6 +352,16 @@ refresh it:
 ```sh
 cargo run -p trace-check -- screen mac-compare --update-baseline
 ```
+
+### Supported platforms
+
+| Backend | Platform |
+| --- | --- |
+| WASM tracing and static screen | any host; needs WABT 1.0.42 |
+| Native Memcheck | Linux x86-64 only; needs Valgrind 3.x |
+
+The native backend refuses to run on any other target rather than producing
+a result that does not apply.
 
 ### Adding a screen target or a case
 
