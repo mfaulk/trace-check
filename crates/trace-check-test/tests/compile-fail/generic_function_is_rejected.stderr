@@ -1,0 +1,5 @@
+error: `constant_time` supports only non-generic free functions in M3; the compiled code of a generic function depends on its instantiation
+ --> tests/compile-fail/generic_function_is_rejected.rs:5:14
+  |
+5 | pub fn verify<T: PartialEq>(value: &T, other: &T) -> bool {
+  |              ^^^^^^^^^^^^^^
