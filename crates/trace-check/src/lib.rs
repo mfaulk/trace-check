@@ -4,12 +4,24 @@
 //! WABT's interpreter ([`runner`]), reduce raw trace text to ordered
 //! instruction locations ([`parser`]), compare those sequences ([`compare`]),
 //! and render the result with its provenance and limits ([`report`]).
+//!
+//! Alongside that dynamic pipeline, [`screen`] runs two static analyses over
+//! the compiled artifact: a structural census with a baseline regression gate
+//! ([`census`]) and a taint analysis for secret-dependent control flow
+//! ([`taint`]), both over the lowered module from [`wasm`].
 
+pub mod census;
 pub mod compare;
 pub mod experiment;
 pub mod parser;
 pub mod report;
 pub mod runner;
+pub mod screen;
+pub mod taint;
+pub mod wasm;
+
+#[cfg(test)]
+mod testwat;
 
 use std::path::Path;
 
