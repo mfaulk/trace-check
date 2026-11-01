@@ -418,6 +418,22 @@ the macro. The seams:
   and the CLI maps outcome-versus-expectation to an exit code. An
   `assert_constant_time!` macro would call the same comparison.
 
+### The gap an assertion API must close
+
+`run_mode() == Valgrind` proves the tool is active. It does **not** prove that a
+particular secret was successfully tainted and then consumed by the code under
+test. A marking that silently failed — the wrong address, a copy made before
+the guard, an inlining pattern that bypassed the marked storage — would look
+exactly like a clean result.
+
+M2 closes that gap per *case*, with the `control-unmarked-secret` and
+known-vulnerable cases calibrating the suite as a whole. A standalone
+`assert_constant_time!` has no such suite around it, so it needs an equivalent
+check built in: the assertion should be unable to report "no leak" unless a
+paired known-vulnerable variant was detected in the same run. Designing that
+positive-control requirement into the macro from the start is cheaper than
+retrofitting trust into it later.
+
 What M2 does **not** build, by instruction: procedural macros, automatic test
 generation, annotation discovery, a general annotation language, SMT or symbolic
 execution, native instruction-by-instruction tracing, key management.
