@@ -468,7 +468,7 @@ fn run_bounded(
     Ok(stdout)
 }
 
-fn tool_version(program: &Path, args: &[&str]) -> Result<String, RunError> {
+pub fn tool_version(program: &Path, args: &[&str]) -> Result<String, RunError> {
     let output = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
@@ -487,9 +487,11 @@ fn tool_version(program: &Path, args: &[&str]) -> Result<String, RunError> {
 }
 
 /// Builds the example for WASM and returns the artifact path reported by cargo.
+/// Public so the static screen can analyze the same artifact the dynamic
+/// experiment traces.
 /// The path is read from cargo's JSON output rather than guessed, so a custom
 /// `CARGO_TARGET_DIR` does not silently trace a stale module.
-fn build_wasm(manifest: &Path, package: &str) -> Result<PathBuf, RunError> {
+pub fn build_wasm(manifest: &Path, package: &str) -> Result<PathBuf, RunError> {
     let output = Command::new("cargo")
         .args([
             "build",

@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "module_sha256": "1ed43f4a199aaabd960cd56c523efa8cc0c67bb8c93e3c2968a4b42d3285b83b",
+  "rustc_version": "rustc 1.97.0 (2d8144b78 2026-07-07)",
+  "target": "wasm32-unknown-unknown",
+  "profile": "release",
+  "functions": {
+    "verify_constant_time": {
+      "instructions": 33,
+      "br_if": 1,
+      "br_table": 0,
+      "if": 0,
+      "loops": 1,
+      "select": 0,
+      "loads": 2,
+      "stores": 0,
+      "calls": 2,
+      "call_indirect": 0,
+      "unsupported": 0
+    },
+    "verify_early_exit": {
+      "instructions": 37,
+      "br_if": 0,
+      "br_table": 0,
+      "if": 0,
+      "loops": 0,
+      "select": 0,
+      "loads": 8,
+      "stores": 0,
+      "calls": 0,
+      "call_indirect": 0,
+      "unsupported": 0
+    },
+    "verify_early_exit_opaque": {
+      "instructions": 198,
+      "br_if": 31,
+      "br_table": 0,
+      "if": 0,
+      "loops": 0,
+      "select": 0,
+      "loads": 64,
+      "stores": 0,
+      "calls": 0,
+      "call_indirect": 0,
+      "unsupported": 0
+    }
+  }
+}
