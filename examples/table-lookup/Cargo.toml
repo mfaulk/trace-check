@@ -1,0 +1,21 @@
+[package]
+name = "table-lookup"
+description = "Secret-indexed table lookup: the address-leak class invisible to instruction-path comparison"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The harness is gated so an ordinary `cargo build --workspace` never needs the
+# instrumentation crate, keeping the fast suite independent of Valgrind.
+[[bin]]
+name = "table-lookup-native"
+path = "src/bin/native_harness.rs"
+required-features = ["native-harness"]
+
+[features]
+native-harness = ["dep:trace-check-secret"]
+
+[dependencies]
+subtle = "2.6"
+trace-check-secret = { path = "../../crates/trace-check-secret", optional = true }
