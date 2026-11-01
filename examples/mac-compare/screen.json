@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "description": "Static screening targets. Secrets are declared at the function boundary because taint is not tracked through linear memory: the exported wrappers store their i64 words to memory before calling a verifier, so screening an export would report a false clean. The verifiers are the leaf primitives where the secret arrives as a pointer parameter.",
+  "targets": [
+    {
+      "function": "verify_early_exit",
+      "description": "naive per-byte loop; the optimizer erases the branch, so this should screen clean despite a secret-dependent source-level if",
+      "secret_params": [
+        0
+      ],
+      "load_policy": "pointer-params",
+      "expect_clean": true
+    },
+    {
+      "function": "verify_early_exit_opaque",
+      "description": "volatile per-byte loads keep the branch, so the secret must reach a branch condition",
+      "secret_params": [
+        0
+      ],
+      "load_policy": "pointer-params",
+      "expect_clean": false
+    },
+    {
+      "function": "verify_constant_time",
+      "description": "subtle::ConstantTimeEq control; the secret must not reach any branch",
+      "secret_params": [
+        0
+      ],
+      "load_policy": "pointer-params",
+      "expect_clean": true
+    }
+  ]
+}

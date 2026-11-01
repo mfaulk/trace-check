@@ -4,11 +4,13 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+use trace_check::census::Baseline;
 use trace_check::compare::{compare, Outcome};
 use trace_check::experiment::Experiment;
 use trace_check::parser::parse_trace;
 use trace_check::run_experiment;
-use trace_check::runner::{Limits, Runner};
+use trace_check::runner::{self, Limits, Runner, CARGO_PROFILE, WASM_TARGET};
+use trace_check::screen::{self, ScreenConfig, ScreenInputs};
 
 /// Exit codes are part of the CLI contract: a tool that cannot tell a
 /// difference from a failure is unusable in CI.
@@ -45,6 +47,26 @@ enum Command {
         trace_b: PathBuf,
         #[arg(long, value_enum, default_value_t = Format::Text)]
         format: Format,
+    },
+    /// Statically screen the compiled artifact for secret-dependent control
+    /// flow, and gate its structural census against a recorded baseline.
+    Screen {
+        #[arg(value_enum)]
+        example: ExampleName,
+        /// Screen a prebuilt module instead of building the example.
+        #[arg(long)]
+        module: Option<PathBuf>,
+        /// Baseline file; defaults to the example's artifact-baseline.json.
+        #[arg(long)]
+        baseline: Option<PathBuf>,
+        /// Overwrite the baseline with the current census.
+        #[arg(long)]
+        update_baseline: bool,
+        /// Skip the baseline comparison even when a baseline file exists.
+        #[arg(long)]
+        no_baseline: bool,
+        #[command(flatten)]
+        options: DemoOptions,
     },
     /// Write a raw interpreter trace for one case. Raw traces contain the input
     /// values, including the modeled secret, so this is opt-in.
@@ -97,8 +119,21 @@ impl ExampleName {
     }
 
     fn cases_path(self, workspace_root: &Path) -> PathBuf {
+        self.example_dir(workspace_root).join("cases.json")
+    }
+
+    fn screen_path(self, workspace_root: &Path) -> PathBuf {
+        self.example_dir(workspace_root).join("screen.json")
+    }
+
+    fn baseline_path(self, workspace_root: &Path) -> PathBuf {
+        self.example_dir(workspace_root)
+            .join("artifact-baseline.json")
+    }
+
+    fn example_dir(self, workspace_root: &Path) -> PathBuf {
         match self {
-            ExampleName::MacCompare => workspace_root.join("examples/mac-compare/cases.json"),
+            ExampleName::MacCompare => workspace_root.join("examples/mac-compare"),
         }
     }
 }
@@ -127,6 +162,21 @@ fn run() -> Result<u8, String> {
             trace_b,
             format,
         } => compare_files(&trace_a, &trace_b, format),
+        Command::Screen {
+            example,
+            module,
+            baseline,
+            update_baseline,
+            no_baseline,
+            options,
+        } => screen_example(
+            example,
+            module.as_deref(),
+            baseline.as_deref(),
+            update_baseline,
+            no_baseline,
+            &options,
+        ),
         Command::Capture {
             example,
             variant,
@@ -155,6 +205,68 @@ fn demo(example: ExampleName, options: &DemoOptions) -> Result<u8, String> {
     }
 
     Ok(if report.summary.controls_reproduced {
+        EXIT_OK
+    } else {
+        EXIT_FINDING
+    })
+}
+
+fn screen_example(
+    example: ExampleName,
+    module: Option<&Path>,
+    baseline_override: Option<&Path>,
+    update_baseline: bool,
+    no_baseline: bool,
+    options: &DemoOptions,
+) -> Result<u8, String> {
+    let root = workspace_root(options)?;
+    let config = ScreenConfig::load(&example.screen_path(&root)).map_err(|e| e.to_string())?;
+
+    let module_path = match module {
+        Some(path) => path.to_path_buf(),
+        None => runner::build_wasm(&root.join("Cargo.toml"), example.package())
+            .map_err(|e| e.to_string())?,
+    };
+    let rustc_version =
+        runner::tool_version(Path::new("rustc"), &["--version"]).map_err(|e| e.to_string())?;
+    let inputs = ScreenInputs {
+        module_path: &module_path,
+        rustc_version: &rustc_version,
+        target: WASM_TARGET,
+        profile: CARGO_PROFILE,
+    };
+
+    let baseline_path = baseline_override
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| example.baseline_path(&root));
+
+    if update_baseline {
+        let captured = screen::capture_baseline(&config, &inputs).map_err(|e| e.to_string())?;
+        std::fs::write(&baseline_path, captured.to_json() + "\n")
+            .map_err(|e| format!("{}: {e}", baseline_path.display()))?;
+        eprintln!("wrote baseline to {}", baseline_path.display());
+        return Ok(EXIT_OK);
+    }
+
+    // The gate is on whenever a baseline exists, so CI needs no extra flag.
+    let recorded = if no_baseline || !baseline_path.is_file() {
+        None
+    } else {
+        Some(Baseline::load(&baseline_path).map_err(|e| e.to_string())?)
+    };
+    if recorded.is_none() && !no_baseline {
+        eprintln!(
+            "note: no baseline at {}; run `screen --update-baseline` to create one",
+            baseline_path.display()
+        );
+    }
+
+    let report = screen::run(&config, &inputs, recorded.as_ref()).map_err(|e| e.to_string())?;
+    match options.format {
+        Format::Text => print!("{}", report.to_text()),
+        Format::Json => println!("{}", report.to_json()),
+    }
+    Ok(if report.summary.passed {
         EXIT_OK
     } else {
         EXIT_FINDING
