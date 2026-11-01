@@ -9,11 +9,14 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use trace_check::census::Baseline;
 use trace_check::compare::{compare, Outcome};
 use trace_check::experiment::{Experiment, Variant};
 use trace_check::parser::{parse_trace, Decision};
 use trace_check::run_experiment;
-use trace_check::runner::{Limits, Runner};
+use trace_check::runner::{self, Limits, Runner};
+use trace_check::screen::{self, ScreenConfig, ScreenInputs};
+use trace_check::taint::FindingKind;
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -275,5 +278,202 @@ fn wabt_version_is_pinned() {
         version.trim(),
         trace_check::runner::REQUIRED_WABT_VERSION,
         "the installed WABT does not match the pinned version"
+    );
+}
+
+fn screen_inputs<'a>(module: &'a Path, rustc: &'a str) -> ScreenInputs<'a> {
+    ScreenInputs {
+        module_path: module,
+        rustc_version: rustc,
+        target: runner::WASM_TARGET,
+        profile: runner::CARGO_PROFILE,
+    }
+}
+
+fn built_module() -> (PathBuf, String) {
+    let module = runner::build_wasm(&workspace_root().join("Cargo.toml"), "mac-compare")
+        .expect("the example builds");
+    let rustc = runner::tool_version(Path::new("rustc"), &["--version"]).unwrap();
+    (module, rustc)
+}
+
+/// The bundled screen config validates and names the three variants.
+#[test]
+fn bundled_screen_config_is_valid() {
+    let config = ScreenConfig::load(&workspace_root().join("examples/mac-compare/screen.json"))
+        .expect("bundled screen config is valid");
+    assert_eq!(config.targets.len(), 3);
+    assert!(config
+        .function_names()
+        .contains(&"verify_constant_time".to_string()));
+}
+
+/// The static screen reproduces every declared expectation and agrees with the
+/// dynamic result: the naive comparator screens clean because its branch was
+/// erased, the volatile one has secret-dependent branches, and the `subtle`
+/// control is clean.
+#[test]
+fn screen_reproduces_declared_expectations() {
+    if !backend_available() {
+        return;
+    }
+    let root = workspace_root();
+    let config = ScreenConfig::load(&root.join("examples/mac-compare/screen.json")).unwrap();
+    let (module, rustc) = built_module();
+    let report = screen::run(&config, &screen_inputs(&module, &rustc), None).expect("screen runs");
+
+    assert!(
+        report.summary.passed,
+        "unmet: {:?}",
+        report.summary.unmet_expectations
+    );
+    assert_eq!(report.summary.inconclusive, 0);
+
+    let target = |name: &str| {
+        report
+            .targets
+            .iter()
+            .find(|t| t.function == name)
+            .unwrap_or_else(|| panic!("missing target {name}"))
+    };
+    assert!(target("verify_early_exit").verdict.is_clean());
+    assert!(!target("verify_early_exit_opaque").verdict.is_clean());
+    assert!(target("verify_constant_time").verdict.is_clean());
+}
+
+/// Tier 0 and Tier 1 are complementary: the `subtle` control contains a branch
+/// and a loop, yet no branch condition derives from the secret. A census alone
+/// would read that as a finding.
+#[test]
+fn census_branches_are_not_by_themselves_findings() {
+    if !backend_available() {
+        return;
+    }
+    let root = workspace_root();
+    let config = ScreenConfig::load(&root.join("examples/mac-compare/screen.json")).unwrap();
+    let (module, rustc) = built_module();
+    let report = screen::run(&config, &screen_inputs(&module, &rustc), None).unwrap();
+
+    let control = report
+        .targets
+        .iter()
+        .find(|t| t.function == "verify_constant_time")
+        .unwrap();
+    assert!(
+        control.census.branches() > 0,
+        "the control is expected to contain a branch on its public loop bound"
+    );
+    assert!(
+        control.verdict.is_clean(),
+        "but no branch condition may derive from the secret"
+    );
+}
+
+/// Every secret-dependent branch the analyzer reports in the volatile variant
+/// corresponds to a real `br_if` in the census, and the count matches the
+/// per-byte early exit (31 compared bytes branch; the last needs no branch).
+#[test]
+fn opaque_findings_match_the_census() {
+    if !backend_available() {
+        return;
+    }
+    let root = workspace_root();
+    let config = ScreenConfig::load(&root.join("examples/mac-compare/screen.json")).unwrap();
+    let (module, rustc) = built_module();
+    let report = screen::run(&config, &screen_inputs(&module, &rustc), None).unwrap();
+
+    let opaque = report
+        .targets
+        .iter()
+        .find(|t| t.function == "verify_early_exit_opaque")
+        .unwrap();
+    assert_eq!(opaque.census.br_if, 31);
+    assert_eq!(opaque.verdict.leaks().count(), 31);
+    assert!(opaque
+        .verdict
+        .leaks()
+        .all(|f| f.kind == FindingKind::SecretDependentBranch));
+}
+
+/// The committed baseline matches the current artifact's census, so the Tier 0
+/// gate passes on a clean tree.
+#[test]
+fn committed_baseline_matches_the_current_census() {
+    if !backend_available() {
+        return;
+    }
+    let root = workspace_root();
+    let config = ScreenConfig::load(&root.join("examples/mac-compare/screen.json")).unwrap();
+    let recorded = Baseline::load(&root.join("examples/mac-compare/artifact-baseline.json"))
+        .expect("the baseline is committed");
+    let (module, rustc) = built_module();
+    let report = screen::run(&config, &screen_inputs(&module, &rustc), Some(&recorded)).unwrap();
+
+    let comparison = report.baseline.expect("a baseline was supplied");
+    assert!(
+        !comparison.is_regression(),
+        "census drifted: {:?} added {:?} removed {:?}",
+        comparison.drift,
+        comparison.added,
+        comparison.removed
+    );
+}
+
+/// A baseline recording a branchless function fails the gate once a branch
+/// appears, which is the compiler-regression case the gate exists for.
+#[test]
+fn baseline_gate_catches_a_new_branch() {
+    if !backend_available() {
+        return;
+    }
+    let root = workspace_root();
+    let config = ScreenConfig::load(&root.join("examples/mac-compare/screen.json")).unwrap();
+    let (module, rustc) = built_module();
+
+    // Pretend the volatile variant used to be branchless.
+    let mut tampered =
+        Baseline::load(&root.join("examples/mac-compare/artifact-baseline.json")).unwrap();
+    tampered
+        .functions
+        .get_mut("verify_early_exit_opaque")
+        .unwrap()
+        .br_if = 0;
+
+    let report = screen::run(&config, &screen_inputs(&module, &rustc), Some(&tampered)).unwrap();
+    let comparison = report.baseline.expect("a baseline was supplied");
+    assert!(comparison.is_regression());
+    assert!(comparison
+        .drift
+        .iter()
+        .any(|d| d.function == "verify_early_exit_opaque" && d.field == "br_if"));
+    assert!(!report.summary.passed, "drift must fail the screen");
+}
+
+/// A screen config naming a function the module does not contain is an explicit
+/// error listing what is available, never a silent skip.
+#[test]
+fn unknown_screen_target_is_an_explicit_error() {
+    if !backend_available() {
+        return;
+    }
+    let (module, rustc) = built_module();
+    let config: ScreenConfig = serde_json::from_value(serde_json::json!({
+        "schema_version": 1,
+        "targets": [{
+            "function": "no_such_function",
+            "secret_params": [0],
+            "load_policy": "pointer-params",
+            "expect_clean": true
+        }]
+    }))
+    .unwrap();
+
+    let error = screen::run(&config, &screen_inputs(&module, &rustc), None)
+        .expect_err("an unknown target must fail");
+    let message = error.to_string();
+    assert!(message.contains("no_such_function"), "{message}");
+    assert!(
+        message.contains("verify_early_exit"),
+        "should list what is available: {message}"
     );
 }
