@@ -16,7 +16,7 @@ the formal noninterference property, and the roadmap.
 | --- | --- | --- |
 | M1 | Differential execution tracing (WASM, WABT) | complete |
 | M2 | Native secret-dependency analysis (Valgrind Memcheck) | complete |
-| M3 | Rust developer API — annotations, assertions, CI | next |
+| M3 | Rust developer API — annotations, assertions, CI | complete |
 | M4 | Symbolic verification — no concrete vectors | future |
 | M5 | Hardware-oriented validation — statistical timing | future |
 
@@ -37,10 +37,65 @@ the formal noninterference property, and the roadmap.
   two paths diverge.
 
 ```sh
+cargo trace-check test                           # your own crate's checks (M3)
 cargo run -p trace-check -- native               # native, under Memcheck
 cargo run -p trace-check -- screen mac-compare   # static, no execution
 cargo run -p trace-check -- demo mac-compare     # dynamic WASM tracing
 ```
+
+## Using it in your own crate
+
+Write constant-time checks as ordinary unit tests — no harness binary, no JSON
+manifest:
+
+```rust
+use trace_check_test::{assert_constant_time, ct_test};
+
+#[ct_test(target = "verify_tag")]
+fn verify_tag_is_constant_time() {
+    let supplied = [0u8; 32];
+
+    let accepted = assert_constant_time!(
+        secret = secret_tag(),
+        call = |expected| verify_tag(expected, &supplied),
+    );
+
+    // The macro evaluates to the call's value, so functional assertions work too.
+    assert!(!accepted);
+}
+```
+
+```sh
+cargo trace-check test                          # build, discover, run under Memcheck
+cargo trace-check test --filter verify_tag      # one check
+cargo trace-check test --format json            # machine-readable
+cargo trace-check list                          # what would run
+```
+
+Each check runs in its own process, and each one first runs a **positive
+control** that proves secret marking actually reaches compiled code — without
+it, a clean result would mean nothing. Plain `cargo test` keeps working without
+Valgrind: it passes and prints that the checks were *skipped*.
+
+Secrets are passed **by value** so the optimizer cannot fold past the marked
+storage. Supported: `secret = value` for `[u8; N]` and integer scalars,
+`secrets = (a, b)` for two, and `secret_bytes = slice` for a `&[u8]`. `Vec<u8>`
+and `String` are rejected at compile time, because marking a `Vec` would mark
+its pointer, length and capacity and none of the heap data.
+
+`#[constant_time(secret = "expected")]` declares a contract on a function. It
+emits the function verbatim — no production behavior change — and the runner
+reports a contract with no covering test as `untested` rather than as verified.
+
+Start from [`examples/consumer-crate`](examples/consumer-crate/README.md), which
+demonstrates clean cases, detected branch and address leaks, and an untested
+contract.
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | every required check executed and met its contract |
+| `1` | one or more constant-time violations detected |
+| `2` | incomplete analysis — inconclusive, zero checks selected, missing Valgrind, untested contract |
 
 These are deliberately complementary. The static screen quantifies over *all*
 inputs but over-approximates, so it can report candidates that are not real.
@@ -317,12 +372,16 @@ crates/trace-check/
   src/native.rs                  native build + bounded Memcheck execution
   src/native_report.rs           native text and JSON reporting
 crates/trace-check-secret/       secret marking for Memcheck (C shim)
+crates/trace-check-test/         developer API: assert_constant_time!, ct_test
+crates/trace-check-macros/       the ct_test and constant_time attributes
+crates/cargo-trace-check/        the `cargo trace-check test` subcommand
   tests/integration.rs           fixture and end-to-end tests
   tests/fixtures/                compact captured traces
 examples/mac-compare/            the example, its cases.json, screen.json
                                  and committed artifact-baseline.json
 examples/table-lookup/           the secret-indexed address-leak example
 examples/native-cases.json       native case manifest with expectations
+examples/consumer-crate/         using trace-check as a dependency (M3)
 examples/legacy-branch-demo/     original proof of concept, kept for context
 docs/                            milestone plan, methodology, limitations
 .github/workflows/ci.yml         pinned Linux CI
