@@ -25,6 +25,15 @@ jobs:
           rustc --version
           cargo --version
 
+      # Ubuntu's valgrind package ships the client-request headers, which the
+      # trace-check-secret shim needs at build time, as well as the binary.
+      - name: Install Valgrind
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y valgrind
+          valgrind --version
+          test -f /usr/include/valgrind/memcheck.h
+
       - uses: Swatinem/rust-cache@v2
 
       - name: Install WABT ${{ env.WABT_VERSION }}
@@ -47,17 +56,30 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      # A missing backend must fail rather than silently skip the end-to-end tests.
-      - name: Test
+      # A missing backend must fail rather than silently skip the end-to-end
+      # tests. The fast suite runs first so an ordinary regression surfaces
+      # before the slow instrumented tests.
+      - name: Test (fast)
         env:
           TRACE_CHECK_REQUIRE_BACKEND: "1"
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace --all-features --lib --bins
+
+      - name: Test (integration and instrumented)
+        env:
+          TRACE_CHECK_REQUIRE_BACKEND: "1"
+        run: cargo test --workspace --all-features --tests
 
       # Tier 0 + Tier 1. The baseline gate is active because the baseline file
       # is committed, so a toolchain change that alters the compiled shape of a
       # screened function fails here rather than passing unnoticed.
       - name: Screen the artifact (static)
         run: cargo run --locked --release -p trace-check -- screen mac-compare
+
+      # M2: native secret-dependency analysis. Must detect both the early-exit
+      # comparison and the secret-indexed memory access while accepting the
+      # constant-time implementations.
+      - name: Analyze native code (Memcheck)
+        run: cargo run --locked --release -p trace-check -- native
 
       - name: Reproduce the demonstration
         run: cargo run --locked --release -p trace-check -- demo mac-compare
@@ -68,6 +90,8 @@ jobs:
             > mac-compare-report.json
           cargo run --locked --release -p trace-check -- screen mac-compare --format json \
             > mac-compare-screen.json
+          cargo run --locked --release -p trace-check -- native --format json \
+            > native-memcheck.json
 
       - uses: actions/upload-artifact@v4
         with:
@@ -75,3 +99,4 @@ jobs:
           path: |
             mac-compare-report.json
             mac-compare-screen.json
+            native-memcheck.json

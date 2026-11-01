@@ -11,3 +11,4 @@
 # Generated reports. The committed artifact-baseline.json is not one of these.
 *-report.json
 *-screen.json
+native-memcheck.json
