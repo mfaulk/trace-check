@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/trace-check", "examples/mac-compare", "examples/legacy-branch-demo"]
+members = [
+    "crates/trace-check",
+    "crates/trace-check-secret",
+    "examples/mac-compare",
+    "examples/table-lookup",
+    "examples/legacy-branch-demo",
+]
 resolver = "2"
 
 [workspace.package]
@@ -15,3 +21,12 @@ opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
+
+# Native Memcheck analysis needs production-like optimization *and* symbols: a
+# finding without a source location is not actionable. `panic = "unwind"` is
+# kept here because the native harnesses are ordinary test binaries.
+[profile.memcheck]
+inherits = "release"
+debug = true
+strip = false
+panic = "unwind"
