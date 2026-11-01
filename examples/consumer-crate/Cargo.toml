@@ -1,0 +1,21 @@
+[package]
+name = "consumer-crate"
+description = "Using trace-check from an ordinary Rust crate: constant-time assertions as unit tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+# Enables a deliberately untested #[constant_time] contract, so the coverage
+# failure can be demonstrated and tested on its own. Off by default, because a
+# crate that always fails its own checks is a poor starting point to copy.
+untested-contract = []
+
+[dependencies]
+subtle = "2.6"
+# `#[constant_time]` annotates items in src/lib.rs, so the macro crate must be
+# resolvable when the library is compiled, not only when its tests are. The
+# attribute emits the function verbatim plus `#[cfg(test)]` metadata, so a
+# production build of this crate contains nothing from trace-check.
+trace-check-test = { path = "../../crates/trace-check-test" }
