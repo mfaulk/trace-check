@@ -66,12 +66,39 @@ measured, not assumed, and it does not certify the crate.
 No part of this tool labels code "secure" or "verified constant-time", and
 output deliberately avoids that vocabulary.
 
+## Static screening adds its own limits
+
+The `screen` command is a screen, not a proof. Three properties bound it:
+
+* **Secrets are declared, not discovered.** The analysis knows which values are
+  secret only because the config says so. A wrong declaration produces a
+  confident wrong answer, in either direction.
+* **Taint does not flow through memory.** A store of a secret value does not
+  taint later loads, so analysis must target the function where secrets arrive
+  at the boundary. Screening a wrapper that spills its arguments to memory
+  reports a false clean.
+* **Control flow is over-approximated.** Findings are candidates to confirm,
+  not confirmed leaks. Loop-carried taint is attributed to the whole function.
+
+A function containing an unmodeled operator yields no verdict, and that counts
+as inconclusive — never as clean.
+
+"Zero findings" therefore means: no *declared* secret reaches a branch, address
+or indirect call target, in *this* compiled module, under the *modeled*
+instruction subset. It does not mean the function is constant-time.
+
+The Tier 0 baseline gate makes an even narrower claim. It asserts only that the
+compiled shape of the screened functions has not changed since the baseline was
+recorded. A passing gate is not a security property; a failing gate is a prompt
+to go inspect the artifact.
+
 ## Scope boundaries by construction
 
 Out of scope for Milestone 1, by design rather than by omission:
 
 * native instrumentation (Valgrind) and hardware-level measurement,
-* memory-address and cache-line analysis,
+* memory-address and cache-line analysis *as an observed trace* — Tier 1 flags
+  secret-dependent addresses structurally, but nothing measures them,
 * statistical timing measurement,
 * secret-taint analysis or automatic discovery of which inputs are secret,
 * instrumentation of arbitrary crates or full protocol integrations,

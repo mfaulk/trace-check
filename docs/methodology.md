@@ -149,3 +149,113 @@ differ — that requires extending `ExecutionEvent` with address information, an
 the normalization rules above would have to change accordingly. Milestone 3
 moves to native machine code, where the relationship between interpreter-level
 findings and hardware behavior becomes the question.
+
+## Static screening
+
+Tracing answers "did these two runs execute the same path?" for the inputs you
+chose. Static screening answers a different question — "can a secret value
+reach a branch condition at all?" — which is quantified over every input but
+decided on an approximation. Both tiers run without executing the module.
+
+### Tier 0: structural census
+
+For each screened function, count instruction shapes: branches (`br_if`,
+`br_table`, `if`), loops, `select`s, loads, stores, calls, and operators outside
+the modeled subset. The census makes no security claim. Its value is as a
+tripwire against change.
+
+For a fixed-length comparison primitive, **zero branches** is a strong
+input-independent property, and it is cheap to assert. More importantly, the
+census is committed as `artifact-baseline.json` and compared on every CI run.
+The failure mode this exists for is a toolchain upgrade that if-converts a
+`select` back into a branch, or that stops vectorizing a loop — a regression
+invisible to source review, because the source did not change. Census drift
+fails the gate; the module hash is recorded but compared separately, since it
+changes on every compiler bump and would otherwise make the gate pure noise.
+
+### Tier 1: taint analysis
+
+A forward abstract interpretation over WASM's operand stack, locals and globals.
+Each abstract value carries three facts: whether it is secret, whether it
+derives from a declared secret-pointer parameter, and how many loads deep its
+derivation is. Findings are raised where a secret value reaches:
+
+| Sink | Finding | Why it matters |
+| --- | --- | --- |
+| `br_if` / `br_table` / `if` condition | `secret_dependent_branch` | secret-dependent control flow |
+| load or store address | `secret_dependent_address` | identical instruction path, varying access pattern |
+| `call_indirect` target | `secret_dependent_call_target` | secret-dependent dispatch |
+| `select` condition | `secret_select` (informational) | branchless, so not a leak of this kind |
+
+The `secret_dependent_address` sink is worth noting: it covers the
+secret-indexed-table class (AES S-boxes) that differential instruction tracing
+cannot see at all, because the instruction path is unchanged. That is Milestone
+2's subject, reachable statically today.
+
+### Declaring where secrets enter
+
+Nothing in a compiled module marks which bytes are a key, so the screen config
+declares it per function: which parameters are secret, and how secrets reach
+them. The load policy exists because the answer depends on the ABI:
+
+* `params` — secrets arrive as scalars. A load is secret only if its *address*
+  is secret. Declaring a pointer parameter secret under this policy marks the
+  pointer value itself as secret, which correctly flags the load address but is
+  usually not what you mean.
+* `pointer-params` — a parameter points directly at secret bytes, as with
+  `&[u8; 32]`. Loads through it are secret; the address is not.
+* `pointer-params-indirect` — a parameter points at a descriptor holding a data
+  pointer and a length, as with `&[u8]`. The first dereference reads public
+  metadata; only a second-level dereference reaches the data.
+
+That last policy exists for a concrete false positive. A hand-rolled
+`acc |= a[i] ^ b[i]` loop over `&[u8]` compiles to five branches, two loops and
+a `select` — every one of them testing the slice *length*, which is public. A
+branch census alone calls that leaky. It is not, and distinguishing the two
+requires knowing that the first dereference is metadata.
+
+### What the model does not do
+
+The analysis is **intraprocedural** and **does not track taint through linear
+memory**: a store of a secret value does not taint later loads. This is why the
+bundled config screens the verifier functions rather than the exported
+wrappers — the wrappers store their `i64` argument words to memory before
+calling a verifier, so screening an export would report a false clean.
+
+Control flow is **over-approximated**. Loop-carried taint is propagated by
+re-running the function to a fixpoint with locals seeded from the previous pass,
+so a local that becomes secret inside a loop is treated as secret throughout the
+function, including before the loop. Erring toward reporting too much is the
+right direction for a screen, but it means a finding is a *candidate* to be
+confirmed — by reading the artifact, or by differential tracing.
+
+A function containing an operator outside the modeled subset gets **no verdict**
+at all, and that counts as inconclusive rather than clean. A screener that
+silently skipped instructions it did not model would report "no finding" for
+code it never looked at.
+
+## Screening workflow
+
+The two tiers here are the cheap end of a longer ladder. For reference, in
+increasing cost and power:
+
+1. **Tier 0 regression gate** — census drift in CI. No analysis, catches
+   compiler-induced decay.
+2. **Tier 1 taint** — quantified over all inputs, over-approximating.
+3. **Differential tracing** (`demo`) — exact for the inputs run; confirms that
+   taint actually reaches control flow and prunes Tier 1 candidates.
+4. **Memory-address tracing** — Milestone 2; needed to *observe* the
+   secret-indexed-access class that Tier 1 can only flag structurally.
+5. **Statistical timing on hardware** — e.g. `dudect`; the only method that
+   catches variable-latency instructions, which no trace-based analysis sees.
+
+Prior art worth knowing rather than reinventing: **ctgrind** marks secrets as
+uninitialized and lets Valgrind's memcheck report when an undefined value
+reaches a branch or an address, which is taint analysis for free;
+**Microwalk** does dynamic taint with leakage quantification; **DFSan** is
+LLVM's dataflow sanitizer; **ct-verif**, **Binsec/Rel** and **Jasmin** cover the
+formal end.
+
+One boundary applies to all of it here: WASM is a convenient, stable IR, but it
+is not what runs on hardware. A clean WASM screen says nothing about a native
+build — the same argument as the `early_exit` erasure, one level up.

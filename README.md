@@ -5,17 +5,28 @@ The classic example is an authentication-tag comparison that stops at the first
 differing byte: how long it runs tells an attacker how much of their guess was
 correct.
 
-`trace-check` turns that idea into a reproducible experiment. It builds a small
-WebAssembly module, runs it under WABT's interpreter with paired inputs that
-differ **only** in a modeled secret, reduces each raw trace to an ordered
-sequence of executed instruction locations, and reports where the two paths
-diverge.
+`trace-check` turns that idea into reproducible analysis, from two directions:
 
-One command runs the whole thing:
+* **Statically** (`screen`) — parse the compiled WASM, count the control-flow
+  shapes of each screened function against a committed baseline, and track
+  which values derive from the secret to see whether any of them reaches a
+  branch, a memory address, or an indirect call target.
+* **Dynamically** (`demo`) — run the module under WABT's interpreter with
+  paired inputs that differ **only** in a modeled secret, reduce each raw trace
+  to an ordered sequence of executed instruction locations, and report where the
+  two paths diverge.
 
 ```sh
-cargo run -p trace-check -- demo mac-compare
+cargo run -p trace-check -- screen mac-compare   # static, no execution
+cargo run -p trace-check -- demo mac-compare     # dynamic, builds and runs
 ```
+
+The two are deliberately complementary. The static screen quantifies over *all*
+inputs but over-approximates, so it can report candidates that are not real.
+Differential tracing is exact for the inputs it runs but says nothing about the
+inputs it did not. The `subtle` control in the bundled example shows why you
+want both: its census contains a branch and a loop, yet no branch condition
+derives from the secret — a census alone would read that as a finding.
 
 ## What it actually shows — and what it does not
 
@@ -30,6 +41,12 @@ Results are reported as one of three outcomes:
 | `DIFFERENCE_DETECTED` | The instruction path changed when only the secret changed. Evidence of secret-dependent behavior. |
 | `NO_DIFFERENCE_OBSERVED` | Paths matched **for the tested inputs**. Not proof of constant-time security. |
 | `INCONCLUSIVE` | Capture, parsing, nondeterminism, or a confounded decision prevented a trustworthy answer. |
+
+The static screen reports per-function findings instead, of three kinds:
+`secret_dependent_branch`, `secret_dependent_address` (an identical
+instruction path whose memory access pattern still varies), and
+`secret_dependent_call_target`. A `select` with a secret condition is reported
+as informational, not a leak: it is branchless, which is the point.
 
 See [docs/limitations.md](docs/limitations.md) for the full boundary, and
 [docs/methodology.md](docs/methodology.md) for the threat model and procedure.
@@ -46,6 +63,12 @@ of them accepting where another rejects.
 | `early_exit` | naive per-byte loop with `return false` | **no path difference** — LLVM vectorizes it into a branchless XOR/OR tree at `opt-level = 3` |
 | `early_exit_opaque` | same loop, per-byte `read_volatile` loads | **path difference** — the branch survives; executed work grows by 6 instructions per compared byte |
 | `constant_time` | `subtle::ConstantTimeEq` | **no path difference** — flat at 1138 events regardless of mismatch position |
+
+Both analyses reach all three of those conclusions independently, which is the
+strongest validation available here: the static screen finds exactly 31
+secret-dependent branches in `early_exit_opaque` — one per compared byte, the
+last needing none — matching the 6-instructions-per-byte growth measured
+dynamically.
 
 The `early_exit` row is the point of keeping it. A secret-dependent `if` in
 Rust source is *not* evidence of a secret-dependent branch in the compiled
@@ -79,6 +102,48 @@ Observed event counts for `early_exit_opaque`, by mismatch position:
   are then not comparable to recorded ones.
 
 ## Commands
+
+### `screen` — static screening and the regression gate
+
+```sh
+cargo run -p trace-check -- screen mac-compare
+cargo run -p trace-check -- screen mac-compare --format json
+cargo run -p trace-check -- screen mac-compare --module path/to/other.wasm
+```
+
+Runs both static tiers and needs no interpreter:
+
+* **Tier 0 — structural census.** Counts branches, loops, `select`s, loads,
+  stores and calls per screened function and compares them to
+  `examples/mac-compare/artifact-baseline.json`. Census drift fails the gate;
+  this is what catches a toolchain upgrade that if-converts a `select` back into
+  a branch, the realistic way constant-time code decays. A module-hash change on
+  its own is reported as a note, not a failure, since it changes on every
+  compiler bump.
+* **Tier 1 — taint analysis.** A forward abstract interpretation over the
+  operand stack, locals and globals, flagging where a secret-derived value
+  reaches a branch condition, a memory address, or an indirect call target.
+
+The gate is active whenever the baseline file exists, so CI needs no extra flag.
+
+| Option | Effect |
+| --- | --- |
+| `--update-baseline` | overwrite the baseline with the current census |
+| `--no-baseline` | skip the comparison even if a baseline exists |
+| `--baseline PATH` | use a different baseline file |
+| `--module PATH` | screen a prebuilt module instead of building the example |
+
+Which parameters are secret, and how secrets reach each function, are declared
+in [`examples/mac-compare/screen.json`](examples/mac-compare/screen.json) —
+nothing in a compiled module says which bytes are a key, and a screener that
+guessed would quietly analyze the wrong thing. Three load policies are
+available:
+
+| Policy | Use when |
+| --- | --- |
+| `params` | secrets arrive as scalar values |
+| `pointer-params` | a parameter points directly at secret bytes (`&[u8; 32]`) |
+| `pointer-params-indirect` | a parameter points at a descriptor holding a data pointer and length (`&[u8]`); the first dereference is treated as public metadata |
 
 ### `demo` — build, run and compare an example end to end
 
@@ -118,8 +183,8 @@ modeled secret, and are git-ignored except for the compact fixtures under
 
 | Code | Meaning |
 | --- | --- |
-| `0` | `demo`: every declared expectation reproduced. `compare`: `NO_DIFFERENCE_OBSERVED`. |
-| `1` | `demo`: an expectation was not reproduced. `compare`: `DIFFERENCE_DETECTED`. |
+| `0` | `demo`: every declared expectation reproduced. `screen`: every declaration held and the census did not drift. `compare`: `NO_DIFFERENCE_OBSERVED`. |
+| `1` | `demo`: an expectation was not reproduced. `screen`: a finding, an unmet declaration, or baseline drift. `compare`: `DIFFERENCE_DETECTED`. |
 | `2` | Error or `INCONCLUSIVE`: missing backend, build failure, timeout, trap, unparseable trace. |
 
 A missing tool, a trap, a timeout, an oversized capture, an unknown export, a
@@ -132,16 +197,21 @@ failure — never a silent pass.
 Cargo.toml                       workspace and the pinned release profile
 rust-toolchain.toml              pinned Rust channel and wasm32 target
 crates/trace-check/
-  src/main.rs                    CLI: demo, compare, capture
+  src/main.rs                    CLI: screen, demo, compare, capture
   src/lib.rs                     end-to-end pipeline
   src/experiment.rs              cases.json loading and validation
   src/runner.rs                  WASM build, bounded wasm-interp execution
   src/parser.rs                  wasm-interp --trace grammar -> ExecutionEvent
   src/compare.rs                 differential analysis and outcomes
   src/report.rs                  text and versioned JSON reporting
+  src/wasm.rs                    WASM binary -> modeled instruction subset
+  src/census.rs                  Tier 0 census and baseline regression gate
+  src/taint.rs                   Tier 1 secret-dependence abstract interpreter
+  src/screen.rs                  screening orchestration and reporting
   tests/integration.rs           fixture and end-to-end tests
   tests/fixtures/                compact captured traces
-examples/mac-compare/            the traced example and its cases.json
+examples/mac-compare/            the example, its cases.json, screen.json
+                                 and committed artifact-baseline.json
 examples/legacy-branch-demo/     original proof of concept, kept for context
 docs/                            milestone plan, methodology, limitations
 .github/workflows/ci.yml         pinned Linux CI
@@ -150,22 +220,42 @@ docs/                            milestone plan, methodology, limitations
 ## Development
 
 ```sh
-cargo test --workspace                    # 54 tests; end-to-end tests skip without WABT
+cargo test --workspace                    # 91 tests; backend tests skip without WABT
 TRACE_CHECK_REQUIRE_BACKEND=1 cargo test --workspace   # a missing backend fails instead
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all
 ```
 
 `TRACE_CHECK_REQUIRE_BACKEND=1` is what CI sets, so a skipped backend can never
-be mistaken for a pass.
+be mistaken for a pass. Some unit tests assemble inline `.wat` and therefore
+need `wat2wasm`; they follow the same skip-or-require contract.
 
-### Adding a case or comparison
+### When the baseline legitimately changes
 
-Edit `examples/mac-compare/cases.json`: add a case (32-byte hex tag plus its
-expected decision) or a comparison (variant, two case ids, expected outcome, and
-the reasoning). The fixture is validated before anything is executed — unknown
-references, duplicate ids, self-comparisons and malformed tags are rejected up
-front.
+A toolchain bump that changes a screened function's compiled shape fails the
+Tier 0 gate by design. Inspect the new artifact first — the point of the gate is
+that this is where a constant-time regression would appear — and only then
+refresh it:
+
+```sh
+cargo run -p trace-check -- screen mac-compare --update-baseline
+```
+
+### Adding a screen target or a case
+
+For the static screen, add a target to `examples/mac-compare/screen.json`
+(function name, secret parameter indices, load policy, and whether it is
+expected to be clean) and refresh the baseline.
+
+For the dynamic experiment, edit `examples/mac-compare/cases.json`: add a case
+(32-byte hex tag plus its expected decision) or a comparison (variant, two case
+ids, expected outcome, and the reasoning). The fixture is validated before
+anything is executed — unknown references, duplicate ids, self-comparisons and
+malformed tags are rejected up front.
+
+In both files the *expectation* lives in the fixture rather than in code, so a
+compiler change that invalidates a prediction surfaces as an unmet expectation
+instead of being silently absorbed.
 
 ### The legacy example
 
