@@ -81,6 +81,38 @@ jobs:
       - name: Analyze native code (Memcheck)
         run: cargo run --locked --release -p trace-check -- native
 
+      # M3: the developer-facing workflow. The consumer crate deliberately
+      # contains vulnerable implementations, so a full run exits 1 by design;
+      # the filtered run is the one that must exit 0.
+      - name: Constant-time checks pass for the clean cases
+        working-directory: examples/consumer-crate
+        run: cargo run --locked --release -p cargo-trace-check -- test --filter constant_time
+
+      - name: Constant-time checks detect the vulnerable cases
+        working-directory: examples/consumer-crate
+        run: |
+          set +e
+          cargo run --locked --release -p cargo-trace-check -- test --format json \
+            > "$GITHUB_WORKSPACE/m3-consumer.json"
+          code=$?
+          set -e
+          if [ "$code" != "1" ]; then
+            echo "expected exit 1 (leak detected), got $code"
+            exit 1
+          fi
+          python3 "$GITHUB_WORKSPACE/ci/verify-m3-consumer.py" \
+            "$GITHUB_WORKSPACE/m3-consumer.json"
+
+      - name: An untested contract fails the run
+        working-directory: examples/consumer-crate
+        run: |
+          set +e
+          cargo run --locked --release -p cargo-trace-check -- test \
+            --features untested-contract --filter verify_tag_is_constant_time
+          code=$?
+          set -e
+          test "$code" = "2" || { echo "expected exit 2 (incomplete), got $code"; exit 1; }
+
       - name: Reproduce the demonstration
         run: cargo run --locked --release -p trace-check -- demo mac-compare
 
