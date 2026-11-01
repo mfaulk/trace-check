@@ -302,3 +302,122 @@ fn address_leak_is_invisible_to_instruction_path_comparison() {
         "M2 must detect what M1 structurally cannot"
     );
 }
+
+/// Real Valgrind output parses, and truncating it at any point never yields a
+/// clean run.
+///
+/// The end-to-end counterpart to the unit tests: rather than trusting
+/// hand-written fixtures, this captures genuine Memcheck XML and verifies that
+/// every prefix of it is either rejected or still reports the findings it
+/// contains. A prefix that parsed to zero errors would mean incomplete
+/// instrumentation evidence reading as NO_LEAK_OBSERVED.
+#[test]
+fn no_prefix_of_real_memcheck_output_parses_as_clean() {
+    if !valgrind_available() {
+        return;
+    }
+    let root = workspace_root();
+    let manifest = manifest();
+    let case = manifest
+        .cases
+        .iter()
+        .find(|case| case.id == "table-secret-index")
+        .expect("the address-leak case exists");
+
+    // Capture real XML by running the case through the backend once, then
+    // re-read it from a fresh Valgrind invocation we control.
+    let runner = native::NativeRunner::prepare(&root.join("Cargo.toml"), native::Limits::default())
+        .expect("valgrind is available");
+    let (binary, _hash) = runner.build(case).expect("the harness builds");
+
+    let xml_path = std::env::temp_dir().join(format!(
+        "trace-check-prefix-test-{}.xml",
+        std::process::id()
+    ));
+    let status = Command::new("valgrind")
+        .args([
+            "--tool=memcheck",
+            "--xml=yes",
+            &format!("--xml-file={}", xml_path.display()),
+        ])
+        .arg(&binary)
+        .arg(&case.case)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("valgrind runs");
+    assert!(status.code().is_some(), "valgrind should exit normally");
+
+    let xml = std::fs::read_to_string(&xml_path).expect("valgrind wrote XML");
+    let _ = std::fs::remove_file(&xml_path);
+
+    // The complete document must parse and contain the address finding.
+    let complete = trace_check::memcheck::parse(&xml).expect("real output parses");
+    assert!(
+        complete.secret_dependency_errors().count() > 0,
+        "the captured run should contain the address finding"
+    );
+
+    // Step through prefixes. Any that parses must still carry every finding
+    // the complete document had; none may parse to an empty error list.
+    let expected = complete.errors.len();
+    let step = (xml.len() / 40).max(1);
+    let mut accepted_prefixes = 0;
+    for end in (1..xml.len()).step_by(step) {
+        // Only cut on a char boundary.
+        if !xml.is_char_boundary(end) {
+            continue;
+        }
+        if let Ok(partial) = trace_check::memcheck::parse(&xml[..end]) {
+            accepted_prefixes += 1;
+            assert_eq!(
+                partial.errors.len(),
+                expected,
+                "a truncated prefix of length {end} parsed with {} of {expected} errors; \
+                 incomplete evidence must never read as a shorter error list",
+                partial.errors.len()
+            );
+        }
+    }
+    // Only the full document should be accepted, so no strict prefix passes.
+    assert_eq!(
+        accepted_prefixes, 0,
+        "no strict prefix of a Memcheck document should be accepted"
+    );
+}
+
+/// A harness killed by the timeout cannot produce a clean security result: the
+/// backend reports a harness failure rather than NO_LEAK_OBSERVED.
+#[test]
+fn a_timed_out_run_is_never_clean() {
+    if !valgrind_available() {
+        return;
+    }
+    let root = workspace_root();
+    let manifest = manifest();
+    let case = manifest
+        .cases
+        .iter()
+        .find(|case| case.id == "table-constant-time-scan")
+        .expect("case exists");
+
+    // A timeout far below what Memcheck needs, so the run is always killed.
+    let limits = native::Limits {
+        timeout: std::time::Duration::from_millis(1),
+        ..native::Limits::default()
+    };
+    let outcome = run_native_case(&root.join("Cargo.toml"), case, limits);
+    match outcome {
+        Err(error) => {
+            let message = error.to_string();
+            assert!(
+                message.contains("timeout") || message.contains("exceeded"),
+                "a killed run should be reported as a timeout, got: {message}"
+            );
+        }
+        Ok(report) => panic!(
+            "a killed run must not produce a verdict, got {}",
+            report.cases[0].result.outcome
+        ),
+    }
+}

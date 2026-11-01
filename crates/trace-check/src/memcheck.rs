@@ -5,6 +5,12 @@
 //! file and line — which is what makes a finding actionable and what makes
 //! attribution possible at all.
 //!
+//! Completeness is checked before any content is trusted. A document that
+//! ended early must never parse to "no errors found", because that converts
+//! missing instrumentation evidence into a clean security result — the one
+//! failure mode a security tool cannot have. See [`parse`] for the four
+//! independent checks.
+//!
 //! Two classification rules carry the weight:
 //!
 //! * Only `UninitCondition` and `UninitValue` are secret-dependency findings.
@@ -188,12 +194,23 @@ impl MemcheckRun {
 
 #[derive(Debug)]
 pub enum MemcheckParseError {
-    /// Not Valgrind XML at all, or a truncated document.
+    /// Not Valgrind XML at all, or syntactically invalid.
     Malformed(String),
-    /// Valgrind produced XML for a different protocol version.
+    /// The document ended with structure still open, so instrumentation
+    /// evidence may be missing. Never treated as "no errors found".
+    Truncated(String),
+    /// Valgrind produced XML for a protocol version this build does not know.
     UnsupportedProtocol { found: String },
+    /// No `<protocolversion>`, so the layout cannot be assumed.
+    MissingProtocolVersion,
     /// The document parsed but contained no `<valgrindoutput>` root.
     MissingRoot,
+    /// The XML came from a different Valgrind tool, whose error kinds this
+    /// classifier does not model.
+    WrongTool { found: String },
+    /// Valgrind never reported `FINISHED`, so the run was killed, crashed, or
+    /// the output was captured mid-write.
+    NotFinished,
 }
 
 impl fmt::Display for MemcheckParseError {
@@ -202,15 +219,34 @@ impl fmt::Display for MemcheckParseError {
             MemcheckParseError::Malformed(detail) => {
                 write!(f, "malformed Memcheck XML: {detail}")
             }
+            MemcheckParseError::Truncated(detail) => write!(
+                f,
+                "truncated Memcheck XML ({detail}); instrumentation evidence may be \
+                 incomplete, so no security conclusion can be drawn"
+            ),
             MemcheckParseError::UnsupportedProtocol { found } => write!(
                 f,
                 "Memcheck XML protocol version {found:?} is not supported (this build \
                  understands {})",
                 SUPPORTED_PROTOCOL_VERSIONS.join(", ")
             ),
+            MemcheckParseError::MissingProtocolVersion => write!(
+                f,
+                "Memcheck XML has no <protocolversion>, so its layout cannot be assumed"
+            ),
             MemcheckParseError::MissingRoot => {
                 write!(f, "Memcheck XML has no <valgrindoutput> root element")
             }
+            MemcheckParseError::WrongTool { found } => write!(
+                f,
+                "XML was produced by the Valgrind tool {found:?}, not memcheck; its error \
+                 kinds are not modeled here"
+            ),
+            MemcheckParseError::NotFinished => write!(
+                f,
+                "Valgrind did not report FINISHED, so the run was killed, crashed, or its \
+                 output was captured mid-write"
+            ),
         }
     }
 }
@@ -219,22 +255,37 @@ impl std::error::Error for MemcheckParseError {}
 
 /// Parses Valgrind's XML output.
 ///
-/// Implemented over `quick-xml`'s event reader rather than by matching text, so
-/// a truncated document is a parse error instead of a short error list — the
-/// same rule M1's trace parser applies to truncated traces.
+/// Completeness is enforced before any content is trusted. A document that
+/// ended early — because Valgrind was killed, crashed, or its output was read
+/// mid-write — must never parse to "no errors found": that would turn missing
+/// instrumentation evidence into a clean security result. Four independent
+/// checks have to pass:
+///
+/// * the document is syntactically valid and every element is closed,
+/// * `<protocolversion>` is present and known,
+/// * `<tool>` is `memcheck`, since other tools use different error kinds,
+/// * a terminal `<status><state>FINISHED</state>` was seen.
+///
+/// The `FINISHED` marker is the strongest of these. Balanced tags only prove
+/// the bytes we received were well-formed; `FINISHED` proves Valgrind ran to
+/// completion and wrote its full report.
 pub fn parse(xml: &str) -> Result<MemcheckRun, MemcheckParseError> {
     use quick_xml::events::Event;
     use quick_xml::Reader;
 
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
+    reader.config_mut().check_end_names = true;
 
-    let mut protocol_version = None;
+    let mut protocol_version: Option<String> = None;
+    let mut tool: Option<String> = None;
     let mut errors = Vec::new();
     let mut saw_root = false;
+    let mut root_closed = false;
+    let mut finished = false;
+    let mut depth: usize = 0;
+    let mut in_status = false;
 
-    // Current parse state.
-    let mut path: Vec<String> = Vec::new();
     let mut current: Option<PartialError> = None;
     let mut frame: Option<Frame> = None;
     let mut text = String::new();
@@ -245,8 +296,10 @@ pub fn parse(xml: &str) -> Result<MemcheckRun, MemcheckParseError> {
             Ok(Event::Eof) => break,
             Ok(Event::Start(start)) => {
                 let name = String::from_utf8_lossy(start.name().as_ref()).into_owned();
+                depth += 1;
                 match name.as_str() {
                     "valgrindoutput" => saw_root = true,
+                    "status" => in_status = true,
                     "error" => current = Some(PartialError::default()),
                     "frame" => {
                         frame = Some(Frame {
@@ -258,7 +311,6 @@ pub fn parse(xml: &str) -> Result<MemcheckRun, MemcheckParseError> {
                     }
                     _ => {}
                 }
-                path.push(name);
                 text.clear();
             }
             Ok(Event::Text(contents)) => {
@@ -269,18 +321,31 @@ pub fn parse(xml: &str) -> Result<MemcheckRun, MemcheckParseError> {
             }
             Ok(Event::End(end)) => {
                 let name = String::from_utf8_lossy(end.name().as_ref()).into_owned();
+                depth = depth.checked_sub(1).ok_or_else(|| {
+                    MemcheckParseError::Malformed(format!("unbalanced </{name}>"))
+                })?;
                 let in_error = current.is_some();
                 let in_frame = frame.is_some();
 
                 match name.as_str() {
+                    "valgrindoutput" if depth == 0 => root_closed = true,
                     "protocolversion" if !in_error => protocol_version = Some(text.clone()),
+                    "tool" if !in_error => tool = Some(text.clone()),
+                    "state" if in_status => {
+                        if text.trim() == "FINISHED" {
+                            finished = true;
+                        }
+                    }
+                    "status" => in_status = false,
                     "fn" if in_frame => frame.as_mut().unwrap().function = Some(text.clone()),
                     "file" if in_frame => frame.as_mut().unwrap().file = Some(text.clone()),
                     "obj" if in_frame => frame.as_mut().unwrap().object = Some(text.clone()),
                     "line" if in_frame => frame.as_mut().unwrap().line = text.trim().parse().ok(),
                     "frame" => {
-                        if let (Some(finished), Some(error)) = (frame.take(), current.as_mut()) {
-                            error.stack.push(finished);
+                        if let (Some(finished_frame), Some(error)) =
+                            (frame.take(), current.as_mut())
+                        {
+                            error.stack.push(finished_frame);
                         }
                     }
                     "kind" if in_error => current.as_mut().unwrap().kind = Some(text.clone()),
@@ -293,13 +358,12 @@ pub fn parse(xml: &str) -> Result<MemcheckRun, MemcheckParseError> {
                     // `auxwhat` carries origin detail under --track-origins.
                     "auxwhat" if in_error => current.as_mut().unwrap().origin = Some(text.clone()),
                     "error" => {
-                        if let Some(finished) = current.take() {
-                            errors.push(finished.build());
+                        if let Some(complete) = current.take() {
+                            errors.push(complete.build());
                         }
                     }
                     _ => {}
                 }
-                path.pop();
                 text.clear();
             }
             Ok(_) => {}
@@ -309,13 +373,51 @@ pub fn parse(xml: &str) -> Result<MemcheckRun, MemcheckParseError> {
     if !saw_root {
         return Err(MemcheckParseError::MissingRoot);
     }
-    let protocol_version = protocol_version.unwrap_or_default();
-    if !protocol_version.is_empty()
-        && !SUPPORTED_PROTOCOL_VERSIONS.contains(&protocol_version.as_str())
-    {
+    // Structural completeness first: anything still open means the bytes we
+    // have are not the whole report.
+    if let Some(partial) = &current {
+        return Err(MemcheckParseError::Truncated(format!(
+            "an <error> element of kind {:?} was never closed",
+            partial.kind.as_deref().unwrap_or("<unknown>")
+        )));
+    }
+    if frame.is_some() {
+        return Err(MemcheckParseError::Truncated(
+            "a <frame> element was never closed".to_string(),
+        ));
+    }
+    if depth != 0 || !root_closed {
+        return Err(MemcheckParseError::Truncated(format!(
+            "{depth} element(s) left open and the <valgrindoutput> root was {}",
+            if root_closed {
+                "closed"
+            } else {
+                "never closed"
+            }
+        )));
+    }
+
+    let protocol_version = protocol_version.ok_or(MemcheckParseError::MissingProtocolVersion)?;
+    if !SUPPORTED_PROTOCOL_VERSIONS.contains(&protocol_version.as_str()) {
         return Err(MemcheckParseError::UnsupportedProtocol {
             found: protocol_version,
         });
+    }
+    match tool.as_deref() {
+        Some("memcheck") => {}
+        Some(other) => {
+            return Err(MemcheckParseError::WrongTool {
+                found: other.to_string(),
+            })
+        }
+        None => {
+            return Err(MemcheckParseError::WrongTool {
+                found: "<absent>".to_string(),
+            })
+        }
+    }
+    if !finished {
+        return Err(MemcheckParseError::NotFinished);
     }
 
     Ok(MemcheckRun {
@@ -349,10 +451,13 @@ impl PartialError {
 mod tests {
     use super::*;
 
+    /// A complete, well-formed Memcheck document. Helpers below derive the
+    /// truncation and tampering cases from it.
     const UNINIT_CONDITION: &str = r#"<?xml version="1.0"?>
 <valgrindoutput>
 <protocolversion>6</protocolversion>
 <tool>memcheck</tool>
+<status><state>RUNNING</state></status>
 <error>
   <unique>0x0</unique>
   <kind>UninitCondition</kind>
@@ -362,6 +467,7 @@ mod tests {
     <frame><ip>0x2</ip><obj>/bin/t</obj><fn>main</fn><file>main.rs</file><line>10</line></frame>
   </stack>
 </error>
+<status><state>FINISHED</state></status>
 </valgrindoutput>"#;
 
     /// A secret-dependent branch diagnostic parses with its stack and location.
@@ -441,12 +547,15 @@ mod tests {
     #[test]
     fn frames_past_the_attribution_window_do_not_attribute() {
         let mut deep = String::from(
-            r#"<?xml version="1.0"?><valgrindoutput><protocolversion>6</protocolversion><error><kind>UninitCondition</kind><what>w</what><stack>"#,
+            r#"<?xml version="1.0"?><valgrindoutput><protocolversion>6</protocolversion><tool>memcheck</tool><error><kind>UninitCondition</kind><what>w</what><stack>"#,
         );
         for index in 0..ATTRIBUTION_DEPTH {
             deep.push_str(&format!("<frame><fn>filler{index}</fn></frame>"));
         }
-        deep.push_str("<frame><fn>target_function</fn></frame></stack></error></valgrindoutput>");
+        deep.push_str(
+            "<frame><fn>target_function</fn></frame></stack></error>\
+             <status><state>FINISHED</state></status></valgrindoutput>",
+        );
         let run = parse(&deep).unwrap();
         assert!(!run.errors[0].attributable_to("target_function"));
     }
@@ -463,8 +572,10 @@ mod tests {
     #[test]
     fn parses_multiple_errors() {
         let xml = UNINIT_CONDITION.replace(
-            "</error>\n</valgrindoutput>",
-            "</error><error><kind>InvalidRead</kind><what>bad read</what><stack><frame><fn>g</fn></frame></stack></error></valgrindoutput>",
+            "</error>\n<status><state>FINISHED</state></status>",
+            "</error><error><kind>InvalidRead</kind><what>bad read</what><stack>\
+             <frame><fn>g</fn></frame></stack></error>\
+             <status><state>FINISHED</state></status>",
         );
         let run = parse(&xml).unwrap();
         assert_eq!(run.errors.len(), 2);
@@ -472,21 +583,128 @@ mod tests {
         assert_eq!(run.memory_errors().count(), 1);
     }
 
-    /// A clean run parses to zero errors rather than failing.
+    /// A complete clean run parses to zero errors rather than failing.
     #[test]
     fn parses_a_clean_run() {
-        let xml = r#"<?xml version="1.0"?><valgrindoutput><protocolversion>6</protocolversion><tool>memcheck</tool></valgrindoutput>"#;
+        let xml = r#"<?xml version="1.0"?><valgrindoutput><protocolversion>6</protocolversion><tool>memcheck</tool><status><state>FINISHED</state></status></valgrindoutput>"#;
         let run = parse(xml).unwrap();
         assert!(run.errors.is_empty());
     }
 
-    /// Truncated XML is a parse error, not a short error list.
+    /// XML cut mid-tag is rejected as malformed.
     #[test]
-    fn truncated_xml_is_rejected() {
+    fn xml_cut_mid_tag_is_rejected() {
         let truncated = &UNINIT_CONDITION[..UNINIT_CONDITION.len() / 2];
+        assert!(parse(truncated).is_err());
+    }
+
+    /// A document cut at a clean element boundary — well-formed as far as it
+    /// goes — must still be rejected. This is the dangerous shape: it has a
+    /// root and a protocol version, so a parser that only checks those would
+    /// report zero errors and the backend would call it NO_LEAK_OBSERVED.
+    #[test]
+    fn xml_cut_at_an_element_boundary_is_rejected() {
+        let truncated = "<valgrindoutput>\n  <protocolversion>6</protocolversion>\n";
+        let error = parse(truncated).expect_err("an unclosed document must be rejected");
+        assert!(
+            matches!(error, MemcheckParseError::Truncated(_)),
+            "expected Truncated, got {error}"
+        );
+    }
+
+    /// A document truncated immediately before `</valgrindoutput>` is
+    /// rejected, even though every inner element closed and an error was
+    /// successfully parsed. Losing the root close means losing the FINISHED
+    /// status, so the report may be incomplete.
+    #[test]
+    fn xml_truncated_before_the_root_close_is_rejected() {
+        let complete = UNINIT_CONDITION;
+        let truncated = complete
+            .rsplit_once("</valgrindoutput>")
+            .expect("fixture closes its root")
+            .0;
+        let error = parse(truncated).expect_err("a missing root close must be rejected");
+        assert!(
+            matches!(
+                error,
+                MemcheckParseError::Truncated(_) | MemcheckParseError::NotFinished
+            ),
+            "expected Truncated or NotFinished, got {error}"
+        );
+    }
+
+    /// An `<error>` element left open is reported as truncation, never as a
+    /// shorter error list.
+    #[test]
+    fn unfinished_error_element_is_rejected() {
+        let xml = "<valgrindoutput><protocolversion>6</protocolversion><tool>memcheck</tool>\
+                   <error><kind>UninitCondition</kind>";
+        let error = parse(xml).expect_err("an unclosed <error> must be rejected");
+        match error {
+            MemcheckParseError::Truncated(detail) => {
+                assert!(detail.contains("UninitCondition"), "{detail}");
+            }
+            other => panic!("expected Truncated, got {other}"),
+        }
+    }
+
+    /// An unclosed `<frame>` is reported as truncation.
+    #[test]
+    fn unfinished_frame_element_is_rejected() {
+        let xml = "<valgrindoutput><protocolversion>6</protocolversion><tool>memcheck</tool>\
+                   <error><kind>UninitCondition</kind><what>w</what><stack><frame><fn>f</fn>";
+        assert!(matches!(parse(xml), Err(MemcheckParseError::Truncated(_))));
+    }
+
+    /// Valgrind never reporting FINISHED means the run was killed or crashed,
+    /// so the output cannot be read as a complete report.
+    #[test]
+    fn missing_finished_status_is_rejected() {
+        let xml = UNINIT_CONDITION.replace("<status><state>FINISHED</state></status>", "");
+        assert!(
+            matches!(parse(&xml), Err(MemcheckParseError::NotFinished)),
+            "a run without FINISHED must not parse"
+        );
+    }
+
+    /// A RUNNING status alone is not completion.
+    #[test]
+    fn running_status_alone_is_not_finished() {
+        let xml = UNINIT_CONDITION.replace(
+            "<status><state>FINISHED</state></status>",
+            "<status><state>RUNNING</state></status>",
+        );
+        assert!(matches!(parse(&xml), Err(MemcheckParseError::NotFinished)));
+    }
+
+    /// Output from another Valgrind tool is refused: its error kinds are not
+    /// the ones this classifier models.
+    #[test]
+    fn other_valgrind_tools_are_refused() {
+        let xml = UNINIT_CONDITION.replace("<tool>memcheck</tool>", "<tool>helgrind</tool>");
+        match parse(&xml) {
+            Err(MemcheckParseError::WrongTool { found }) => assert_eq!(found, "helgrind"),
+            other => panic!("expected WrongTool, got {other:?}"),
+        }
+    }
+
+    /// A document with no <tool> element is refused rather than assumed.
+    #[test]
+    fn absent_tool_element_is_refused() {
+        let xml = UNINIT_CONDITION.replace("<tool>memcheck</tool>", "");
         assert!(matches!(
-            parse(truncated),
-            Err(MemcheckParseError::Malformed(_)) | Err(MemcheckParseError::MissingRoot)
+            parse(&xml),
+            Err(MemcheckParseError::WrongTool { .. })
+        ));
+    }
+
+    /// A missing protocol version is refused rather than defaulted.
+    #[test]
+    fn absent_protocol_version_is_refused() {
+        let xml = UNINIT_CONDITION.replace("<protocolversion>6</protocolversion>", "");
+        assert!(matches!(
+            parse(&xml),
+            Err(MemcheckParseError::MissingProtocolVersion)
         ));
     }
 
