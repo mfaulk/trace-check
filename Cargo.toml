@@ -2,8 +2,12 @@
 members = [
     "crates/trace-check",
     "crates/trace-check-secret",
+    "crates/trace-check-test",
+    "crates/trace-check-macros",
+    "crates/cargo-trace-check",
     "examples/mac-compare",
     "examples/table-lookup",
+    "examples/consumer-crate",
     "examples/legacy-branch-demo",
 ]
 resolver = "2"
