@@ -370,23 +370,32 @@ pub struct NativeRunner {
     cargo_version: String,
 }
 
+/// Validates the platform and locates a supported Valgrind.
+///
+/// Shared by the manifest backend and the Cargo runner so both refuse an
+/// unsupported target rather than producing a result that does not apply.
+pub fn prepare_valgrind() -> Result<(PathBuf, String), NativeError> {
+    if std::env::consts::ARCH != "x86_64" || std::env::consts::OS != "linux" {
+        return Err(NativeError::UnsupportedTarget {
+            found: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
+        });
+    }
+
+    let valgrind = PathBuf::from("valgrind");
+    let banner = tool_version(&valgrind, &["--version"])
+        .map_err(|source| NativeError::MissingValgrind { source })?;
+    // `valgrind --version` prints e.g. `valgrind-3.28.0`.
+    let version = banner.trim().trim_start_matches("valgrind-").to_string();
+    if !version.starts_with(REQUIRED_VALGRIND_MAJOR_MINOR) {
+        return Err(NativeError::UnsupportedValgrind { found: version });
+    }
+    Ok((valgrind, version))
+}
+
 impl NativeRunner {
     /// Validates the toolchain and target before anything is built.
     pub fn prepare(workspace_manifest: &Path, limits: Limits) -> Result<Self, NativeError> {
-        if std::env::consts::ARCH != "x86_64" || std::env::consts::OS != "linux" {
-            return Err(NativeError::UnsupportedTarget {
-                found: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
-            });
-        }
-
-        let valgrind = PathBuf::from("valgrind");
-        let banner = tool_version(&valgrind, &["--version"])
-            .map_err(|source| NativeError::MissingValgrind { source })?;
-        // `valgrind --version` prints e.g. `valgrind-3.28.0`.
-        let version = banner.trim().trim_start_matches("valgrind-").to_string();
-        if !version.starts_with(REQUIRED_VALGRIND_MAJOR_MINOR) {
-            return Err(NativeError::UnsupportedValgrind { found: version });
-        }
+        let (valgrind, version) = prepare_valgrind()?;
 
         Ok(NativeRunner {
             valgrind,
@@ -464,72 +473,39 @@ impl NativeRunner {
     pub fn analyze(&self, case: &NativeCase) -> Result<(NativeResult, Provenance), NativeError> {
         let (binary, hash) = self.build(case)?;
 
-        // A randomly named TempDir, never a path built from manifest data.
-        // Case ids come from an arbitrary --manifest, and this directory is
-        // removed recursively; a crafted id containing path separators could
-        // otherwise redirect that deletion. The RAII guard also cleans up on
-        // the error and timeout paths, which an explicit remove did not.
-        let xml_dir = tempfile::Builder::new()
-            .prefix("trace-check-memcheck-")
-            .tempdir()
-            .map_err(|e| NativeError::Io(format!("cannot create a scratch directory: {e}")))?;
-        let xml_path = xml_dir.path().join("memcheck.xml");
-
-        let args = vec![
-            "--tool=memcheck".to_string(),
-            "--track-origins=yes".to_string(),
-            "--num-callers=24".to_string(),
-            // Leak checking would report allocations that are irrelevant here
-            // and would muddy the memory-error classification.
-            "--leak-check=no".to_string(),
-            format!("--error-exitcode={MEMCHECK_ERROR_EXITCODE}"),
-            "--xml=yes".to_string(),
-            format!("--xml-file={}", xml_path.display()),
-            binary.display().to_string(),
-            case.case.clone(),
-        ];
-        let rendered = render(&self.valgrind, &args);
-        let captured = run_bounded(&self.valgrind, &args, self.limits, &rendered)?;
+        let output = run_under_memcheck(
+            &self.valgrind,
+            &binary,
+            std::slice::from_ref(&case.case),
+            &[],
+            self.limits,
+        )?;
 
         // A nonzero status that is not the Memcheck error code means the
         // harness itself failed, which is not a security result.
-        if let Some(code) = captured.exit_code {
-            if code != 0 && code != MEMCHECK_ERROR_EXITCODE {
+        match output.exit_code {
+            Some(code) if code == 0 || code == MEMCHECK_ERROR_EXITCODE => {}
+            Some(code) => {
                 return Err(NativeError::HarnessFailed {
-                    command: rendered,
+                    command: output.command,
                     status: format!("exit code {code}"),
-                    stderr: if captured.stderr.trim().is_empty() {
-                        captured.stdout.clone()
+                    stderr: if output.stderr.trim().is_empty() {
+                        output.stdout
                     } else {
-                        captured.stderr.clone()
+                        output.stderr
                     },
-                });
+                })
             }
-        } else {
-            return Err(NativeError::HarnessFailed {
-                command: rendered,
-                status: "a signal".to_string(),
-                stderr: captured.stderr.clone(),
-            });
+            None => {
+                return Err(NativeError::HarnessFailed {
+                    command: output.command,
+                    status: "a signal".to_string(),
+                    stderr: output.stderr,
+                })
+            }
         }
-
-        let metadata = std::fs::metadata(&xml_path).map_err(|e| NativeError::XmlUnreadable {
-            path: xml_path.display().to_string(),
-            source: e.to_string(),
-        })?;
-        let cap = (self.limits.max_output_bytes as u64).min(MAX_XML_BYTES);
-        if metadata.len() > cap {
-            return Err(NativeError::XmlTooLarge {
-                path: xml_path.display().to_string(),
-                size: metadata.len(),
-                limit: cap,
-            });
-        }
-        let xml = std::fs::read_to_string(&xml_path).map_err(|e| NativeError::XmlUnreadable {
-            path: xml_path.display().to_string(),
-            source: e.to_string(),
-        })?;
-        // `xml_dir` is dropped at the end of this function, removing the file.
+        let captured = output;
+        let xml = captured.xml.clone();
 
         let instrumented = harness_was_instrumented(&captured.stdout);
         let result = match memcheck::parse(&xml) {
@@ -562,6 +538,108 @@ impl NativeRunner {
 }
 
 pub const BACKEND: &str = "native-memcheck";
+
+/// Valgrind flags shared by every analysis in this project.
+///
+/// `--track-origins=yes` is mandatory, not merely helpful: an undefined value
+/// with no reported origin cannot be distinguished from a genuine
+/// uninitialized-memory bug, so it is never claimed as secret dependency.
+///
+/// The three leak flags matter for M3. A full Rust `#[test]` binary allocates
+/// in ways Memcheck reports as `Leak_PossiblyLost`, which the classifier maps
+/// to a memory error and which would therefore make every constant-time test
+/// inconclusive. `--leak-check=no` alone does not remove the error;
+/// `--show-leak-kinds=none` does. Suppressing leaks is sound here because a
+/// memory leak cannot corrupt a definedness analysis — but it does mean this
+/// tool is not a substitute for running Memcheck normally.
+pub fn shared_valgrind_args() -> Vec<String> {
+    vec![
+        "--tool=memcheck".to_string(),
+        "--track-origins=yes".to_string(),
+        "--num-callers=24".to_string(),
+        "--leak-check=no".to_string(),
+        "--errors-for-leak-kinds=none".to_string(),
+        "--show-leak-kinds=none".to_string(),
+        format!("--error-exitcode={MEMCHECK_ERROR_EXITCODE}"),
+    ]
+}
+
+/// What one bounded Memcheck run produced.
+#[derive(Debug)]
+pub struct MemcheckOutput {
+    /// Valgrind's XML report, already size-bounded.
+    pub xml: String,
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: Option<i32>,
+    /// The command line, for diagnostics.
+    pub command: String,
+}
+
+impl MemcheckOutput {
+    /// Whether the exit status is Valgrind's findings code rather than a
+    /// failure of the program itself.
+    pub fn exited_with_findings(&self) -> bool {
+        self.exit_code == Some(MEMCHECK_ERROR_EXITCODE)
+    }
+}
+
+/// Runs `program` under Memcheck with bounded output and a wall-clock limit,
+/// and returns its XML report.
+///
+/// The single place either backend invokes Valgrind, so M2's guarantees —
+/// argument arrays rather than shell strings, concurrent pipe drainage, a
+/// timeout, an output cap, a randomly named scratch directory, and a bounded
+/// XML read — apply to both without being reimplemented.
+pub fn run_under_memcheck(
+    valgrind: &Path,
+    program: &Path,
+    program_args: &[String],
+    env: &[(String, String)],
+    limits: Limits,
+) -> Result<MemcheckOutput, NativeError> {
+    // A randomly named TempDir, never a path built from caller-supplied data,
+    // and an RAII guard so the error and timeout paths clean up too.
+    let xml_dir = tempfile::Builder::new()
+        .prefix("trace-check-memcheck-")
+        .tempdir()
+        .map_err(|e| NativeError::Io(format!("cannot create a scratch directory: {e}")))?;
+    let xml_path = xml_dir.path().join("memcheck.xml");
+
+    let mut args = shared_valgrind_args();
+    args.push("--xml=yes".to_string());
+    args.push(format!("--xml-file={}", xml_path.display()));
+    args.push(program.display().to_string());
+    args.extend(program_args.iter().cloned());
+
+    let command = render(valgrind, &args);
+    let captured = run_bounded_with_env(valgrind, &args, env, limits, &command)?;
+
+    let metadata = std::fs::metadata(&xml_path).map_err(|e| NativeError::XmlUnreadable {
+        path: xml_path.display().to_string(),
+        source: e.to_string(),
+    })?;
+    let cap = (limits.max_output_bytes as u64).min(MAX_XML_BYTES);
+    if metadata.len() > cap {
+        return Err(NativeError::XmlTooLarge {
+            path: xml_path.display().to_string(),
+            size: metadata.len(),
+            limit: cap,
+        });
+    }
+    let xml = std::fs::read_to_string(&xml_path).map_err(|e| NativeError::XmlUnreadable {
+        path: xml_path.display().to_string(),
+        source: e.to_string(),
+    })?;
+
+    Ok(MemcheckOutput {
+        xml,
+        stdout: captured.stdout,
+        stderr: captured.stderr,
+        exit_code: captured.exit_code,
+        command,
+    })
+}
 
 /// Reads the harness's structured run-mode line. Absent or non-Valgrind means
 /// marking was inert, so no conclusion can be drawn from a clean run.
@@ -693,14 +771,26 @@ fn render(program: &Path, args: &[String]) -> String {
 /// Spawns a process with bounded output and a wall-clock limit. Mirrors
 /// [`crate::runner`]'s discipline; both pipes are drained concurrently so a
 /// bounded read cannot deadlock against a full pipe.
+#[cfg(test)]
 fn run_bounded(
     program: &Path,
     args: &[String],
     limits: Limits,
     rendered: &str,
 ) -> Result<Captured, NativeError> {
+    run_bounded_with_env(program, args, &[], limits, rendered)
+}
+
+fn run_bounded_with_env(
+    program: &Path,
+    args: &[String],
+    env: &[(String, String)],
+    limits: Limits,
+    rendered: &str,
+) -> Result<Captured, NativeError> {
     let mut child = Command::new(program)
         .args(args)
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
