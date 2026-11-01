@@ -9,14 +9,24 @@
 //! the compiled artifact: a structural census with a baseline regression gate
 //! ([`census`]) and a taint analysis for secret-dependent control flow
 //! ([`taint`]), both over the lowered module from [`wasm`].
+//!
+//! A second, independent backend analyzes **native** code: [`native`] builds a
+//! harness, runs it under Valgrind Memcheck, and [`memcheck`] classifies the
+//! diagnostics into secret-dependent branches and addresses. The two backends
+//! share only the outcome vocabulary and provenance in [`security`] — their
+//! evidence is of different kinds and is reported separately.
 
 pub mod census;
 pub mod compare;
 pub mod experiment;
+pub mod memcheck;
+pub mod native;
+pub mod native_report;
 pub mod parser;
 pub mod report;
 pub mod runner;
 pub mod screen;
+pub mod security;
 pub mod taint;
 pub mod wasm;
 
@@ -70,4 +80,41 @@ pub fn run_experiment(
         &ordered,
         &results,
     ))
+}
+
+use native::{NativeCase, NativeError, NativeManifest, NativeRunner};
+use native_report::NativeReport;
+
+/// Runs every case in a native manifest and assembles its report.
+///
+/// A build or execution failure for one case aborts the run rather than being
+/// folded into the report: a harness failure is not a security result, and
+/// continuing would risk presenting a partial analysis as a complete one.
+pub fn run_native(
+    workspace_manifest: &Path,
+    manifest: &NativeManifest,
+    limits: native::Limits,
+) -> Result<NativeReport, NativeError> {
+    let runner = NativeRunner::prepare(workspace_manifest, limits)?;
+    let mut entries = Vec::new();
+    for case in &manifest.cases {
+        let (result, provenance) = runner.analyze(case)?;
+        entries.push((case.clone(), result, provenance));
+    }
+    Ok(native_report::build(entries))
+}
+
+/// Runs a single named case, for a future assertion macro or focused debugging.
+pub fn run_native_case(
+    workspace_manifest: &Path,
+    case: &NativeCase,
+    limits: native::Limits,
+) -> Result<NativeReport, NativeError> {
+    let runner = NativeRunner::prepare(workspace_manifest, limits)?;
+    let (result, provenance) = runner.analyze(case)?;
+    Ok(native_report::build(vec![(
+        case.clone(),
+        result,
+        provenance,
+    )]))
 }

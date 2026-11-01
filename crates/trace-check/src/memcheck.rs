@@ -1,0 +1,527 @@
+//! Valgrind Memcheck XML parsing and classification.
+//!
+//! Parsing is structured rather than a stderr grep. Memcheck's XML carries an
+//! error `<kind>`, a human `<what>`, and a `<stack>` of frames with function,
+//! file and line — which is what makes a finding actionable and what makes
+//! attribution possible at all.
+//!
+//! Two classification rules carry the weight:
+//!
+//! * Only `UninitCondition` and `UninitValue` are secret-dependency findings.
+//!   Memcheck also reports genuine memory bugs; labelling an `InvalidRead` as a
+//!   timing leak would be worse than missing it.
+//! * A finding counts against the function under test only when a frame naming
+//!   it appears near the top of the stack. Without that, a secret-derived value
+//!   formatted by `println!` shows up as a leak in `core::fmt`.
+
+use std::fmt;
+
+use serde::Serialize;
+
+/// Valgrind XML protocol versions this parser understands.
+///
+/// The subset actually consumed — error `kind`/`what` and `stack/frame` with
+/// `fn`/`file`/`line`/`obj` — has been stable across these revisions. Valgrind
+/// 3.28 emits 6; older releases emit 4. An unlisted version is refused rather
+/// than parsed on the assumption that the layout held.
+pub const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] = ["4", "5", "6"];
+
+/// How far down the stack a frame may be and still attribute the finding to the
+/// function under test. Inlining can insert a few frames; beyond this the
+/// finding is more likely to belong to a caller or to the runtime.
+pub const ATTRIBUTION_DEPTH: usize = 8;
+
+/// One stack frame from a Memcheck error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Frame {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object: Option<String>,
+}
+
+impl fmt::Display for Frame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let function = self.function.as_deref().unwrap_or("<unknown>");
+        match (&self.file, self.line) {
+            (Some(file), Some(line)) => write!(f, "{function} ({file}:{line})"),
+            (Some(file), None) => write!(f, "{function} ({file})"),
+            _ => write!(f, "{function}"),
+        }
+    }
+}
+
+/// What a Memcheck error means for this analysis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Classification {
+    /// `UninitCondition` — a secret-derived value reached a conditional branch.
+    SecretDependentBranch,
+    /// `UninitValue` — a secret-derived value was used where it affects
+    /// behaviour, typically a memory address or a syscall argument.
+    SecretDependentValue,
+    /// A real memory bug, unrelated to secrecy. Not a timing leak.
+    MemoryError,
+    /// A kind this build does not classify. Retained, never ignored.
+    Unclassified,
+}
+
+impl Classification {
+    pub fn of_kind(kind: &str) -> Classification {
+        match kind {
+            "UninitCondition" => Classification::SecretDependentBranch,
+            "UninitValue" => Classification::SecretDependentValue,
+            // Memcheck's memory-error kinds.
+            "InvalidRead" | "InvalidWrite" | "InvalidJump" | "InvalidFree" | "MismatchedFree"
+            | "Overlap" | "SyscallParam" | "ClientCheck" | "InvalidMemPool" => {
+                Classification::MemoryError
+            }
+            kind if kind.starts_with("Leak_") => Classification::MemoryError,
+            _ => Classification::Unclassified,
+        }
+    }
+
+    /// Whether this classification describes secret dependency at all.
+    pub fn is_secret_dependency(self) -> bool {
+        matches!(
+            self,
+            Classification::SecretDependentBranch | Classification::SecretDependentValue
+        )
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Classification::SecretDependentBranch => "secret_dependent_branch",
+            Classification::SecretDependentValue => "secret_dependent_value",
+            Classification::MemoryError => "memory_error",
+            Classification::Unclassified => "unclassified",
+        }
+    }
+
+    /// Human-facing description used in reports.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Classification::SecretDependentBranch => "Secret-dependent branch",
+            Classification::SecretDependentValue => "Secret-dependent memory address or value use",
+            Classification::MemoryError => "Memory error (not a timing leak)",
+            Classification::Unclassified => "Unclassified Memcheck diagnostic",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemcheckError {
+    pub kind: String,
+    pub classification: Classification,
+    pub what: String,
+    pub stack: Vec<Frame>,
+    /// Memcheck's origin tracking, when `--track-origins=yes` resolved one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+}
+
+impl MemcheckError {
+    /// The frame a report should point at: the shallowest frame with a source
+    /// location, falling back to the shallowest frame at all.
+    pub fn primary_frame(&self) -> Option<&Frame> {
+        self.stack
+            .iter()
+            .find(|frame| frame.file.is_some() && frame.line.is_some())
+            .or_else(|| self.stack.first())
+    }
+
+    /// Whether a frame naming `function` appears within the attribution window.
+    pub fn attributable_to(&self, function: &str) -> bool {
+        self.stack
+            .iter()
+            .take(ATTRIBUTION_DEPTH)
+            .filter_map(|frame| frame.function.as_deref())
+            .any(|name| frame_names_function(name, function))
+    }
+}
+
+/// Matches a demangled frame name against a plain function name. Frames appear
+/// as `crate::module::function` or with generic suffixes, so compare the path
+/// tail rather than requiring equality.
+fn frame_names_function(frame: &str, function: &str) -> bool {
+    let without_generics = frame
+        .split(['<', '('])
+        .next()
+        .unwrap_or(frame)
+        .trim_end_matches("::");
+    without_generics
+        .rsplit("::")
+        .next()
+        .is_some_and(|tail| tail == function)
+        || without_generics == function
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MemcheckRun {
+    pub protocol_version: String,
+    pub errors: Vec<MemcheckError>,
+}
+
+impl MemcheckRun {
+    pub fn secret_dependency_errors(&self) -> impl Iterator<Item = &MemcheckError> {
+        self.errors
+            .iter()
+            .filter(|e| e.classification.is_secret_dependency())
+    }
+
+    pub fn memory_errors(&self) -> impl Iterator<Item = &MemcheckError> {
+        self.errors
+            .iter()
+            .filter(|e| e.classification == Classification::MemoryError)
+    }
+
+    pub fn unclassified_errors(&self) -> impl Iterator<Item = &MemcheckError> {
+        self.errors
+            .iter()
+            .filter(|e| e.classification == Classification::Unclassified)
+    }
+}
+
+#[derive(Debug)]
+pub enum MemcheckParseError {
+    /// Not Valgrind XML at all, or a truncated document.
+    Malformed(String),
+    /// Valgrind produced XML for a different protocol version.
+    UnsupportedProtocol { found: String },
+    /// The document parsed but contained no `<valgrindoutput>` root.
+    MissingRoot,
+}
+
+impl fmt::Display for MemcheckParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MemcheckParseError::Malformed(detail) => {
+                write!(f, "malformed Memcheck XML: {detail}")
+            }
+            MemcheckParseError::UnsupportedProtocol { found } => write!(
+                f,
+                "Memcheck XML protocol version {found:?} is not supported (this build \
+                 understands {})",
+                SUPPORTED_PROTOCOL_VERSIONS.join(", ")
+            ),
+            MemcheckParseError::MissingRoot => {
+                write!(f, "Memcheck XML has no <valgrindoutput> root element")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MemcheckParseError {}
+
+/// Parses Valgrind's XML output.
+///
+/// Implemented over `quick-xml`'s event reader rather than by matching text, so
+/// a truncated document is a parse error instead of a short error list — the
+/// same rule M1's trace parser applies to truncated traces.
+pub fn parse(xml: &str) -> Result<MemcheckRun, MemcheckParseError> {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut protocol_version = None;
+    let mut errors = Vec::new();
+    let mut saw_root = false;
+
+    // Current parse state.
+    let mut path: Vec<String> = Vec::new();
+    let mut current: Option<PartialError> = None;
+    let mut frame: Option<Frame> = None;
+    let mut text = String::new();
+
+    loop {
+        match reader.read_event() {
+            Err(error) => return Err(MemcheckParseError::Malformed(error.to_string())),
+            Ok(Event::Eof) => break,
+            Ok(Event::Start(start)) => {
+                let name = String::from_utf8_lossy(start.name().as_ref()).into_owned();
+                match name.as_str() {
+                    "valgrindoutput" => saw_root = true,
+                    "error" => current = Some(PartialError::default()),
+                    "frame" => {
+                        frame = Some(Frame {
+                            function: None,
+                            file: None,
+                            line: None,
+                            object: None,
+                        })
+                    }
+                    _ => {}
+                }
+                path.push(name);
+                text.clear();
+            }
+            Ok(Event::Text(contents)) => {
+                text = contents
+                    .decode()
+                    .map_err(|e| MemcheckParseError::Malformed(e.to_string()))?
+                    .into_owned();
+            }
+            Ok(Event::End(end)) => {
+                let name = String::from_utf8_lossy(end.name().as_ref()).into_owned();
+                let in_error = current.is_some();
+                let in_frame = frame.is_some();
+
+                match name.as_str() {
+                    "protocolversion" if !in_error => protocol_version = Some(text.clone()),
+                    "fn" if in_frame => frame.as_mut().unwrap().function = Some(text.clone()),
+                    "file" if in_frame => frame.as_mut().unwrap().file = Some(text.clone()),
+                    "obj" if in_frame => frame.as_mut().unwrap().object = Some(text.clone()),
+                    "line" if in_frame => frame.as_mut().unwrap().line = text.trim().parse().ok(),
+                    "frame" => {
+                        if let (Some(finished), Some(error)) = (frame.take(), current.as_mut()) {
+                            error.stack.push(finished);
+                        }
+                    }
+                    "kind" if in_error => current.as_mut().unwrap().kind = Some(text.clone()),
+                    "what" if in_error => {
+                        let error = current.as_mut().unwrap();
+                        if error.what.is_none() {
+                            error.what = Some(text.clone());
+                        }
+                    }
+                    // `auxwhat` carries origin detail under --track-origins.
+                    "auxwhat" if in_error => current.as_mut().unwrap().origin = Some(text.clone()),
+                    "error" => {
+                        if let Some(finished) = current.take() {
+                            errors.push(finished.build());
+                        }
+                    }
+                    _ => {}
+                }
+                path.pop();
+                text.clear();
+            }
+            Ok(_) => {}
+        }
+    }
+
+    if !saw_root {
+        return Err(MemcheckParseError::MissingRoot);
+    }
+    let protocol_version = protocol_version.unwrap_or_default();
+    if !protocol_version.is_empty()
+        && !SUPPORTED_PROTOCOL_VERSIONS.contains(&protocol_version.as_str())
+    {
+        return Err(MemcheckParseError::UnsupportedProtocol {
+            found: protocol_version,
+        });
+    }
+
+    Ok(MemcheckRun {
+        protocol_version,
+        errors,
+    })
+}
+
+#[derive(Default)]
+struct PartialError {
+    kind: Option<String>,
+    what: Option<String>,
+    origin: Option<String>,
+    stack: Vec<Frame>,
+}
+
+impl PartialError {
+    fn build(self) -> MemcheckError {
+        let kind = self.kind.unwrap_or_else(|| "Unknown".to_string());
+        MemcheckError {
+            classification: Classification::of_kind(&kind),
+            what: self.what.unwrap_or_default(),
+            origin: self.origin,
+            stack: self.stack,
+            kind,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const UNINIT_CONDITION: &str = r#"<?xml version="1.0"?>
+<valgrindoutput>
+<protocolversion>6</protocolversion>
+<tool>memcheck</tool>
+<error>
+  <unique>0x0</unique>
+  <kind>UninitCondition</kind>
+  <what>Conditional jump or move depends on uninitialised value(s)</what>
+  <stack>
+    <frame><ip>0x1</ip><obj>/bin/t</obj><fn>mac_compare::verify_early_exit_opaque</fn><file>lib.rs</file><line>70</line></frame>
+    <frame><ip>0x2</ip><obj>/bin/t</obj><fn>main</fn><file>main.rs</file><line>10</line></frame>
+  </stack>
+</error>
+</valgrindoutput>"#;
+
+    /// A secret-dependent branch diagnostic parses with its stack and location.
+    #[test]
+    fn parses_uninit_condition_with_stack() {
+        let run = parse(UNINIT_CONDITION).expect("valid XML parses");
+        assert_eq!(run.errors.len(), 1);
+        let error = &run.errors[0];
+        assert_eq!(error.classification, Classification::SecretDependentBranch);
+        assert_eq!(error.stack.len(), 2);
+        assert_eq!(error.stack[0].file.as_deref(), Some("lib.rs"));
+        assert_eq!(error.stack[0].line, Some(70));
+        assert_eq!(error.primary_frame().unwrap().line, Some(70));
+    }
+
+    /// `UninitValue` is classified as a secret-dependent value use, which is
+    /// how a secret-dependent address is reported.
+    #[test]
+    fn uninit_value_is_a_secret_dependent_value() {
+        assert_eq!(
+            Classification::of_kind("UninitValue"),
+            Classification::SecretDependentValue
+        );
+        assert!(Classification::of_kind("UninitValue").is_secret_dependency());
+    }
+
+    /// Genuine memory errors are never classified as secret dependency.
+    #[test]
+    fn memory_errors_are_not_secret_dependency() {
+        for kind in [
+            "InvalidRead",
+            "InvalidWrite",
+            "InvalidFree",
+            "MismatchedFree",
+            "SyscallParam",
+            "Leak_DefinitelyLost",
+            "Leak_StillReachable",
+        ] {
+            let classification = Classification::of_kind(kind);
+            assert_eq!(classification, Classification::MemoryError, "{kind}");
+            assert!(!classification.is_secret_dependency(), "{kind}");
+        }
+    }
+
+    /// An unrecognized kind is retained as unclassified, never dropped and
+    /// never assumed benign.
+    #[test]
+    fn unknown_kind_is_retained_as_unclassified() {
+        let classification = Classification::of_kind("SomeFutureKind");
+        assert_eq!(classification, Classification::Unclassified);
+        assert!(!classification.is_secret_dependency());
+    }
+
+    /// Attribution matches the function under test by path tail.
+    #[test]
+    fn attributes_to_the_function_under_test() {
+        let run = parse(UNINIT_CONDITION).unwrap();
+        assert!(run.errors[0].attributable_to("verify_early_exit_opaque"));
+        assert!(!run.errors[0].attributable_to("verify_constant_time"));
+    }
+
+    /// A finding only reachable through formatting code is not attributed to
+    /// the function under test; this is the spurious-println case.
+    #[test]
+    fn formatting_frames_do_not_attribute_to_the_function() {
+        let xml = UNINIT_CONDITION
+            .replace(
+                "mac_compare::verify_early_exit_opaque",
+                "core::fmt::num::_fmt_inner",
+            )
+            .replace("<fn>main</fn>", "<fn>core::fmt::write</fn>");
+        let run = parse(&xml).unwrap();
+        assert!(!run.errors[0].attributable_to("verify_early_exit_opaque"));
+    }
+
+    /// Frames beyond the attribution window do not attribute the finding.
+    #[test]
+    fn frames_past_the_attribution_window_do_not_attribute() {
+        let mut deep = String::from(
+            r#"<?xml version="1.0"?><valgrindoutput><protocolversion>6</protocolversion><error><kind>UninitCondition</kind><what>w</what><stack>"#,
+        );
+        for index in 0..ATTRIBUTION_DEPTH {
+            deep.push_str(&format!("<frame><fn>filler{index}</fn></frame>"));
+        }
+        deep.push_str("<frame><fn>target_function</fn></frame></stack></error></valgrindoutput>");
+        let run = parse(&deep).unwrap();
+        assert!(!run.errors[0].attributable_to("target_function"));
+    }
+
+    /// Generic suffixes in a frame name still match the plain function name.
+    #[test]
+    fn generic_frame_names_match() {
+        assert!(frame_names_function("crate::module::f::<u8>", "f"));
+        assert!(frame_names_function("f", "f"));
+        assert!(!frame_names_function("crate::module::fg", "f"));
+    }
+
+    /// Multiple errors are all retained, in document order.
+    #[test]
+    fn parses_multiple_errors() {
+        let xml = UNINIT_CONDITION.replace(
+            "</error>\n</valgrindoutput>",
+            "</error><error><kind>InvalidRead</kind><what>bad read</what><stack><frame><fn>g</fn></frame></stack></error></valgrindoutput>",
+        );
+        let run = parse(&xml).unwrap();
+        assert_eq!(run.errors.len(), 2);
+        assert_eq!(run.secret_dependency_errors().count(), 1);
+        assert_eq!(run.memory_errors().count(), 1);
+    }
+
+    /// A clean run parses to zero errors rather than failing.
+    #[test]
+    fn parses_a_clean_run() {
+        let xml = r#"<?xml version="1.0"?><valgrindoutput><protocolversion>6</protocolversion><tool>memcheck</tool></valgrindoutput>"#;
+        let run = parse(xml).unwrap();
+        assert!(run.errors.is_empty());
+    }
+
+    /// Truncated XML is a parse error, not a short error list.
+    #[test]
+    fn truncated_xml_is_rejected() {
+        let truncated = &UNINIT_CONDITION[..UNINIT_CONDITION.len() / 2];
+        assert!(matches!(
+            parse(truncated),
+            Err(MemcheckParseError::Malformed(_)) | Err(MemcheckParseError::MissingRoot)
+        ));
+    }
+
+    /// Output that is not Valgrind XML at all is rejected.
+    #[test]
+    fn non_valgrind_output_is_rejected() {
+        let error = parse("valgrind: command not found").unwrap_err();
+        assert!(matches!(error, MemcheckParseError::MissingRoot), "{error}");
+    }
+
+    /// An unsupported protocol version is refused rather than guessed at.
+    #[test]
+    fn unsupported_protocol_version_is_refused() {
+        let xml = UNINIT_CONDITION.replace(
+            "<protocolversion>6</protocolversion>",
+            "<protocolversion>99</protocolversion>",
+        );
+        assert!(matches!(
+            parse(&xml),
+            Err(MemcheckParseError::UnsupportedProtocol { .. })
+        ));
+    }
+
+    /// Origin detail from --track-origins is captured when present.
+    #[test]
+    fn captures_origin_detail() {
+        let xml = UNINIT_CONDITION.replace(
+            "<stack>",
+            "<auxwhat>Uninitialised value was created by a client request</auxwhat><stack>",
+        );
+        let run = parse(&xml).unwrap();
+        assert!(run.errors[0]
+            .origin
+            .as_deref()
+            .unwrap()
+            .contains("client request"));
+    }
+}
