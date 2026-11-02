@@ -8,6 +8,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use trace_check::symbolic::Verifier;
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -20,44 +22,39 @@ fn cli() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_cargo-trace-check"))
 }
 
-/// The analyzer image is checked through the CLI itself: a dry `verify` of one
-/// case fails fast with a dependency error when the backend is absent.
+/// Asks the library the same question the CLI asks, rather than probing for a
+/// runtime here.
+///
+/// An earlier version of this helper reimplemented the probe and reproduced the
+/// defect under review: it took the first runtime on `PATH` and looked for the
+/// image only there, so on a machine with Podman installed and the image in
+/// Docker every test "skipped" -- and failed outright under
+/// `TRACE_CHECK_REQUIRE_SYMBOLIC`. Duplicating the logic is what made that
+/// possible, so it is not duplicated.
 fn analyzer_available() -> bool {
-    let tool = ["podman", "docker"].into_iter().find(|tool| {
-        Command::new(tool)
-            .arg("--version")
-            .output()
-            .map(|out| out.status.success())
-            .unwrap_or(false)
-    });
-    let present = match tool {
-        None => false,
-        Some(tool) => Command::new(tool)
-            .args(["image", "inspect", trace_check::symbolic::ANALYZER_IMAGE])
-            .output()
-            .map(|out| out.status.success())
-            .unwrap_or(false),
+    let reason = match Verifier::prepare() {
+        Err(e) => Some(e.to_string()),
+        Ok(mut verifier) => verifier.check_image().err().map(|e| e.to_string()),
     };
-    if !present {
-        assert!(
-            std::env::var_os("TRACE_CHECK_REQUIRE_SYMBOLIC").is_none(),
-            "TRACE_CHECK_REQUIRE_SYMBOLIC is set but the symbolic analyzer image is unavailable"
-        );
-        eprintln!("skipping: no container runtime with the pinned analyzer image");
+    match reason {
+        None => true,
+        Some(reason) => {
+            assert!(
+                std::env::var_os("TRACE_CHECK_REQUIRE_SYMBOLIC").is_none(),
+                "TRACE_CHECK_REQUIRE_SYMBOLIC is set but the symbolic backend is unavailable: \
+                 {reason}"
+            );
+            eprintln!("skipping: {reason}");
+            false
+        }
     }
-    present
 }
 
-/// The first probed runtime whose store holds the analyzer image.
+/// The runtime the library would select, which is the one holding the image.
 fn runtime_with_image() -> Option<String> {
-    ["podman", "docker"].into_iter().find_map(|tool| {
-        Command::new(tool)
-            .args(["image", "inspect", trace_check::symbolic::ANALYZER_IMAGE])
-            .output()
-            .ok()
-            .filter(|out| out.status.success())
-            .map(|_| tool.to_string())
-    })
+    let mut verifier = Verifier::prepare().ok()?;
+    verifier.check_image().ok()?;
+    Some(verifier.container_tool().to_string())
 }
 
 struct Run {
