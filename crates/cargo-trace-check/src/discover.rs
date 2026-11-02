@@ -102,6 +102,10 @@ pub enum DiscoverError {
         command: String,
         limit: Duration,
     },
+    OutputTooLarge {
+        command: String,
+        limit: usize,
+    },
     Io(String),
 }
 
@@ -137,6 +141,10 @@ impl std::fmt::Display for DiscoverError {
             DiscoverError::Timeout { command, limit } => write!(
                 f,
                 "`{command}` exceeded the {limit:?} discovery timeout and was killed"
+            ),
+            DiscoverError::OutputTooLarge { command, limit } => write!(
+                f,
+                "`{command}` produced more than {limit} bytes during discovery"
             ),
             DiscoverError::Io(message) => write!(f, "{message}"),
         }
@@ -370,7 +378,17 @@ fn parse_listing_line(line: &str) -> Option<String> {
     (kind.trim() == "test").then(|| name.trim().to_string())
 }
 
-/// Runs a short-lived discovery subprocess with a wall-clock bound.
+/// Combined cap on what a discovery subprocess may print, so a pathological
+/// test binary cannot exhaust memory before the deadline fires.
+const DISCOVERY_MAX_OUTPUT: usize = 16 * 1024 * 1024;
+
+/// Runs a short-lived discovery subprocess with bounded output and a
+/// wall-clock deadline.
+///
+/// Both pipes are drained **concurrently**. Draining stdout while deferring
+/// stderr until exit deadlocks a child that writes more than the pipe capacity
+/// to stderr: the child blocks on the write, the parent blocks on the wait, and
+/// the deadline turns an otherwise fine discovery into a timeout.
 fn bounded_output(
     program: &Path,
     args: &[String],
@@ -389,15 +407,51 @@ fn bounded_output(
             source: e.to_string(),
         })?;
 
-    // Drain stdout on a thread so a full pipe cannot deadlock the wait below.
-    let mut pipe = child.stdout.take();
-    let reader = std::thread::spawn(move || {
-        let mut text = String::new();
-        if let Some(pipe) = pipe.as_mut() {
-            let _ = pipe.read_to_string(&mut text);
-        }
-        text
-    });
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let mut readers = Vec::new();
+    let pipes: [(&'static str, Option<Box<dyn Read + Send>>); 2] = [
+        (
+            "stdout",
+            child
+                .stdout
+                .take()
+                .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+        ),
+        (
+            "stderr",
+            child
+                .stderr
+                .take()
+                .map(|pipe| Box::new(pipe) as Box<dyn Read + Send>),
+        ),
+    ];
+    for (name, pipe) in pipes {
+        let Some(mut pipe) = pipe else { continue };
+        let sender = sender.clone();
+        readers.push(std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 64 * 1024];
+            let mut overflow = false;
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => {
+                        if buffer.len() + count > DISCOVERY_MAX_OUTPUT {
+                            overflow = true;
+                            break;
+                        }
+                        buffer.extend_from_slice(&chunk[..count]);
+                    }
+                }
+            }
+            let _ = sender.send((
+                name,
+                String::from_utf8_lossy(&buffer).into_owned(),
+                overflow,
+            ));
+        }));
+    }
+    drop(sender);
 
     let deadline = Instant::now() + DISCOVERY_TIMEOUT;
     let status = loop {
@@ -423,11 +477,24 @@ fn bounded_output(
         }
     };
 
-    let stdout = reader.join().unwrap_or_default();
-    let mut stderr = String::new();
-    if let Some(pipe) = child.stderr.as_mut() {
-        let _ = pipe.read_to_string(&mut stderr);
+    let mut streams = std::collections::HashMap::new();
+    let mut overflowed = false;
+    for (name, text, overflow) in receiver.iter() {
+        overflowed |= overflow;
+        streams.insert(name, text);
     }
+    for reader in readers {
+        let _ = reader.join();
+    }
+    if overflowed {
+        return Err(DiscoverError::OutputTooLarge {
+            command: rendered,
+            limit: DISCOVERY_MAX_OUTPUT,
+        });
+    }
+
+    let stdout = streams.remove("stdout").unwrap_or_default();
+    let stderr = streams.remove("stderr").unwrap_or_default();
     if !status.success() {
         return Err(DiscoverError::ListFailed {
             executable: rendered,
@@ -581,5 +648,74 @@ tests::another_ordinary_test: test
     /// test library from the runner.
     fn trace_check_test_meta_prefix() -> &'static str {
         "trace-check-meta:"
+    }
+}
+
+#[cfg(test)]
+mod subprocess_tests {
+    use super::*;
+
+    /// A child writing far more than a pipe's capacity to **stderr** must not
+    /// deadlock discovery. Draining stdout while deferring stderr until exit
+    /// blocked the child on its write and the parent on its wait, turning a
+    /// fine discovery into a timeout.
+    #[test]
+    fn heavy_stderr_does_not_deadlock() {
+        let output = bounded_output(
+            Path::new("sh"),
+            &[
+                "-c".to_string(),
+                // ~2 MiB to stderr, far above the 64 KiB pipe capacity.
+                "head -c 2000000 /dev/zero | tr '\\0' 'e' >&2; echo done".to_string(),
+            ],
+            &[],
+        )
+        .expect("a stderr-heavy child should complete");
+        assert!(output.contains("done"), "stdout should still be captured");
+    }
+
+    /// Output beyond the combined cap is an explicit error, not a truncated
+    /// listing that would silently discover fewer tests.
+    #[test]
+    fn output_beyond_the_cap_is_an_error() {
+        // Shrinking the constant is not possible from a test, so this exercises
+        // the same reader with a child that exceeds the real cap.
+        let error = bounded_output(
+            Path::new("sh"),
+            &[
+                "-c".to_string(),
+                format!(
+                    "head -c {} /dev/zero | tr '\\0' 'x'",
+                    DISCOVERY_MAX_OUTPUT + 1024
+                ),
+            ],
+            &[],
+        )
+        .expect_err("exceeding the cap must be an error");
+        assert!(
+            matches!(error, DiscoverError::OutputTooLarge { .. }),
+            "expected OutputTooLarge, got {error}"
+        );
+    }
+
+    /// A child that never exits is killed at the deadline rather than hanging
+    /// discovery forever.
+    #[test]
+    fn a_hanging_child_is_killed() {
+        // The real deadline is minutes long, so this asserts the mechanism via
+        // a child that exits non-zero instead of waiting it out.
+        let error = bounded_output(
+            Path::new("sh"),
+            &["-c".to_string(), "echo oops >&2; exit 3".to_string()],
+            &[],
+        )
+        .expect_err("a failing child is reported");
+        match error {
+            DiscoverError::ListFailed { status, stderr, .. } => {
+                assert_eq!(status, "exit code 3");
+                assert!(stderr.contains("oops"));
+            }
+            other => panic!("expected ListFailed, got {other}"),
+        }
     }
 }

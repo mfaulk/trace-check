@@ -21,7 +21,7 @@
 //! be if-converted away, and it fires reliably. The same lesson appeared in M1
 //! (WASM) and M2 (native SIMD); this is its third form.
 
-use crate::mark::MarkSecret;
+use crate::marking::MarkSecret;
 
 /// Table the probe indexes. Fixed contents: only the address matters.
 static PROBE_TABLE: [u8; 256] = [0xA5; 256];

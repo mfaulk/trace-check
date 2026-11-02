@@ -45,12 +45,34 @@ use syn::{
 ///
 /// * the function **verbatim** — no wrapper, no instrumentation, so production
 ///   behavior is untouched;
-/// * under `#[cfg(test)]`, a call counter and an `#[inline(never)]` adapter
-///   named `<function>_ct` with the same signature, which counts and delegates.
-///   Tests call the adapter so invocation can be proven; the analyzed
-///   function's own compiled code is unchanged;
+/// * under `#[cfg(test)]`, an **analysis adapter** named `<function>_ct`, plus
+///   an invocation counter;
 /// * under `#[cfg(test)]`, a metadata test declaring the contract, so a
 ///   contract with no covering test is still discoverable.
+///
+/// # The adapter owns the declared secrets
+///
+/// The adapter takes each declared secret **by value**, launders it through an
+/// optimization barrier, marks it, calls the untouched function with that value
+/// in its declared parameter slot, and declassifies the result. It also runs the
+/// positive control.
+///
+/// That shape is what makes a contract claim mean something. Two escapes exist
+/// if the test is left to do the marking itself:
+///
+/// * it can invoke the contract with public inputs and mark a secret in a
+///   *separate* assertion, so nothing secret ever reaches the function;
+/// * it can mark a secret and pass it to the wrong parameter, leaving the
+///   declared one public.
+///
+/// Both were reachable in review and both reported `covered` with exit 0 for a
+/// function that is vulnerable with respect to its declared secret. Neither is
+/// expressible now: marking happens inside the adapter, bound to the declared
+/// slot by the generated signature.
+///
+/// A declared secret must be a sized value or a reference to one — the adapter
+/// has to own it. `&[u8]` is rejected with an explanation; use
+/// `assert_constant_time!(secret_bytes = …)` without a contract for that.
 ///
 /// Parameter names are validated against the signature at compile time, so a
 /// typo is an error rather than a contract that silently covers nothing.
@@ -101,13 +123,16 @@ pub fn constant_time(attr: TokenStream, item: TokenStream) -> TokenStream {
     let adapter = adapter_ident(&name_literal);
     let meta_fn = format_ident!("__trace_check_contract_{}", name);
 
-    // Rebuild the signature so the adapter can delegate with the same
-    // arguments. Only simple ident patterns reach here; the signature check
-    // above rejects everything else.
-    let (arg_decls, arg_names) = match adapter_arguments(&function) {
+    let adapter_parts = match adapter_signature(&function, &args.secrets) {
         Ok(parts) => parts,
         Err(error) => return error.to_compile_error().into(),
     };
+    let AdapterSignature {
+        declarations: arg_decls,
+        call_arguments,
+        secret_bindings,
+        secret_marks,
+    } = adapter_parts;
     let return_type = match &function.sig.output {
         ReturnType::Default => quote! {},
         ReturnType::Type(arrow, ty) => quote! { #arrow #ty },
@@ -122,15 +147,28 @@ pub fn constant_time(attr: TokenStream, item: TokenStream) -> TokenStream {
         #visibility static #counter: ::std::sync::atomic::AtomicU64 =
             ::std::sync::atomic::AtomicU64::new(0);
 
-        /// Contract adapter: counts the call and delegates to the untouched
-        /// function. `#[inline(never)]` keeps it a separate frame so it cannot
-        /// perturb the analysis of the function itself.
+        /// Analysis adapter: owns and marks the declared secrets, runs the
+        /// positive control, invokes the untouched function with each secret in
+        /// its declared slot, and declassifies the result.
+        ///
+        /// `#[inline(never)]` keeps this a separate frame so it cannot perturb
+        /// the analysis of the function itself.
         #[cfg(test)]
         #[inline(never)]
         #[allow(non_snake_case)]
         #visibility fn #adapter( #( #arg_decls ),* ) #return_type {
             #counter.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
-            #name( #( #arg_names ),* )
+            ::trace_check_test::contract_begin(
+                &::trace_check_test::meta::qualified(module_path!(), #name_literal),
+            );
+            // Laundered before marking: interprocedural constant propagation
+            // would otherwise let the optimizer use an immediate and never read
+            // the marked storage.
+            #( #secret_bindings )*
+            let __trace_check_guards = ( #( #secret_marks, )* );
+            let __trace_check_result = #name( #( #call_arguments ),* );
+            drop(__trace_check_guards);
+            ::trace_check_test::finish(__trace_check_result)
         }
 
         #[cfg(test)]
@@ -343,12 +381,29 @@ fn is_identifier(text: &str) -> bool {
         && text.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
-/// Splits a signature into declarations and argument names for the adapter.
-fn adapter_arguments(
-    function: &ItemFn,
-) -> syn::Result<(Vec<proc_macro2::TokenStream>, Vec<Ident>)> {
-    let mut declarations = Vec::new();
-    let mut names = Vec::new();
+/// The pieces needed to generate the analysis adapter.
+struct AdapterSignature {
+    /// Adapter parameter declarations. A declared secret of type `&T` becomes
+    /// `T`, because the adapter must own what it marks.
+    declarations: Vec<proc_macro2::TokenStream>,
+    /// Expressions passed to the original function, restoring `&` where the
+    /// original took a reference.
+    call_arguments: Vec<proc_macro2::TokenStream>,
+    /// `let x = launder(x);` for each declared secret.
+    secret_bindings: Vec<proc_macro2::TokenStream>,
+    /// `mark(&x)` for each declared secret.
+    secret_marks: Vec<proc_macro2::TokenStream>,
+}
+
+/// Builds the adapter signature, taking ownership of the declared secrets.
+fn adapter_signature(function: &ItemFn, secrets: &[String]) -> syn::Result<AdapterSignature> {
+    let mut parts = AdapterSignature {
+        declarations: Vec::new(),
+        call_arguments: Vec::new(),
+        secret_bindings: Vec::new(),
+        secret_marks: Vec::new(),
+    };
+
     for argument in &function.sig.inputs {
         let FnArg::Typed(typed) = argument else {
             return Err(syn::Error::new_spanned(
@@ -365,10 +420,70 @@ fn adapter_arguments(
         };
         let ident = pattern.ident.clone();
         let ty: &Type = &typed.ty;
-        declarations.push(quote! { #ident: #ty });
-        names.push(ident);
+
+        if !secrets.iter().any(|secret| ident == secret) {
+            // A public parameter passes through unchanged.
+            parts.declarations.push(quote! { #ident: #ty });
+            parts.call_arguments.push(quote! { #ident });
+            continue;
+        }
+
+        match ty {
+            Type::Reference(reference) if reference.mutability.is_none() => {
+                let owned = &*reference.elem;
+                reject_unowned_secret(owned, &ident)?;
+                // Own the value, then hand the function a reference to it.
+                parts.declarations.push(quote! { #ident: #owned });
+                parts.call_arguments.push(quote! { &#ident });
+            }
+            Type::Reference(reference) => {
+                return Err(syn::Error::new_spanned(
+                    reference,
+                    "a declared secret cannot be a `&mut` parameter in M3; the adapter must own \
+                     what it marks",
+                ))
+            }
+            other => {
+                reject_unowned_secret(other, &ident)?;
+                parts.declarations.push(quote! { #ident: #other });
+                parts.call_arguments.push(quote! { #ident });
+            }
+        }
+
+        parts
+            .secret_bindings
+            .push(quote! { let #ident = ::trace_check_test::launder(#ident); });
+        parts
+            .secret_marks
+            .push(quote! { ::trace_check_test::mark(&#ident) });
     }
-    Ok((declarations, names))
+
+    Ok(parts)
+}
+
+/// Rejects a declared secret the adapter cannot own.
+///
+/// An unsized type has no owned form to mark, so the contract could not bind
+/// marking to the parameter. Saying so at compile time beats generating an
+/// adapter that marks the wrong thing.
+fn reject_unowned_secret(ty: &Type, ident: &Ident) -> syn::Result<()> {
+    let unsized_shape = match ty {
+        Type::Slice(_) => Some("a slice"),
+        Type::TraitObject(_) => Some("a trait object"),
+        Type::Path(path) if path.path.is_ident("str") => Some("a `str`"),
+        _ => None,
+    };
+    if let Some(shape) = unsized_shape {
+        return Err(syn::Error::new_spanned(
+            ty,
+            format!(
+                "the declared secret `{ident}` is {shape}, which the contract adapter cannot \
+                 own. Use a fixed-size array such as `&[u8; 32]`, or drop the contract and use \
+                 `assert_constant_time!(secret_bytes = …)` directly"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Rejects signatures M3 does not support, so an annotation never claims more
