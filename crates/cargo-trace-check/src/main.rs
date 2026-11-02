@@ -14,6 +14,8 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+use trace_check::contract::{self, VerifyConfig};
+use trace_check::harness::Library;
 use trace_check::native::{self, Limits};
 use trace_check::security::Provenance;
 use trace_check::symbolic::CaseFile;
@@ -67,10 +69,28 @@ enum Command {
     /// a different and stronger claim than the dynamic backend's
     /// NO_LEAK_OBSERVED.
     Verify {
-        /// Run only this case.
+        /// Verify a declared `#[constant_time]` contract in a real library, by
+        /// its qualified identity, e.g. `crypto::tag::verify_tag`. Repeatable.
+        #[arg(long, conflicts_with_all = ["case", "cases"])]
+        contract: Vec<String>,
+        /// Verify every contract configured in trace-check.toml.
+        #[arg(long, conflicts_with_all = ["case", "cases"])]
+        all_contracts: bool,
+        /// Library manifest to verify contracts from. Defaults to
+        /// ./Cargo.toml.
+        #[arg(long)]
+        manifest_path: Option<PathBuf>,
+        /// Verification configuration. Defaults to trace-check.toml beside the
+        /// manifest.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Cargo features to enable for the library's verification build.
+        #[arg(long, value_delimiter = ',')]
+        features: Vec<String>,
+        /// Run only this bundled standalone case (M4).
         #[arg(long)]
         case: Option<String>,
-        /// Case file. Defaults to examples/symbolic/cases.json.
+        /// Bundled case file. Defaults to examples/symbolic/cases.json.
         #[arg(long)]
         cases: Option<PathBuf>,
         #[arg(long, value_enum, default_value_t = Format::Text)]
@@ -151,18 +171,47 @@ fn execute(cli: Cli) -> Result<u8, String> {
             format,
         ),
         Command::Verify {
+            contract,
+            all_contracts,
+            manifest_path,
+            config,
+            features,
             case,
             cases,
             format,
             workspace_root,
             container_runtime,
-        } => verify(
-            case.as_deref(),
-            cases.as_deref(),
-            format,
-            workspace_root.as_deref(),
-            container_runtime.as_deref(),
-        ),
+        } => {
+            if !contract.is_empty() || all_contracts {
+                verify_contracts(
+                    &contract,
+                    all_contracts,
+                    manifest_path.as_deref(),
+                    config.as_deref(),
+                    &features,
+                    format,
+                    container_runtime.as_deref(),
+                )
+            } else {
+                // `--manifest-path`, `--config` and `--features` select a
+                // library, which only contract verification uses. Accepting
+                // them silently here would look like they had an effect.
+                if manifest_path.is_some() || config.is_some() || !features.is_empty() {
+                    return Err(
+                        "--manifest-path, --config and --features apply to contract \
+                         verification; pass --contract <identity> or --all-contracts"
+                            .to_string(),
+                    );
+                }
+                verify(
+                    case.as_deref(),
+                    cases.as_deref(),
+                    format,
+                    workspace_root.as_deref(),
+                    container_runtime.as_deref(),
+                )
+            }
+        }
     }
 }
 
@@ -285,6 +334,85 @@ fn verify(
         &case_dir,
         &selected,
         &out_dir,
+        container_runtime,
+    )
+    .map_err(|e| e.to_string())?;
+
+    match format {
+        Format::Text => print!("{}", report.to_text()),
+        Format::Json => println!("{}", report.to_json()),
+    }
+    Ok(report.exit_code())
+}
+
+/// Verifies declared contracts against the real functions in a Cargo library.
+///
+/// This is M5's path: the analyzed function is compiled from the developer's
+/// own source, not from a verification-specific copy of the algorithm.
+fn verify_contracts(
+    selected: &[String],
+    all_contracts: bool,
+    manifest_path: Option<&Path>,
+    config_path: Option<&Path>,
+    features: &[String],
+    format: Format,
+    container_runtime: Option<&str>,
+) -> Result<u8, String> {
+    let manifest = manifest_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("Cargo.toml"));
+    if !manifest.is_file() {
+        return Err(format!(
+            "{} is not a file; pass --manifest-path to name the library to verify",
+            manifest.display()
+        ));
+    }
+    let library = Library::resolve(&manifest, features).map_err(|e| e.to_string())?;
+
+    let config_path = config_path.map(Path::to_path_buf).unwrap_or_else(|| {
+        Path::new(&library.manifest_path)
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(contract::CONFIG_FILE)
+    });
+    if !config_path.is_file() {
+        return Err(format!(
+            "{} does not exist. Contract verification needs per-contract bounds and an \
+             observation model, which cannot be inferred from the annotation; create it or \
+             pass --config",
+            config_path.display()
+        ));
+    }
+    let config = VerifyConfig::load(&config_path).map_err(|e| e.to_string())?;
+
+    let contracts: Vec<String> = if all_contracts {
+        config.contracts().iter().map(|c| c.to_string()).collect()
+    } else {
+        selected.to_vec()
+    };
+    if contracts.is_empty() {
+        return Err(format!(
+            "no contracts selected. {} configures: {}",
+            config_path.display(),
+            if config.contracts().is_empty() {
+                "(none)".to_string()
+            } else {
+                config.contracts().join(", ")
+            }
+        ));
+    }
+
+    // Keyed on the process so two concurrent invocations cannot share a
+    // generated package or a target directory.
+    let work_root = std::env::temp_dir().join(format!(
+        "trace-check-contract-verify-{}",
+        std::process::id()
+    ));
+    let report = trace_check::run_contract_verification(
+        &library,
+        &config,
+        &contracts,
+        &work_root,
         container_runtime,
     )
     .map_err(|e| e.to_string())?;
