@@ -25,6 +25,9 @@ pub enum Evidence {
     DynamicSecretDependency,
     /// A property over all inputs, under an explicitly stated model.
     StaticAnalysis,
+    /// A relational symbolic search over a declared input domain: either a
+    /// counterexample, or completed coverage of that domain under the model.
+    BoundedRelationalSymbolic,
 }
 
 impl Evidence {
@@ -33,6 +36,7 @@ impl Evidence {
             Evidence::DifferentialTrace => "differential_trace",
             Evidence::DynamicSecretDependency => "dynamic_secret_dependency",
             Evidence::StaticAnalysis => "static_analysis",
+            Evidence::BoundedRelationalSymbolic => "bounded_relational_symbolic",
         }
     }
 }
@@ -45,8 +49,18 @@ impl Evidence {
 pub enum Outcome {
     #[serde(rename = "LEAK_DETECTED")]
     LeakDetected,
+    /// A dynamic check observed no leak on the paths it executed. Produced by
+    /// the Memcheck backend only.
     #[serde(rename = "NO_LEAK_OBSERVED")]
     NoLeakObserved,
+    /// A symbolic exploration completed and discharged every relational
+    /// obligation within a declared input domain and bounds.
+    ///
+    /// Deliberately a separate variant from [`Outcome::NoLeakObserved`]: a
+    /// sampled dynamic run and a completed bounded search are different claims
+    /// and must not share a name.
+    #[serde(rename = "VERIFIED_BOUNDED")]
+    VerifiedBounded,
     #[serde(rename = "INCONCLUSIVE")]
     Inconclusive,
 }
@@ -56,6 +70,7 @@ impl Outcome {
         match self {
             Outcome::LeakDetected => "LEAK_DETECTED",
             Outcome::NoLeakObserved => "NO_LEAK_OBSERVED",
+            Outcome::VerifiedBounded => "VERIFIED_BOUNDED",
             Outcome::Inconclusive => "INCONCLUSIVE",
         }
     }
@@ -64,6 +79,7 @@ impl Outcome {
         match text {
             "LEAK_DETECTED" => Some(Outcome::LeakDetected),
             "NO_LEAK_OBSERVED" => Some(Outcome::NoLeakObserved),
+            "VERIFIED_BOUNDED" => Some(Outcome::VerifiedBounded),
             "INCONCLUSIVE" => Some(Outcome::Inconclusive),
             _ => None,
         }
@@ -130,6 +146,7 @@ mod tests {
         for outcome in [
             Outcome::LeakDetected,
             Outcome::NoLeakObserved,
+            Outcome::VerifiedBounded,
             Outcome::Inconclusive,
         ] {
             assert_eq!(Outcome::parse(outcome.as_str()), Some(outcome));
@@ -160,10 +177,24 @@ mod tests {
         assert!(!unmet.met);
     }
 
+    /// A completed symbolic exploration keeps a name of its own: it must never
+    /// be confused with a sampled dynamic result.
+    #[test]
+    fn verified_bounded_is_distinct_from_no_leak_observed() {
+        assert_ne!(Outcome::VerifiedBounded, Outcome::NoLeakObserved);
+        assert_eq!(
+            serde_json::to_string(&Outcome::VerifiedBounded).unwrap(),
+            "\"VERIFIED_BOUNDED\""
+        );
+        assert!(!Expectation::new(Outcome::VerifiedBounded, Outcome::NoLeakObserved).met);
+        assert!(!Expectation::new(Outcome::NoLeakObserved, Outcome::VerifiedBounded).met);
+    }
+
     /// Inconclusive never satisfies an expectation of either definite outcome.
     #[test]
     fn inconclusive_does_not_meet_a_definite_expectation() {
         assert!(!Expectation::new(Outcome::NoLeakObserved, Outcome::Inconclusive).met);
         assert!(!Expectation::new(Outcome::LeakDetected, Outcome::Inconclusive).met);
+        assert!(!Expectation::new(Outcome::VerifiedBounded, Outcome::Inconclusive).met);
     }
 }
