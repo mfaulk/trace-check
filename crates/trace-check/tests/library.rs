@@ -73,9 +73,29 @@ fn verify_with(
     config: &VerifyConfig,
     contracts: &[String],
 ) -> Result<LibraryReport, HarnessError> {
+    verify_with_runtime(manifest_path, config, contracts, None)
+}
+
+/// A container runtime that cannot exist, so "the analyzer is unavailable" is
+/// deterministic in every environment.
+///
+/// Setting `TRACE_CHECK_CONTAINER_RUNTIME` is **not** a reproduction: the
+/// library entry point takes an explicit runtime and never reads the
+/// environment, so on a machine where podman happens to hold the image the
+/// backend is reachable regardless. That is precisely why two contract-level
+/// error tests passed locally and failed in CI — the local run had a working
+/// analyzer and never exercised the ordering at all.
+const UNREACHABLE_RUNTIME: &str = "no-such-runtime";
+
+fn verify_with_runtime(
+    manifest_path: &Path,
+    config: &VerifyConfig,
+    contracts: &[String],
+    runtime: Option<&str>,
+) -> Result<LibraryReport, HarnessError> {
     let workspace = Workspace::ephemeral()?;
     let library = Library::resolve(manifest_path, &[])?;
-    trace_check::run_contract_verification(&library, config, contracts, &workspace, None)
+    trace_check::run_contract_verification(&library, config, contracts, &workspace, runtime)
 }
 
 /// Every configured contract, verified once per test binary.
@@ -94,6 +114,25 @@ fn suite() -> Option<&'static LibraryReport> {
             )
         })
         .as_ref()
+}
+
+/// Asserts an error is about the contract, not about a missing analyzer.
+///
+/// Every contract-level error test calls this. Two of them failed in CI for
+/// exactly the reason it checks: the container backend was prepared before the
+/// library was compiled, so "this function carries no `#[constant_time]`
+/// annotation" came out as "cannot obtain the analyzer image" on any machine
+/// without it. A problem with the contract must be reported as a problem with
+/// the contract, and these tests must fail if that ever stops being true —
+/// rather than being quietly gated on a backend they do not need.
+fn assert_not_a_backend_error(error: &HarnessError) {
+    let message = error.to_string();
+    for masking in ["analyzer image", "podman", "docker", "container"] {
+        assert!(
+            !message.contains(masking),
+            "a contract-level error was masked by the backend: {message}"
+        );
+    }
 }
 
 fn contract_report<'a>(
@@ -355,6 +394,7 @@ fn an_undeclared_contract_is_an_explicit_error() {
         message.contains("no_such_function") && message.contains("#[constant_time]"),
         "{message}"
     );
+    assert_not_a_backend_error(&error);
 }
 
 /// A function in the library that carries no annotation is refused for the same
@@ -374,6 +414,7 @@ fn an_unannotated_function_is_an_explicit_error() {
     let error = verify_with(&manifest(), &config, &["crypto::tag::TAG_LEN".to_string()])
         .expect_err("an unannotated item must be refused");
     assert!(error.to_string().contains("#[constant_time]"), "{error}");
+    assert_not_a_backend_error(&error);
 }
 
 /// An identity qualified by the wrong crate is refused before anything is
@@ -408,6 +449,7 @@ fn an_unsupported_signature_is_an_actionable_error() {
         &target,
     )
     .expect_err("an unsupported signature must be refused");
+    assert_not_a_backend_error(&error);
     let message = error.to_string();
     assert!(message.contains("`expected`"), "{message}");
     assert!(message.contains("TAG_LEN"), "{message}");
@@ -418,9 +460,6 @@ fn an_unsupported_signature_is_an_actionable_error() {
 /// the descriptor is read, so the message can name the declared secrets.
 #[test]
 fn configuration_cannot_reassign_a_role() {
-    if !analyzer_available() {
-        return;
-    }
     let mut config = config();
     config
         .verify
@@ -448,9 +487,6 @@ fn configuration_cannot_reassign_a_role() {
 /// from an annotation.
 #[test]
 fn an_unconfigured_contract_is_refused() {
-    if !analyzer_available() {
-        return;
-    }
     let mut config = config();
     config.verify.remove("crypto::tag::verify_tag");
     let error = verify_with(
@@ -466,6 +502,7 @@ fn an_unconfigured_contract_is_refused() {
         ),
         "{error}"
     );
+    assert_not_a_backend_error(&error);
 }
 
 /// A symbol the artifact does not define is an explicit error, not a verdict.
@@ -805,4 +842,65 @@ fn a_kept_workspace_preserves_the_evidence_bundle() {
         entry.artifact.path
     );
     assert!(artifact.starts_with(&root));
+}
+
+/// A contract-level error is reported as itself with the analyzer unreachable
+/// by construction.
+///
+/// The regression CI caught twice. Selection validation moved ahead of the
+/// backend in the first pass, which fixed a misspelled *name*; a contract that
+/// is configured but carries no `#[constant_time]` annotation still reported
+/// "cannot obtain the analyzer image", because reaching that diagnosis needs
+/// the library compiled and compilation came after the backend check. The
+/// analyzer is now prepared lazily, immediately before the first query it is
+/// needed for.
+///
+/// Unlike the environment-variable approach that hid this, `UNREACHABLE_RUNTIME`
+/// makes the backend genuinely absent on any machine, so this test exercises
+/// the ordering rather than the local analyzer install.
+#[test]
+fn contract_errors_survive_an_unreachable_analyzer() {
+    let mut config = config();
+    let settings = config
+        .verify
+        .remove("crypto::tag::verify_tag")
+        .expect("configured");
+    config
+        .verify
+        .insert("crypto::tag::no_such_function".to_string(), settings);
+
+    let error = verify_with_runtime(
+        &manifest(),
+        &config,
+        &["crypto::tag::no_such_function".to_string()],
+        Some(UNREACHABLE_RUNTIME),
+    )
+    .expect_err("an undeclared contract must be refused");
+    assert!(
+        error.to_string().contains("#[constant_time]"),
+        "the contract problem must be the one reported: {error}"
+    );
+    assert_not_a_backend_error(&error);
+    assert!(!error.to_string().contains(UNREACHABLE_RUNTIME), "{error}");
+}
+
+/// And the companion that keeps the test above honest: with the same
+/// unreachable analyzer, a contract with nothing wrong with it must fail *on
+/// the analyzer*. Without this, the assertion above would also pass if the
+/// runtime were somehow reachable after all.
+#[test]
+fn an_unreachable_analyzer_is_reported_when_it_is_the_problem() {
+    let error = verify_with_runtime(
+        &manifest(),
+        &config(),
+        &["crypto::tag::verify_tag".to_string()],
+        Some(UNREACHABLE_RUNTIME),
+    )
+    .expect_err("an unreachable analyzer must be refused");
+    let message = error.to_string();
+    assert!(
+        message.contains(UNREACHABLE_RUNTIME) || message.contains("container runtime"),
+        "expected a backend failure, got: {message}"
+    );
+    assert!(!message.contains("#[constant_time]"), "{message}");
 }
