@@ -103,8 +103,8 @@ on `rustc 1.97.0` output for `x86_64-unknown-linux-gnu` at `-O`.
 | Secret-dependent **branch** found? | Yes — 7 control-flow leaks, each with an instruction address |
 | Constant-time control verified? | Yes — `secure`, 29/29 memory-access checks, 0 unknown, 0 pending |
 | Incomplete exploration distinguishable? | Yes — `Program status is : unknown`, and `total paths` ≠ `completed/cut paths` |
-| Concrete solver witness (the two secret values)? | **No** — see [Witness scope](#witness-scope) |
-| Concrete replay as corroboration? | **No** — dropped; see [Witness scope](#witness-scope) |
+| Concrete solver witness (the two secret values)? | **Not from the console output** — but recoverable via `-smt-dir`; see [Witness scope](#witness-scope) |
+| Concrete replay as corroboration? | **No** — dropped as establishing less than it appears to; see [Witness scope](#witness-scope) |
 
 ### Four findings that shaped the design
 
@@ -241,22 +241,53 @@ verdict is allowed:
 * output is missing, malformed, or truncated;
 * the analyzer exits non-zero or on a signal, or times out;
 * a declared symbol could not be resolved;
-* `0` checks of a kind were performed when that kind was requested — nothing was
-  actually verified.
+* the analyzer never reported reaching the declared `function` — see
+  [Attributing a result to a function](#attributing-a-result-to-a-function);
+* for **any** requested check class: no count was reported, the count was `0`,
+  or fewer obligations passed than were raised. `0 / 1 memory access checks
+  pass` next to a `secure` verdict is a contradiction, and the counts win;
+* no maximum path depth was reported, so the bound cannot be shown to have
+  held. A missing figure is missing evidence, not depth zero.
 
 A `secure` verdict with no reported findings is **not sufficient** for
-`VERIFIED_BOUNDED` on its own. The run must also show complete exploration, zero
-unknown queries, and a non-zero number of completed checks.
+`VERIFIED_BOUNDED` on its own. The run must also show complete exploration,
+zero unknown queries, every requested class of obligation fully discharged, and
+analyzer-produced evidence that the declared function was reached.
 
 ## Witness scope
 
 BINSEC's `checkct` reports the **instruction address** of each leaking
-operation, and localizes it precisely — but it does not expose the satisfying
-model, so the two concrete secret values are not available from the analyzer.
-`-smt-dir` produced no solvable query for these cases, because the leaks were
-settled by preprocessing rather than a solver call.
+operation. The satisfying model is not in its console output, but it is
+reachable: `-smt-dir` makes the analyzer cache every query it issued, with the
+solver's answer and model recorded as trailing comments.
 
-Rather than fabricate a witness, reports state exactly what was established:
+```text
+(declare-fun mirror_TC_SECRET!1 () (_ BitVec 8))
+(declare-fun TC_SECRET!1 () (_ BitVec 8))
+...
+; sat
+(get-value (mirror_TC_SECRET!1))
+; ((mirror_TC_SECRET!1 #xff))
+(get-value (TC_SECRET!1))
+; ((TC_SECRET!1 #xfe))
+```
+
+A query constraining both a secret **and** its `mirror_` copy is the relational
+one, and that pair is the counterexample. Queries over a single copy are
+path-feasibility questions and are ignored: one value cannot witness a
+difference. The values are the solver's own; nothing in this tool constructs,
+guesses, or hard-codes them.
+
+For `trip-count` the pair is `TC_SECRET = 0xfe` against `0xff` — low three bits
+`6` against `7`, so the loop runs a different number of times. That is checked
+in the test suite rather than asserted here.
+
+**Not every leak has a model.** The analyzer settles some findings by taint
+analysis or formula preprocessing without ever issuing a satisfiability query.
+`table-lookup` and `conditional-lookup` are both such cases: zero relational
+queries, so there is no assignment to extract. Those report
+`witness = unavailable_from_analyzer` together with the reason, rather than a
+fabricated pair.
 
 | Field | Meaning |
 | --- | --- |
@@ -264,8 +295,13 @@ Rather than fabricate a witness, reports state exactly what was established:
 | `divergences[].kind` | `control-flow` or `memory-access` |
 | `divergences[].source` | The **outermost** frame of the inline chain — the analyzed function |
 | `divergences[].inline_frames` | The whole chain, innermost first, when the address was inlined |
-| `witness` | `unavailable_from_analyzer` |
-| `witness_detail` | Why: the analyzer localizes the leak without exposing the model |
+| `witness` | `solver_counterexample` or `unavailable_from_analyzer` |
+| `witness_detail` | Which of the two, and why |
+| `counterexamples[]` | `global`, `left`, `right`, and the `query` file the model came from |
+
+A pair is refused as a witness when the two values are equal, which would
+witness nothing, and when the query is `unsat`. Selection is deterministic —
+the lowest-sorting query — so a report does not depend on directory order.
 
 The inline chain is not cosmetic. At `-O` a leaking load sits inside an inlined
 `core::ptr::read_volatile`, so a single-frame lookup resolves every finding in
@@ -273,18 +309,65 @@ this example to `mod.rs` in the standard library and names no code the
 developer wrote. The outermost frame leads; the chain is kept because the
 innermost frame is what an `objdump` of the artifact agrees with.
 
-**Deviation from the plan:** replay was dropped. The sketch above described a
-`witness.replay` field that would run the artifact twice with two secrets from
-the declared domain and compare observable outputs. Implementing it would have
-produced a field that reads like corroboration while establishing something
-different from what the analyzer found — the secret affects the result, which is
-true of every one of these targets including the verified ones, and says nothing
-about addresses. A witness field that cannot distinguish `masked_scan` from
-`secret_lookup` is worse than an honest absence, so the report carries the
-absence and its reason instead.
+**A counterexample contains the declared secret globals' values**, by
+construction — that is what makes it a counterexample. Case inputs must
+therefore be synthetic. The bundled example's secrets are `static mut` globals
+with no meaning outside the harness; never point a case at a real key.
 
-No hardware timing was measured. A differing execution path is not a measured
-timing signal.
+**Concrete replay was considered and dropped.** An earlier sketch had a
+`witness.replay` field that would run the artifact twice with two domain
+secrets and compare observable outputs. That establishes only that the secret
+affects the result, which is true of every target here *including the verified
+ones*, and says nothing about addresses or branches. A field that cannot
+distinguish `masked_scan` from `secret_lookup` reads like corroboration while
+corroborating nothing, so it was left out in favor of the solver's own model.
+
+## Attributing a result to a function
+
+A case names both a `function` and an `entry_symbol`, and the analyzer starts
+at the entry. Checking only that both symbols exist leaves a hole: pair a
+vulnerable function with a safe harness and the report names the vulnerable
+function while describing the safe one's analysis.
+
+Every generated script therefore carries a `reach <function>` directive, and
+the analyzer reports
+
+```text
+[sse:result] Path 0 reached address 0x2014c0 (<masked_scan>) (0 to go)
+```
+
+when exploration actually arrives there. Without that line the outcome is
+`INCONCLUSIVE`: nothing is attributed to a function the analyzer never reached.
+If a leak was found meanwhile it is still reported, with a message saying it
+belongs to other code on the explored paths — hidden findings would be worse
+than mis-attributed ones.
+
+The directive was checked against the real analyzer to leave path counts, check
+counts and the verdict unchanged, so asking for the evidence does not perturb
+what is being measured. This is the M3 contract-coverage problem in a new
+place, settled the same way: with evidence, not with a declaration.
+
+## Observation model
+
+A case must declare its checks explicitly; there is no default. The reason is
+concrete. `secret_lookup`'s instruction path really is secret-independent — only
+the address varies — so under `control-flow` checks alone BINSEC reports
+`secure`, with complete exploration and zero unknown answers. That verdict is
+legitimate and narrow, and a report that does not name the missing property
+reads exactly like the stronger result.
+
+Every result therefore carries `checked_features` and `unchecked_properties`,
+and the text report prints both:
+
+```text
+Observation model:
+  checked:     control-flow noninterference
+  NOT checked: memory-address noninterference
+```
+
+`VERIFIED_BOUNDED` is qualified by that list in its own message. The bundled
+suite checks both classes, so nothing is left unchecked there; the narrow case
+exists as a regression test.
 
 ## CLI
 
@@ -349,9 +432,18 @@ native verification model has proven reliable, as the milestone directs.
   `no_std` harness whose inputs are globals. The *function under test* is
   ordinary optimized Rust, but its surroundings are not.
 * **Bounded, declared domains.** `VERIFIED_BOUNDED` is scoped to the `assume`
-  constraints, the depth bound, and the modeled observations. Outside those it
-  claims nothing.
-* **No concrete witness values**, as above.
+  constraints, the depth bound, and the **declared** observation classes.
+  Outside those it claims nothing, and a case checking one class says nothing
+  about the other.
+* **Concrete witnesses are partial.** A counterexample is available only where
+  the analyzer issued a relational satisfiability query; leaks it settles by
+  taint analysis or preprocessing have no model. See
+  [Witness scope](#witness-scope).
+* **Attribution needs evidence, and that evidence is coarse.** A result is
+  attributed to a function only when the analyzer reported reaching it. The
+  directive proves arrival, not that the leak sits inside that function rather
+  than in something it calls; the divergence's own source location is what
+  localizes it.
 * **The model excludes cache, speculation, operand latency, and all hardware
   timing.** Multiplication and division checks exist in BINSEC but are
   experimental and left off.
@@ -371,21 +463,24 @@ native verification model has proven reliable, as the milestone directs.
 - [x] `cargo trace-check verify` works end to end.
 - [x] Examples and tests run in CI with pinned analyzer and solver.
 - [x] M1–M3 remain fully functional.
+- [x] Reports a solver-generated counterexample where the analyzer issued a
+      relational query, and states the absence with its reason where it did
+      not.
 
 ## Implementation status
 
 All seven bundled cases reproduce their declared outcomes against the pinned
 analyzer. `cargo trace-check verify` exits 0; the observed run:
 
-| Case | Outcome | Paths | Checks (cf / mem) | Unknown |
-| --- | --- | --- | --- | --- |
-| `table-lookup` | `LEAK_DETECTED` (1 memory access) | 1 / 1 | 1 / 1 · 7 / 8 | 0 |
-| `trip-count` | `LEAK_DETECTED` (7 control flow) | 8 / 8 | 8 / 15 · 35 / 35 | 0 |
-| `conditional-lookup` | `LEAK_DETECTED` (1 memory access) | 2 / 2 | 3 / 3 · 33 / 34 | 0 |
-| `masked-scan` | `VERIFIED_BOUNDED` | 1 / 1 | 1 / 1 · 30 / 30 | 0 |
-| `public-branch` | `VERIFIED_BOUNDED` | 1 / 1 | 1 / 1 · 8 / 8 | 0 |
-| `erased-branch` | `VERIFIED_BOUNDED` | 1 / 1 | 1 / 1 · 10 / 10 | 0 |
-| `depth-bounded` | `INCONCLUSIVE` | 10 total, 7 completed | — | — |
+| Case | Outcome | Paths | Checks (cf / mem) | Reached at | Witness |
+| --- | --- | --- | --- | --- | --- |
+| `table-lookup` | `LEAK_DETECTED` (1 memory access) | 1 / 1 | 1 / 1 · 7 / 8 | `0x2016b0` | none — no solver query |
+| `trip-count` | `LEAK_DETECTED` (7 control flow) | 8 / 8 | 8 / 15 · 35 / 35 | `0x2016c0` | `0xfe` vs `0xff` |
+| `conditional-lookup` | `LEAK_DETECTED` (1 memory access) | 2 / 2 | 3 / 3 · 33 / 34 | `0x201480` | none — no solver query |
+| `masked-scan` | `VERIFIED_BOUNDED` | 1 / 1 | 1 / 1 · 30 / 30 | `0x2014c0` | n/a |
+| `public-branch` | `VERIFIED_BOUNDED` | 1 / 1 | 1 / 1 · 8 / 8 | `0x201620` | n/a |
+| `erased-branch` | `VERIFIED_BOUNDED` | 1 / 1 | 1 / 1 · 10 / 10 | `0x2014a0` | n/a |
+| `depth-bounded` | `INCONCLUSIVE` | 10 total, 7 completed | — | `0x201640` | n/a |
 
 The whole suite takes roughly 2.5 s, so there is no fast/slow split: CI runs
 every case. Container startup (~160 ms) dominates per-case cost.
@@ -410,14 +505,55 @@ every case. Container startup (~160 ms) dominates per-case cost.
   going missing could mask the other.
 * **`CaseResult` carries the artifact hash.** A single case result stays
   interpretable after being split out of its report.
+* **Concrete counterexamples are reported after all**, via `-smt-dir`, where a
+  relational query exists. The plan had recorded them as unavailable; see
+  [Witness scope](#witness-scope).
+
+### Corrected after review
+
+Six findings from review of the first revision, in the order they were fixed:
+
+1. **The CI job selected Podman after the image was pulled into Docker.**
+   Runtime selection probed `PATH` order and stopped at the first runtime that
+   existed, so on a runner with both the analyzer image was invisible and all
+   18 symbolic tests failed before any analysis. Selection now prefers a
+   runtime that **holds the image**, `--container-runtime` and
+   `TRACE_CHECK_CONTAINER_RUNTIME` override it, and CI deliberately pulls into
+   Docker only while Podman probes first so the regression stays covered.
+2. **`VERIFIED_BOUNDED` was not tied to the declared function.** Fixed with the
+   `reach <function>` directive; see
+   [Attributing a result to a function](#attributing-a-result-to-a-function).
+   The regression test pairs the vulnerable `secret_lookup` with the safe
+   `masked_scan` harness and requires `INCONCLUSIVE`.
+3. **A result did not say which observations it checked.** Features are now
+   required per case, and every result carries `checked_features` and
+   `unchecked_properties`; see [Observation model](#observation-model).
+4. **The classifier accepted contradictory obligation counts.** It now requires
+   `passed == total` for every requested class, treats a missing count as
+   missing evidence, and no longer reads an absent maximum path depth as zero.
+5. **No concrete counterexample.** Now extracted from the analyzer's own cached
+   solver models; see [Witness scope](#witness-scope).
+6. **Duplicate `case` and `function` keys in the JSON.** `#[serde(flatten)]`
+   over a struct repeating an outer field emitted each twice, and both
+   `serde_json` and Python's `json` keep the last occurrence silently. The
+   fields now live on one side only, with a test that walks the serialized
+   object through `MapAccess` — which preserves duplicates — rather than
+   through a map that collapses them.
 
 ### What validates the validator
 
-`ci/verify-m4-symbolic.py` checks the report, not the exit code: a
+`ci/verify-m4-symbolic.py` checks the report, not the exit code. A
 `VERIFIED_BOUNDED` case must show a complete exploration, zero pending paths,
-zero `unknown` answers, a non-zero number of discharged checks, and no
-divergences; a `LEAK_DETECTED` case must name an address. Tampering a clean
-case's statistics makes it fail, which was confirmed before relying on it.
+zero `unknown` answers, a non-zero number of discharged checks, no divergences,
+no unchecked property, and evidence that its function was reached; a
+`LEAK_DETECTED` case must name an address, and must carry a non-identical
+counterexample pair where one is expected. The chosen container runtime must
+match the one CI pulled into.
+
+Each of those was confirmed by tampering with a passing report before relying
+on it: marking a verified function unreached, narrowing its feature list,
+collapsing a counterexample pair to identical values, and claiming a witness
+where none exists all make the validator fail.
 
 The strongest check in the suite is
 `the_verdict_follows_the_artifact_not_the_declared_expectation`: it rewrites
