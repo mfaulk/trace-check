@@ -141,8 +141,9 @@ pub fn run_symbolic(
     case_dir: &Path,
     selected: &[VerificationCase],
     out_dir: &Path,
+    runtime: Option<&str>,
 ) -> Result<SymbolicReport, SymbolicError> {
-    let mut verifier = Verifier::prepare()?;
+    let mut verifier = Verifier::prepare_with(runtime)?;
     verifier.check_image()?;
 
     let source = case_dir.join(&case_file.target_source);

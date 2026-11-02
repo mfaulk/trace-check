@@ -73,6 +73,20 @@ impl CheckFeature {
             CheckFeature::MemoryAccess => "memory-access",
         }
     }
+
+    /// The noninterference property this class of check establishes, named so a
+    /// report can state what was and was not covered.
+    pub fn property(self) -> &'static str {
+        match self {
+            CheckFeature::ControlFlow => "control-flow noninterference",
+            CheckFeature::MemoryAccess => "memory-address noninterference",
+        }
+    }
+
+    /// Every class, so a report can list what a case left unchecked.
+    pub fn all() -> [CheckFeature; 2] {
+        [CheckFeature::ControlFlow, CheckFeature::MemoryAccess]
+    }
 }
 
 /// One verification case.
@@ -95,8 +109,10 @@ pub struct VerificationCase {
     /// BINSEC `assume` constraints restricting the input domain.
     #[serde(default)]
     pub assumptions: Vec<String>,
-    /// Observations to check. Empty means BINSEC's default set.
-    #[serde(default)]
+    /// Observations to check, declared explicitly rather than left to the
+    /// analyzer's default. A result is only as strong as this list: a case that
+    /// checks `control-flow` alone establishes nothing about addresses, and a
+    /// reader cannot tell the difference unless the case says so.
     pub features: Vec<CheckFeature>,
     /// Exploration depth bound. A case that deliberately exceeds it must be
     /// declared `INCONCLUSIVE`.
@@ -173,6 +189,27 @@ impl CaseFile {
                     case.id
                 )));
             }
+            if case.features.is_empty() {
+                return Err(SymbolicError::Schema(format!(
+                    "case {:?} declares no features, so its observation model is \
+                     unstated; list the checks explicitly, e.g. \
+                     [\"control-flow\", \"memory-access\"]",
+                    case.id
+                )));
+            }
+            if let Some(duplicate) = case
+                .features
+                .iter()
+                .enumerate()
+                .find(|(index, feature)| case.features[..*index].contains(feature))
+                .map(|(_, feature)| *feature)
+            {
+                return Err(SymbolicError::Schema(format!(
+                    "case {:?} lists {:?} twice",
+                    case.id,
+                    duplicate.as_binsec()
+                )));
+            }
             if case.secret_globals.is_empty() {
                 return Err(SymbolicError::Schema(format!(
                     "case {:?} declares no secret globals, so there is no relational \
@@ -245,6 +282,9 @@ pub enum SymbolicError {
     MissingContainerTool,
     MissingImage {
         image: String,
+        /// The runtime that was selected, so the suggested pull command names
+        /// the store the analyzer will actually read from.
+        tool: String,
         detail: String,
     },
     Build {
@@ -287,10 +327,10 @@ impl fmt::Display for SymbolicError {
                  digest-pinned container. Install one, or run BINSEC yourself with the \
                  generated script"
             ),
-            SymbolicError::MissingImage { image, detail } => write!(
+            SymbolicError::MissingImage { image, tool, detail } => write!(
                 f,
-                "cannot obtain the analyzer image {image}: {detail}. Pull it first with \
-                 `podman pull {image}`"
+                "cannot obtain the analyzer image {image}: {detail}. Pull it into that \
+                 store with `{tool} pull {image}`"
             ),
             SymbolicError::Build { stderr } => {
                 write!(f, "building the verification target failed:\n{stderr}")
@@ -342,29 +382,38 @@ pub struct Divergence {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WitnessStatus {
-    /// The analyzer localized the divergence but does not expose the
-    /// satisfying model, so the two secret values are not available.
+    /// The solver produced a satisfying model for the relational query, giving
+    /// two concrete secret values whose executions diverge.
+    SolverCounterexample,
+    /// No model exists to report. The analyzer settles some leaks by taint
+    /// analysis or formula preprocessing without ever issuing a satisfiability
+    /// query, and there is then nothing to extract.
     UnavailableFromAnalyzer,
-    /// Two values from the declared domain produced different observable
-    /// output from the same artifact. Confirms secret-dependence of behavior;
-    /// does **not** prove the addresses or branches differed.
-    ConfirmedDifferential,
-    /// Replay ran and found no difference in observable output.
-    ReplayFoundNoDifference,
-    NotAttempted,
-    Failed,
 }
 
 impl WitnessStatus {
     pub fn as_str(self) -> &'static str {
         match self {
+            WitnessStatus::SolverCounterexample => "solver_counterexample",
             WitnessStatus::UnavailableFromAnalyzer => "unavailable_from_analyzer",
-            WitnessStatus::ConfirmedDifferential => "confirmed_differential",
-            WitnessStatus::ReplayFoundNoDifference => "replay_found_no_difference",
-            WitnessStatus::NotAttempted => "not_attempted",
-            WitnessStatus::Failed => "failed",
         }
     }
+}
+
+/// A solver-produced pair of secret values whose executions diverge.
+///
+/// Read back from the analyzer's own cached solver interaction: BINSEC records
+/// the model alongside each query it issued. The values are the solver's, not
+/// this tool's -- nothing here constructs or guesses them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Counterexample {
+    /// The declared secret global the pair is for.
+    pub global: String,
+    /// The two values, as the solver reported them.
+    pub left: String,
+    pub right: String,
+    /// The query file the model came from, so it can be re-solved by hand.
+    pub query: String,
 }
 
 /// Exploration and proof-obligation statistics parsed from the analyzer.
@@ -394,6 +443,22 @@ impl Exploration {
             && self.pending_paths == Some(0)
     }
 
+    /// Discharged and total obligations for one class of check, as the
+    /// analyzer reported them.
+    ///
+    /// `None` means the analyzer said nothing about that class. For a class the
+    /// case asked for, that is missing evidence rather than zero obligations,
+    /// and the classifier treats it as such.
+    pub fn checks(&self, feature: CheckFeature) -> (Option<u64>, Option<u64>) {
+        match feature {
+            CheckFeature::ControlFlow => (
+                self.control_flow_checks_passed,
+                self.control_flow_checks_total,
+            ),
+            CheckFeature::MemoryAccess => (self.memory_checks_passed, self.memory_checks_total),
+        }
+    }
+
     /// Whether any relational obligation was actually discharged. Zero checks
     /// means nothing was verified, however clean the verdict looks.
     pub fn performed_checks(&self) -> u64 {
@@ -401,10 +466,41 @@ impl Exploration {
     }
 }
 
+/// Analyzer-produced evidence about the function a case claims to be about.
+///
+/// The generated script carries a `reach <function>` directive, and BINSEC
+/// reports `Path N reached address 0x... (<function>)` when exploration
+/// actually arrives there. Without that line nothing can be attributed to the
+/// function: the entry symbol decides what is explored, and a case naming a
+/// function the harness never calls would otherwise inherit the harness's
+/// clean verdict. This is the M3 invocation-counter problem in a new place,
+/// and it is settled the same way — with evidence rather than with a
+/// declaration.
+#[derive(Debug, Clone, Serialize)]
+pub struct TargetEvidence {
+    pub function: String,
+    pub entry_symbol: String,
+    /// Whether the analyzer reported reaching the function.
+    pub reached: bool,
+    /// Where it reported reaching it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    /// The directive that asked for this evidence.
+    pub directive: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CaseResult {
     pub case: String,
     pub function: String,
+    /// Evidence that the analysis actually covered [`CaseResult::function`].
+    pub target: TargetEvidence,
+    /// The observation classes this result covers. Anything absent here was
+    /// not checked, and the result says nothing about it.
+    pub checked_features: Vec<CheckFeature>,
+    /// Properties the result does **not** cover, named rather than left to
+    /// inference.
+    pub unchecked_properties: Vec<&'static str>,
     /// The artifact this result describes. Carried per case so a result stays
     /// interpretable after being split out of its report.
     pub artifact_sha256: String,
@@ -414,6 +510,10 @@ pub struct CaseResult {
     pub witness: WitnessStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub witness_detail: Option<String>,
+    /// Solver-produced secret pairs that diverge, when the analyzer issued a
+    /// relational query and recorded its model.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub counterexamples: Vec<Counterexample>,
     pub exploration: Exploration,
     /// The script handed to the analyzer, so a result can be reproduced by hand.
     pub script: String,
@@ -454,6 +554,77 @@ pub const BUILD_FLAGS: [&str; 8] = [
 
 const LINK_FLAGS: [&str; 4] = ["-C", "link-arg=-nostdlib", "-C", "link-arg=-static"];
 
+/// Container runtimes probed, in preference order when more than one holds the
+/// image.
+pub const CONTAINER_RUNTIMES: [&str; 2] = ["podman", "docker"];
+
+/// Environment override for the container runtime, equivalent to
+/// `--container-runtime`.
+pub const RUNTIME_ENV: &str = "TRACE_CHECK_CONTAINER_RUNTIME";
+
+/// Picks the runtime that actually holds the image.
+///
+/// Selecting the first runtime on `PATH` instead is a real failure mode, not a
+/// hypothetical one: a CI runner with both installed pulled the image with
+/// Docker, the tool picked Podman, and every case failed with "not present
+/// locally" before any analysis ran. `probe` reports, per runtime, whether it
+/// is usable and whether it has the image.
+///
+/// Returns the chosen runtime, or the list of usable runtimes when none has the
+/// image — that list is what makes the error message name the right command.
+fn select_runtime(
+    candidates: &[String],
+    probe: impl Fn(&str) -> RuntimeState,
+) -> Result<String, Vec<String>> {
+    let mut usable = Vec::new();
+    for candidate in candidates {
+        match probe(candidate) {
+            RuntimeState::Absent => {}
+            RuntimeState::WithoutImage => usable.push(candidate.clone()),
+            RuntimeState::WithImage => return Ok(candidate.clone()),
+        }
+    }
+    Err(usable)
+}
+
+/// What a probe of one container runtime found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeState {
+    /// Not installed, or not usable.
+    Absent,
+    /// Usable, but the analyzer image is not in its store.
+    WithoutImage,
+    /// Usable and holding the analyzer image.
+    WithImage,
+}
+
+fn probe_runtime(tool: &str) -> RuntimeState {
+    let usable = Command::new(tool)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !usable {
+        return RuntimeState::Absent;
+    }
+    // `image inspect` rather than podman's `image exists`, which Docker does
+    // not have. Both runtimes have to work.
+    let present = Command::new(tool)
+        .args(["image", "inspect", ANALYZER_IMAGE])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if present {
+        RuntimeState::WithImage
+    } else {
+        RuntimeState::WithoutImage
+    }
+}
+
 pub struct Verifier {
     container_tool: String,
     rustc_version: String,
@@ -463,26 +634,44 @@ pub struct Verifier {
 }
 
 impl Verifier {
-    /// Validates the platform and locates a container runtime.
+    /// Validates the platform and locates a container runtime holding the
+    /// analyzer image, honoring [`RUNTIME_ENV`].
     pub fn prepare() -> Result<Self, SymbolicError> {
+        let requested = std::env::var(RUNTIME_ENV).ok().filter(|v| !v.is_empty());
+        Self::prepare_with(requested.as_deref())
+    }
+
+    /// As [`Verifier::prepare`], with an explicit runtime choice that overrides
+    /// both the probe order and the environment.
+    pub fn prepare_with(requested: Option<&str>) -> Result<Self, SymbolicError> {
         if std::env::consts::ARCH != "x86_64" || std::env::consts::OS != "linux" {
             return Err(SymbolicError::UnsupportedTarget {
                 found: format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS),
             });
         }
-        let container_tool = ["podman", "docker"]
-            .into_iter()
-            .find(|tool| {
-                Command::new(tool)
-                    .arg("--version")
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .map(|status| status.success())
-                    .unwrap_or(false)
-            })
-            .ok_or(SymbolicError::MissingContainerTool)?
-            .to_string();
+        let candidates: Vec<String> = match requested {
+            Some(tool) => {
+                if !CONTAINER_RUNTIMES.contains(&tool) {
+                    return Err(SymbolicError::Schema(format!(
+                        "unknown container runtime {tool:?}; expected one of {}",
+                        CONTAINER_RUNTIMES.join(", ")
+                    )));
+                }
+                vec![tool.to_string()]
+            }
+            None => CONTAINER_RUNTIMES.iter().map(|t| t.to_string()).collect(),
+        };
+
+        let container_tool = match select_runtime(&candidates, probe_runtime) {
+            Ok(tool) => tool,
+            // No runtime has the image. Keep the first usable one so the error
+            // names a command the caller can actually run; an empty list means
+            // nothing is installed at all.
+            Err(usable) => usable
+                .first()
+                .cloned()
+                .ok_or(SymbolicError::MissingContainerTool)?,
+        };
 
         Ok(Verifier {
             container_tool,
@@ -495,24 +684,16 @@ impl Verifier {
         &self.container_tool
     }
 
-    /// Confirms the analyzer image is present locally, so a missing image is an
-    /// explicit dependency error rather than a mid-run surprise.
+    /// Confirms the analyzer image is present in the selected runtime's store,
+    /// so a missing image is an explicit dependency error rather than a mid-run
+    /// surprise.
     pub fn check_image(&mut self) -> Result<(), SymbolicError> {
-        // `image inspect` rather than podman's `image exists`, which Docker
-        // does not have. Both runtimes have to work.
-        let output = Command::new(&self.container_tool)
-            .args(["image", "inspect", ANALYZER_IMAGE])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        match output {
-            Ok(status) if status.success() => {}
-            _ => {
-                return Err(SymbolicError::MissingImage {
-                    image: ANALYZER_IMAGE.to_string(),
-                    detail: "not present locally".to_string(),
-                })
-            }
+        if probe_runtime(&self.container_tool) != RuntimeState::WithImage {
+            return Err(SymbolicError::MissingImage {
+                image: ANALYZER_IMAGE.to_string(),
+                tool: self.container_tool.clone(),
+                detail: format!("not in {}'s image store", self.container_tool),
+            });
         }
         self.analyzer_build = Command::new(&self.container_tool)
             .args(["run", "--rm", ANALYZER_IMAGE, "binsec", "-version"])
@@ -620,6 +801,10 @@ impl Verifier {
         if !case.assumptions.is_empty() {
             script.push('\n');
         }
+        // Asks the analyzer to report whether exploration reaches the function
+        // the case is about. Verified against the real analyzer to leave path
+        // counts, check counts and the verdict unchanged.
+        script.push_str(&format!("{}\n\n", reach_directive(&case.function)));
         script.push_str(&format!("halt at <{}>\n", case.halt_symbol));
         script.push_str("explore all\n");
         script
@@ -658,7 +843,14 @@ impl Verifier {
         let staged_artifact = stage.path().join("targets");
         std::fs::copy(artifact, &staged_artifact)
             .map_err(|e| SymbolicError::Io(format!("{}: {e}", staged_artifact.display())))?;
+        // The analyzer writes its solver queries here, models included. That
+        // is where a counterexample comes from, so the container's non-root
+        // user needs to be able to write into it.
+        let smt_dir = stage.path().join("smt");
+        std::fs::create_dir_all(&smt_dir)
+            .map_err(|e| SymbolicError::Io(format!("{}: {e}", smt_dir.display())))?;
         make_readable(stage.path())?;
+        make_writable(&smt_dir)?;
 
         let mut args = vec![
             "run".to_string(),
@@ -677,17 +869,22 @@ impl Verifier {
             case.max_depth.to_string(),
             "-fml-solver-timeout".to_string(),
             case.solver_timeout_secs.to_string(),
+            // Caches every query with the solver's answer and model, which is
+            // the only interface that exposes a satisfying assignment.
+            "-smt-dir".to_string(),
+            "/work/smt".to_string(),
         ];
-        if !case.features.is_empty() {
-            args.push("-checkct-features".to_string());
-            args.push(
-                case.features
-                    .iter()
-                    .map(|feature| feature.as_binsec())
-                    .collect::<Vec<_>>()
-                    .join(","),
-            );
-        }
+        // Always explicit. Relying on the analyzer's default would make the
+        // observation model of a result depend on the analyzer version rather
+        // than on the case, and the case file requires it for that reason.
+        args.push("-checkct-features".to_string());
+        args.push(
+            case.features
+                .iter()
+                .map(|feature| feature.as_binsec())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
         args.push("targets".to_string());
 
         let limits = Duration::from_secs(case.wall_timeout_secs);
@@ -696,22 +893,57 @@ impl Verifier {
 
         let exploration = parse_exploration(&combined);
         let divergences = parse_divergences(&combined, artifact, &symbols);
-        let (outcome, message) = classify(case, &exploration, &divergences, &captured);
+        let reached = parse_reached(&combined, &case.function);
+        let target = TargetEvidence {
+            function: case.function.clone(),
+            entry_symbol: case.entry_symbol.clone(),
+            reached: reached.is_some(),
+            address: reached,
+            directive: reach_directive(&case.function),
+        };
+        let (outcome, message) = classify(case, &exploration, &divergences, &captured, &target);
+
+        // Only a leak has a counterexample to report, and only when the
+        // analyzer actually issued a relational query.
+        let counterexamples = if outcome == Outcome::LeakDetected {
+            parse_counterexamples(&smt_dir, &case.secret_globals)
+        } else {
+            Vec::new()
+        };
+        let (witness, witness_detail) = if counterexamples.is_empty() {
+            (
+                WitnessStatus::UnavailableFromAnalyzer,
+                Some(
+                    "no satisfying model is available: the analyzer settled this without \
+                     issuing a relational satisfiability query, so there is no assignment \
+                     to extract"
+                        .to_string(),
+                ),
+            )
+        } else {
+            (
+                WitnessStatus::SolverCounterexample,
+                Some(
+                    "the values below are the solver's own model, read back from the \
+                     analyzer's cached query"
+                        .to_string(),
+                ),
+            )
+        };
 
         Ok(CaseResult {
             case: case.id.clone(),
             function: case.function.clone(),
+            target,
+            checked_features: case.features.clone(),
+            unchecked_properties: unchecked_properties(&case.features),
             artifact_sha256: artifact_sha256.to_string(),
             outcome,
             message,
             divergences,
-            witness: WitnessStatus::UnavailableFromAnalyzer,
-            witness_detail: Some(
-                "BINSEC's checkct reports the leaking instruction but does not expose the \
-                 satisfying model, so the two concrete secret values are not available from \
-                 the analyzer"
-                    .to_string(),
-            ),
+            witness,
+            witness_detail,
+            counterexamples,
             exploration,
             script,
         })
@@ -744,6 +976,7 @@ pub fn classify(
     exploration: &Exploration,
     divergences: &[Divergence],
     captured: &Captured,
+    target: &TargetEvidence,
 ) -> (Outcome, String) {
     if captured.exit_code != Some(0) {
         return (
@@ -762,6 +995,33 @@ pub fn classify(
         return (
             Outcome::Inconclusive,
             "the analyzer produced no verdict; its output is missing or malformed".to_string(),
+        );
+    }
+
+    // Nothing is attributed to a function the analyzer never reached. The entry
+    // symbol decides what gets explored, so a case naming an unrelated function
+    // would otherwise inherit the harness's verdict -- including a clean one.
+    if !target.reached {
+        let found_anything = status == Some("insecure") || !divergences.is_empty();
+        return (
+            Outcome::Inconclusive,
+            if found_anything {
+                format!(
+                    "the analyzer found {} divergence site(s) but never reached `{}` from \
+                     `{}`, so no result can be attributed to it; the sites are reported \
+                     below and belong to other code on the explored paths",
+                    divergences.len(),
+                    target.function,
+                    target.entry_symbol
+                )
+            } else {
+                format!(
+                    "the analyzer never reached `{}` from `{}`, so this run establishes \
+                     nothing about it; check that the entry symbol is the harness that \
+                     calls it",
+                    target.function, target.entry_symbol
+                )
+            },
         );
     }
 
@@ -833,15 +1093,58 @@ pub fn classify(
             ),
         );
     }
-    if exploration.performed_checks() == 0 {
+    // Every obligation the case asked for has to be accounted for, class by
+    // class. A `secure` verdict alongside `0 / 1 memory access checks pass`
+    // contradicts itself, and a class the analyzer said nothing about is
+    // missing evidence rather than zero work.
+    for feature in &case.features {
+        match exploration.checks(*feature) {
+            (Some(passed), Some(total)) if total > 0 && passed == total => {}
+            (Some(passed), Some(total)) if total > 0 => {
+                return (
+                    Outcome::Inconclusive,
+                    format!(
+                        "the analyzer reported `secure` but only {passed} of {total} {} \
+                         check(s) passed; the counts contradict the verdict",
+                        feature.as_binsec()
+                    ),
+                );
+            }
+            (_, Some(0)) => {
+                return (
+                    Outcome::Inconclusive,
+                    format!(
+                        "no {} check was performed, so {} was not established however \
+                         clean the verdict looks",
+                        feature.as_binsec(),
+                        feature.property()
+                    ),
+                );
+            }
+            _ => {
+                return (
+                    Outcome::Inconclusive,
+                    format!(
+                        "the case asked for {} checks but the analyzer reported no count \
+                         for them; its output is missing or malformed",
+                        feature.as_binsec()
+                    ),
+                );
+            }
+        }
+    }
+
+    // Depth evidence is required, not assumed. Treating a missing maximum as
+    // zero would let malformed output pass the bound check.
+    let Some(max_depth_reached) = exploration.max_path_depth else {
         return (
             Outcome::Inconclusive,
-            "no relational check was performed, so nothing was verified however clean the \
-             verdict looks"
+            "the analyzer reported no maximum path depth, so the exploration bound cannot \
+             be shown to have held"
                 .to_string(),
         );
-    }
-    if exploration.max_path_depth.unwrap_or(0) >= u64::from(case.max_depth) {
+    };
+    if max_depth_reached >= u64::from(case.max_depth) {
         return (
             Outcome::Inconclusive,
             format!(
@@ -852,18 +1155,160 @@ pub fn classify(
         );
     }
 
-    (
-        Outcome::VerifiedBounded,
-        format!(
-            "all {} relational check(s) discharged over {} fully explored path(s), within the \
-             declared input domain and bounds; this is not a claim about untested domains, \
-             other artifacts, or unmodeled observations",
-            exploration.performed_checks(),
-            exploration
-                .total_paths
-                .map_or_else(|| "?".to_string(), |t| t.to_string())
-        ),
-    )
+    let verified: Vec<&str> = case.features.iter().map(|f| f.property()).collect();
+    let unchecked = unchecked_properties(&case.features);
+    let mut message = format!(
+        "{} established over {} fully explored path(s) ({} relational check(s) discharged), \
+         within the declared input domain and bounds",
+        verified.join(" and "),
+        exploration
+            .total_paths
+            .map_or_else(|| "?".to_string(), |t| t.to_string()),
+        exploration.performed_checks()
+    );
+    if !unchecked.is_empty() {
+        message.push_str(&format!("; {} was NOT checked", unchecked.join(" and ")));
+    }
+    message.push_str(
+        "; this is not a claim about untested domains, other artifacts, or unmodeled \
+         observations",
+    );
+    (Outcome::VerifiedBounded, message)
+}
+
+/// Properties no selected check covers, so a report can name them instead of
+/// leaving a reader to infer the gap.
+pub fn unchecked_properties(selected: &[CheckFeature]) -> Vec<&'static str> {
+    CheckFeature::all()
+        .into_iter()
+        .filter(|feature| !selected.contains(feature))
+        .map(CheckFeature::property)
+        .collect()
+}
+
+/// Extracts solver-produced counterexamples from the analyzer's cached SMT
+/// queries.
+///
+/// `-smt-dir` makes BINSEC write every query it issued, with the solver's
+/// answer and model recorded as trailing comments:
+///
+/// ```text
+/// (declare-fun mirror_TC_SECRET!1 () (_ BitVec 8))
+/// (declare-fun TC_SECRET!1 () (_ BitVec 8))
+/// ...
+/// ; sat
+/// (get-value (mirror_TC_SECRET!1))
+/// ; ((mirror_TC_SECRET!1 #xff))
+/// (get-value (TC_SECRET!1))
+/// ; ((TC_SECRET!1 #xfe))
+/// ```
+///
+/// A query is *relational* when it constrains both a secret and its `mirror_`
+/// copy; that pair is the counterexample. Queries over a single copy are
+/// path-feasibility questions and are ignored, because one value is not a
+/// counterexample to noninterference.
+///
+/// Returns at most one pair per declared secret global, the first found, so a
+/// report names a witness rather than a list of equivalent ones.
+fn parse_counterexamples(smt_dir: &Path, secrets: &[String]) -> Vec<Counterexample> {
+    let Ok(entries) = std::fs::read_dir(smt_dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "smt2"))
+        .collect();
+    // Deterministic order, so the reported witness does not depend on how the
+    // directory happens to be laid out.
+    files.sort();
+
+    let mut found: Vec<Counterexample> = Vec::new();
+    for path in files {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        // Only a satisfiable query has a model.
+        if !text.lines().any(|line| line.trim() == "; sat") {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        for secret in secrets {
+            if found.iter().any(|c| &c.global == secret) {
+                continue;
+            }
+            let plain = model_value(&text, secret, false);
+            let mirror = model_value(&text, secret, true);
+            // Both copies, and genuinely different: equal values would make the
+            // "counterexample" vacuous.
+            if let (Some(left), Some(right)) = (plain, mirror) {
+                if left != right {
+                    found.push(Counterexample {
+                        global: secret.clone(),
+                        left,
+                        right,
+                        query: name.clone(),
+                    });
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Reads one recorded model value for `global`, or its `mirror_` copy.
+///
+/// Matches `; ((TC_SECRET!1 #xfe))`. The `!n` suffix is BINSEC's SSA index and
+/// is not part of the global's name, so the prefix is matched and the index
+/// skipped.
+fn model_value(text: &str, global: &str, mirror: bool) -> Option<String> {
+    let prefix = if mirror {
+        format!("mirror_{global}!")
+    } else {
+        format!("{global}!")
+    };
+    text.lines().find_map(|line| {
+        let line = line.trim();
+        let body = line.strip_prefix("; ((")?.strip_suffix("))")?;
+        let (name, value) = body.split_once(' ')?;
+        if !name.starts_with(&prefix) {
+            return None;
+        }
+        // `TC_SECRET!1` must not match the prefix of `mirror_TC_SECRET!1`, and
+        // the plain form must not match the mirror.
+        if !mirror && name.starts_with("mirror_") {
+            return None;
+        }
+        Some(value.trim().to_string())
+    })
+}
+
+/// The directive that asks the analyzer to report reaching `function`.
+fn reach_directive(function: &str) -> String {
+    format!("reach <{function}>")
+}
+
+/// Reads back the analyzer's own statement that it reached `function`.
+///
+/// The line looks like
+/// `[sse:result] Path 0 reached address 0x2014c0 (<masked_scan>) (0 to go)`.
+/// Matching on the symbol in parentheses rather than on an address keeps this
+/// independent of where the linker put the function.
+fn parse_reached(output: &str, function: &str) -> Option<String> {
+    let marker = format!("(<{function}>)");
+    output.lines().find_map(|line| {
+        if !line.contains("reached address") || !line.contains(&marker) {
+            return None;
+        }
+        line.split("reached address")
+            .nth(1)?
+            .split_whitespace()
+            .next()
+            .map(str::to_string)
+    })
 }
 
 /// Pulls exploration statistics out of the analyzer's report.
@@ -1035,6 +1480,13 @@ fn stage_dir(case_id: &str) -> Result<tempfile::TempDir, SymbolicError> {
 }
 
 /// Makes the staging directory traversable by the container's non-root user.
+/// Lets the container's non-root user write into a staged directory.
+fn make_writable(dir: &Path) -> Result<(), SymbolicError> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o777))
+        .map_err(|e| SymbolicError::Io(format!("{}: {e}", dir.display())))
+}
+
 fn make_readable(dir: &Path) -> Result<(), SymbolicError> {
     use std::os::unix::fs::PermissionsExt;
     let apply = |path: &Path, mode: u32| -> Result<(), SymbolicError> {
@@ -1241,12 +1693,32 @@ mod tests {
             secret_globals: vec!["TC_SECRET".into()],
             public_globals: vec!["TC_TABLE".into()],
             assumptions: vec![],
-            features: vec![],
+            features: vec![CheckFeature::ControlFlow, CheckFeature::MemoryAccess],
             max_depth,
             solver_timeout_secs: 30,
             wall_timeout_secs: 900,
             expected_outcome: expected.into(),
             rationale: String::new(),
+        }
+    }
+
+    /// The analyzer reported reaching the declared function.
+    fn reached() -> TargetEvidence {
+        TargetEvidence {
+            function: "f".into(),
+            entry_symbol: "tc_harness_f".into(),
+            reached: true,
+            address: Some("0x2014c0".into()),
+            directive: "reach <f>".into(),
+        }
+    }
+
+    /// The analyzer never reported reaching it.
+    fn unreached() -> TargetEvidence {
+        TargetEvidence {
+            reached: false,
+            address: None,
+            ..reached()
         }
     }
 
@@ -1304,8 +1776,13 @@ mod tests {
     fn a_reported_leak_is_detected() {
         let stats = parse_exploration(LEAKY);
         let divergences = parse_divergences(LEAKY, Path::new("/nonexistent"), &BTreeMap::new());
-        let (outcome, message) =
-            classify(&case("LEAK_DETECTED", 1000), &stats, &divergences, &ok());
+        let (outcome, message) = classify(
+            &case("LEAK_DETECTED", 1000),
+            &stats,
+            &divergences,
+            &ok(),
+            &reached(),
+        );
         assert_eq!(outcome, Outcome::LeakDetected);
         assert!(message.contains("1 secret-dependent memory access"));
     }
@@ -1315,7 +1792,13 @@ mod tests {
     #[test]
     fn a_complete_clean_run_is_verified_bounded() {
         let stats = parse_exploration(SECURE);
-        let (outcome, message) = classify(&case("VERIFIED_BOUNDED", 1000), &stats, &[], &ok());
+        let (outcome, message) = classify(
+            &case("VERIFIED_BOUNDED", 1000),
+            &stats,
+            &[],
+            &ok(),
+            &reached(),
+        );
         assert_eq!(outcome, Outcome::VerifiedBounded);
         assert!(message.contains("within the declared input domain"));
         assert!(message.contains("not a claim about untested domains"));
@@ -1325,7 +1808,8 @@ mod tests {
     #[test]
     fn an_unknown_verdict_is_inconclusive() {
         let stats = parse_exploration(INCOMPLETE);
-        let (outcome, message) = classify(&case("INCONCLUSIVE", 40), &stats, &[], &ok());
+        let (outcome, message) =
+            classify(&case("INCONCLUSIVE", 40), &stats, &[], &ok(), &reached());
         assert_eq!(outcome, Outcome::Inconclusive);
         assert!(message.contains("7 of 10 paths"));
     }
@@ -1342,7 +1826,13 @@ mod tests {
         let stats = parse_exploration(&output);
         assert_eq!(stats.analyzer_status.as_deref(), Some("secure"));
         assert!(!stats.is_complete());
-        let (outcome, message) = classify(&case("VERIFIED_BOUNDED", 1000), &stats, &[], &ok());
+        let (outcome, message) = classify(
+            &case("VERIFIED_BOUNDED", 1000),
+            &stats,
+            &[],
+            &ok(),
+            &reached(),
+        );
         assert_eq!(outcome, Outcome::Inconclusive);
         assert!(message.contains("exploration was incomplete"));
     }
@@ -1355,7 +1845,13 @@ mod tests {
             "pending paths                    3",
         );
         let stats = parse_exploration(&output);
-        let (outcome, _) = classify(&case("VERIFIED_BOUNDED", 1000), &stats, &[], &ok());
+        let (outcome, _) = classify(
+            &case("VERIFIED_BOUNDED", 1000),
+            &stats,
+            &[],
+            &ok(),
+            &reached(),
+        );
         assert_eq!(outcome, Outcome::Inconclusive);
     }
 
@@ -1364,7 +1860,13 @@ mod tests {
     fn secure_with_unknown_queries_is_inconclusive() {
         let output = SECURE.replace("unknown        0", "unknown        1");
         let stats = parse_exploration(&output);
-        let (outcome, message) = classify(&case("VERIFIED_BOUNDED", 1000), &stats, &[], &ok());
+        let (outcome, message) = classify(
+            &case("VERIFIED_BOUNDED", 1000),
+            &stats,
+            &[],
+            &ok(),
+            &reached(),
+        );
         assert_eq!(outcome, Outcome::Inconclusive);
         assert!(message.contains("returned unknown"));
     }
@@ -1383,9 +1885,22 @@ mod tests {
             );
         let stats = parse_exploration(&output);
         assert_eq!(stats.performed_checks(), 0);
-        let (outcome, message) = classify(&case("VERIFIED_BOUNDED", 1000), &stats, &[], &ok());
+        let (outcome, message) = classify(
+            &case("VERIFIED_BOUNDED", 1000),
+            &stats,
+            &[],
+            &ok(),
+            &reached(),
+        );
         assert_eq!(outcome, Outcome::Inconclusive);
-        assert!(message.contains("nothing was verified"));
+        assert!(
+            message.contains("no control-flow check was performed"),
+            "{message}"
+        );
+        assert!(
+            message.contains("control-flow noninterference was not established"),
+            "{message}"
+        );
     }
 
     /// Reaching the depth bound is inconclusive even with a clean verdict.
@@ -1393,7 +1908,13 @@ mod tests {
     fn reaching_the_depth_bound_is_inconclusive() {
         let stats = parse_exploration(SECURE);
         // The spike's masked scan reached depth 120.
-        let (outcome, message) = classify(&case("VERIFIED_BOUNDED", 120), &stats, &[], &ok());
+        let (outcome, message) = classify(
+            &case("VERIFIED_BOUNDED", 120),
+            &stats,
+            &[],
+            &ok(),
+            &reached(),
+        );
         assert_eq!(outcome, Outcome::Inconclusive);
         assert!(message.contains("depth bound"));
     }
@@ -1402,7 +1923,13 @@ mod tests {
     #[test]
     fn missing_verdict_is_inconclusive() {
         let stats = parse_exploration("some unrelated text");
-        let (outcome, message) = classify(&case("VERIFIED_BOUNDED", 1000), &stats, &[], &ok());
+        let (outcome, message) = classify(
+            &case("VERIFIED_BOUNDED", 1000),
+            &stats,
+            &[],
+            &ok(),
+            &reached(),
+        );
         assert_eq!(outcome, Outcome::Inconclusive);
         assert!(message.contains("no verdict"));
     }
@@ -1416,7 +1943,13 @@ mod tests {
             stderr: String::new(),
             exit_code: Some(2),
         };
-        let (outcome, message) = classify(&case("VERIFIED_BOUNDED", 1000), &stats, &[], &failed);
+        let (outcome, message) = classify(
+            &case("VERIFIED_BOUNDED", 1000),
+            &stats,
+            &[],
+            &failed,
+            &reached(),
+        );
         assert_eq!(outcome, Outcome::Inconclusive);
         assert!(message.contains("exited with code 2"));
     }
@@ -1426,8 +1959,321 @@ mod tests {
     fn truncated_output_is_inconclusive() {
         let truncated = &SECURE[..SECURE.len() / 2];
         let stats = parse_exploration(truncated);
-        let (outcome, _) = classify(&case("VERIFIED_BOUNDED", 1000), &stats, &[], &ok());
+        let (outcome, _) = classify(
+            &case("VERIFIED_BOUNDED", 1000),
+            &stats,
+            &[],
+            &ok(),
+            &reached(),
+        );
         assert_eq!(outcome, Outcome::Inconclusive);
+    }
+
+    /// A clean, complete run establishes nothing when the analyzer never
+    /// reported reaching the declared function.
+    ///
+    /// The reviewed hole: `function` and `entry_symbol` were independent, both
+    /// only checked for existence, so pairing a vulnerable function with a safe
+    /// harness reported VERIFIED_BOUNDED for code that was never analyzed.
+    #[test]
+    fn a_clean_run_that_never_reached_the_target_is_inconclusive() {
+        let stats = parse_exploration(SECURE);
+        let (outcome, message) = classify(
+            &case("VERIFIED_BOUNDED", 1000),
+            &stats,
+            &[],
+            &ok(),
+            &unreached(),
+        );
+        assert_eq!(outcome, Outcome::Inconclusive);
+        assert_ne!(outcome, Outcome::VerifiedBounded);
+        assert!(message.contains("never reached `f`"), "{message}");
+        assert!(message.contains("tc_harness_f"), "{message}");
+    }
+
+    /// A leak found while the declared function was never reached is not
+    /// attributed to it, and is not swallowed either.
+    #[test]
+    fn a_leak_without_target_evidence_is_not_attributed() {
+        let divergences = parse_divergences(LEAKY, Path::new("/nonexistent"), &BTreeMap::new());
+        let stats = parse_exploration(LEAKY);
+        let (outcome, message) = classify(
+            &case("LEAK_DETECTED", 1000),
+            &stats,
+            &divergences,
+            &ok(),
+            &unreached(),
+        );
+        assert_eq!(outcome, Outcome::Inconclusive);
+        assert!(message.contains("never reached `f`"), "{message}");
+        assert!(
+            message.contains("divergence site(s)"),
+            "the finding must not be hidden: {message}"
+        );
+    }
+
+    /// The script asks the analyzer for that evidence.
+    #[test]
+    fn the_script_asks_whether_the_target_was_reached() {
+        let verifier = Verifier {
+            container_tool: "podman".into(),
+            rustc_version: "rustc 1.97.0".into(),
+            analyzer_build: None,
+        };
+        let script = verifier.script(&case("LEAK_DETECTED", 1000));
+        assert!(script.contains("reach <f>"), "{script}");
+    }
+
+    /// The analyzer's own "reached address" line is read back, matched on the
+    /// symbol rather than an address so the linker's layout does not matter.
+    #[test]
+    fn a_reached_target_is_parsed_from_the_analyzer_output() {
+        let output = "[sse:result] Path 0 reached address 0x2014c0 (<masked_scan>) (0 to go)";
+        assert_eq!(
+            parse_reached(output, "masked_scan").as_deref(),
+            Some("0x2014c0")
+        );
+        // A different function in the same run is not evidence for this one.
+        assert_eq!(parse_reached(output, "secret_lookup"), None);
+        assert_eq!(parse_reached("", "masked_scan"), None);
+    }
+
+    /// A `secure` verdict alongside counts that do not add up is contradictory,
+    /// and the counts win.
+    #[test]
+    fn secure_with_unaccounted_obligations_is_inconclusive() {
+        let output = SECURE.replace(
+            "30 / 30 memory access checks pass",
+            "0 / 1 memory access checks pass",
+        );
+        let stats = parse_exploration(&output);
+        let (outcome, message) = classify(
+            &case("VERIFIED_BOUNDED", 1000),
+            &stats,
+            &[],
+            &ok(),
+            &reached(),
+        );
+        assert_eq!(outcome, Outcome::Inconclusive);
+        assert!(
+            message.contains("only 0 of 1 memory-access check(s) passed"),
+            "{message}"
+        );
+        assert!(message.contains("contradict"), "{message}");
+    }
+
+    /// A class the case asked for but the analyzer said nothing about is
+    /// missing evidence, not zero work.
+    #[test]
+    fn a_requested_check_class_with_no_reported_count_is_inconclusive() {
+        let output = SECURE.replace("[checkct:info] 30 / 30 memory access checks pass\n", "");
+        let stats = parse_exploration(&output);
+        assert_eq!(stats.checks(CheckFeature::MemoryAccess), (None, None));
+        let (outcome, message) = classify(
+            &case("VERIFIED_BOUNDED", 1000),
+            &stats,
+            &[],
+            &ok(),
+            &reached(),
+        );
+        assert_eq!(outcome, Outcome::Inconclusive);
+        assert!(message.contains("reported no count"), "{message}");
+    }
+
+    /// Checking control flow alone cannot be mistaken for a full result.
+    ///
+    /// This is the reviewed case: the known secret-indexed lookup reports
+    /// `secure` under control-flow-only checks, because its instruction path
+    /// really is secret-independent. The verdict is legitimate and narrow, and
+    /// the message has to say which property was left out.
+    #[test]
+    fn a_control_flow_only_result_names_what_it_did_not_check() {
+        let output = SECURE.replace("[checkct:info] 30 / 30 memory access checks pass\n", "");
+        let stats = parse_exploration(&output);
+        let mut narrow = case("VERIFIED_BOUNDED", 1000);
+        narrow.features = vec![CheckFeature::ControlFlow];
+        let (outcome, message) = classify(&narrow, &stats, &[], &ok(), &reached());
+        assert_eq!(outcome, Outcome::VerifiedBounded);
+        assert!(
+            message.contains("control-flow noninterference established"),
+            "{message}"
+        );
+        assert!(
+            message.contains("memory-address noninterference was NOT checked"),
+            "{message}"
+        );
+        assert_eq!(
+            unchecked_properties(&narrow.features),
+            vec!["memory-address noninterference"]
+        );
+    }
+
+    /// A full result reports nothing as unchecked.
+    #[test]
+    fn a_full_result_leaves_no_modeled_property_unchecked() {
+        assert!(unchecked_properties(&CheckFeature::all()).is_empty());
+    }
+
+    /// Missing depth evidence is not treated as depth zero.
+    #[test]
+    fn a_missing_max_depth_is_inconclusive() {
+        let output = SECURE.replace("             max path depth                   120\n", "");
+        let stats = parse_exploration(&output);
+        assert_eq!(stats.max_path_depth, None);
+        let (outcome, message) = classify(
+            &case("VERIFIED_BOUNDED", 1000),
+            &stats,
+            &[],
+            &ok(),
+            &reached(),
+        );
+        assert_eq!(outcome, Outcome::Inconclusive);
+        assert!(message.contains("no maximum path depth"), "{message}");
+    }
+
+    /// A case must declare its observation model rather than inheriting the
+    /// analyzer's default.
+    #[test]
+    fn a_case_with_no_declared_features_is_rejected() {
+        let error = case_file(|value| {
+            value["cases"][0]["features"] = serde_json::json!([]);
+        })
+        .expect_err("an unstated observation model is refused");
+        assert!(error.to_string().contains("observation model"), "{error}");
+    }
+
+    /// Omitting the field entirely is refused too, so the requirement cannot be
+    /// sidestepped.
+    #[test]
+    fn a_case_missing_the_features_field_is_rejected() {
+        let error = case_file(|value| {
+            value["cases"][0]
+                .as_object_mut()
+                .expect("a case object")
+                .remove("features");
+        })
+        .expect_err("features is required");
+        assert!(error.to_string().contains("features"), "{error}");
+    }
+
+    /// A duplicated feature is a case-file mistake, not a silently deduplicated
+    /// list.
+    #[test]
+    fn a_duplicated_feature_is_rejected() {
+        let error = case_file(|value| {
+            value["cases"][0]["features"] = serde_json::json!(["control-flow", "control-flow"]);
+        })
+        .expect_err("a duplicate is refused");
+        assert!(error.to_string().contains("twice"), "{error}");
+    }
+
+    /// Real relational query as the analyzer cached it, model included.
+    const RELATIONAL_QUERY: &str = "\
+(set-logic QF_ABV)
+(declare-fun mirror_TC_SECRET!1 () (_ BitVec 8))
+(declare-fun TC_SECRET!1 () (_ BitVec 8))
+(assert !2) (check-sat)
+; sat
+(get-value (mirror_TC_SECRET!1))
+; ((mirror_TC_SECRET!1 #xff))
+(get-value (TC_SECRET!1))
+; ((TC_SECRET!1 #xfe))
+";
+
+    /// Real path-feasibility query: one copy only, so not a counterexample.
+    const PATH_QUERY: &str = "\
+(set-logic QF_ABV)
+(declare-fun TC_SECRET!1 () (_ BitVec 8))
+(assert !0) (check-sat)
+; sat
+(get-value (TC_SECRET!1))
+; ((TC_SECRET!1 #x06))
+";
+
+    fn smt_dir(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for (name, body) in files {
+            std::fs::write(dir.path().join(name), body).expect("write query");
+        }
+        dir
+    }
+
+    /// A relational model is read back as the counterexample pair.
+    #[test]
+    fn a_relational_model_yields_a_counterexample_pair() {
+        let dir = smt_dir(&[("query_10.smt2", RELATIONAL_QUERY)]);
+        let found = parse_counterexamples(dir.path(), &["TC_SECRET".to_string()]);
+        assert_eq!(
+            found,
+            vec![Counterexample {
+                global: "TC_SECRET".into(),
+                left: "#xfe".into(),
+                right: "#xff".into(),
+                query: "query_10.smt2".into(),
+            }]
+        );
+    }
+
+    /// A single-copy query is a path-feasibility question, not a
+    /// counterexample: one value cannot witness a difference.
+    #[test]
+    fn a_single_copy_model_is_not_a_counterexample() {
+        let dir = smt_dir(&[("query_11.smt2", PATH_QUERY)]);
+        assert!(parse_counterexamples(dir.path(), &["TC_SECRET".to_string()]).is_empty());
+    }
+
+    /// An unsatisfiable query has no model to report.
+    #[test]
+    fn an_unsat_query_yields_no_counterexample() {
+        let unsat = RELATIONAL_QUERY.replace("; sat", "; unsat");
+        let dir = smt_dir(&[("query_10.smt2", &unsat)]);
+        assert!(parse_counterexamples(dir.path(), &["TC_SECRET".to_string()]).is_empty());
+    }
+
+    /// Equal values are not a counterexample, however the model is recorded.
+    #[test]
+    fn an_identical_pair_is_refused_as_a_witness() {
+        let vacuous = RELATIONAL_QUERY.replace("#xff", "#xfe");
+        let dir = smt_dir(&[("query_10.smt2", &vacuous)]);
+        assert!(parse_counterexamples(dir.path(), &["TC_SECRET".to_string()]).is_empty());
+    }
+
+    /// Selection is deterministic: the lowest-sorting query wins, so a report
+    /// does not depend on directory order.
+    #[test]
+    fn the_reported_witness_is_deterministic() {
+        let other = RELATIONAL_QUERY.replace("#xfe", "#xfb");
+        let dir = smt_dir(&[
+            ("query_4.smt2", &other),
+            ("query_10.smt2", RELATIONAL_QUERY),
+        ]);
+        let found = parse_counterexamples(dir.path(), &["TC_SECRET".to_string()]);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].query, "query_10.smt2");
+        assert_eq!(found[0].left, "#xfe");
+    }
+
+    /// A missing cache directory is not a failure: many leaks are settled
+    /// without a solver call, and that is reported rather than erroring.
+    #[test]
+    fn a_missing_query_cache_yields_no_counterexample() {
+        let found =
+            parse_counterexamples(Path::new("/nonexistent/smt"), &["TC_SECRET".to_string()]);
+        assert!(found.is_empty());
+    }
+
+    /// `mirror_` and plain copies are never confused for one another.
+    #[test]
+    fn mirror_and_plain_model_values_are_distinguished() {
+        assert_eq!(
+            model_value(RELATIONAL_QUERY, "TC_SECRET", false).as_deref(),
+            Some("#xfe")
+        );
+        assert_eq!(
+            model_value(RELATIONAL_QUERY, "TC_SECRET", true).as_deref(),
+            Some("#xff")
+        );
+        assert_eq!(model_value(PATH_QUERY, "TC_SECRET", true), None);
     }
 
     /// The generated script uses BINSEC's syntax and carries the declared
@@ -1461,6 +2307,7 @@ mod tests {
                 "halt_symbol": "tc_halt",
                 "secret_globals": ["TC_SECRET"],
                 "public_globals": ["TC_TABLE"],
+                "features": ["control-flow", "memory-access"],
                 "max_depth": 1000,
                 "expected_outcome": "LEAK_DETECTED"
             }]
@@ -1578,13 +2425,72 @@ mod tests {
 
     /// A missing analyzer image names the pull command.
     #[test]
-    fn a_missing_image_names_the_pull_command() {
+    fn a_missing_image_names_the_pull_command_for_the_selected_runtime() {
         let rendered = SymbolicError::MissingImage {
             image: ANALYZER_IMAGE.to_string(),
-            detail: "not present locally".to_string(),
+            tool: "docker".to_string(),
+            detail: "not in docker's image store".to_string(),
         }
         .to_string();
-        assert!(rendered.contains("podman pull"));
+        assert!(rendered.contains("docker pull"), "{rendered}");
+        assert!(!rendered.contains("podman pull"), "{rendered}");
+    }
+
+    fn runtimes() -> Vec<String> {
+        CONTAINER_RUNTIMES.iter().map(|t| t.to_string()).collect()
+    }
+
+    /// The runtime holding the image is selected even when another one comes
+    /// first on PATH.
+    ///
+    /// This is the CI failure that made the M4 job red: the image was pulled
+    /// with Docker, Podman was picked because it probes first, and every case
+    /// failed with "not present locally" before any analysis ran.
+    #[test]
+    fn the_runtime_holding_the_image_is_selected_over_the_first_on_path() {
+        let chosen = select_runtime(&runtimes(), |tool| match tool {
+            "podman" => RuntimeState::WithoutImage,
+            "docker" => RuntimeState::WithImage,
+            _ => RuntimeState::Absent,
+        });
+        assert_eq!(chosen.as_deref(), Ok("docker"));
+    }
+
+    /// Preference order still decides when more than one runtime has the image.
+    #[test]
+    fn the_preferred_runtime_wins_when_both_have_the_image() {
+        let chosen = select_runtime(&runtimes(), |_| RuntimeState::WithImage);
+        assert_eq!(chosen.as_deref(), Ok("podman"));
+    }
+
+    /// When no runtime has the image, the usable ones are reported so the error
+    /// can name a command that works.
+    #[test]
+    fn with_no_image_anywhere_the_usable_runtimes_are_reported() {
+        let chosen = select_runtime(&runtimes(), |tool| match tool {
+            "docker" => RuntimeState::WithoutImage,
+            _ => RuntimeState::Absent,
+        });
+        assert_eq!(chosen, Err(vec!["docker".to_string()]));
+    }
+
+    /// Nothing installed is distinguishable from installed-but-empty.
+    #[test]
+    fn no_runtime_at_all_is_distinguishable_from_a_missing_image() {
+        let chosen = select_runtime(&runtimes(), |_| RuntimeState::Absent);
+        assert_eq!(chosen, Err(Vec::new()));
+    }
+
+    /// An explicit runtime choice is restricted to the runtimes actually
+    /// supported, so a typo cannot turn into a command that is run.
+    #[test]
+    fn an_unknown_explicit_runtime_is_rejected() {
+        let error = match Verifier::prepare_with(Some("containerd")) {
+            Err(error) => error,
+            Ok(_) => panic!("an unsupported runtime name must be rejected"),
+        };
+        assert!(error.to_string().contains("containerd"), "{error}");
+        assert!(error.to_string().contains("podman, docker"), "{error}");
     }
 
     /// The analyzer image is pinned by digest, not by a mutable tag.

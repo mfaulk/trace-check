@@ -15,21 +15,22 @@ use crate::symbolic::{CaseResult, SymbolicProvenance, VerificationCase};
 /// JSON report schema version for symbolic analyses.
 pub const REPORT_SCHEMA_VERSION: u32 = 1;
 
-const LIMITATIONS: [&str; 7] = [
+const LIMITATIONS: [&str; 10] = [
     "VERIFIED_BOUNDED is scoped to the declared input domain, the exploration bound, and the modeled observations; it claims nothing outside them.",
+    "A result covers only the observation classes the case declared. Read `checked_features` and `unchecked_properties` per case: control-flow noninterference alone says nothing about secret-dependent addresses.",
+    "A result is attributed to a function only when the analyzer reported reaching it. `target.reached` carries that evidence; without it the outcome is INCONCLUSIVE.",
     "Only control flow and effective memory addresses are modeled. Cache behavior, speculation, operand latency, power and all hardware timing are excluded.",
     "A result describes one artifact built by one compiler at one set of flags; a different build must be re-verified.",
     "The analyzed artifact is a freestanding no_std harness whose inputs are globals. The function under test is ordinary optimized Rust, but its surroundings are not.",
-    "The analyzer reports the leaking instruction, not the satisfying model, so concrete secret values are not available as a witness.",
+    "A concrete counterexample is reported only when the analyzer issued a relational satisfiability query and recorded its model. Leaks it settles by taint analysis or formula preprocessing have no model to extract, and report witness=unavailable_from_analyzer with that reason.",
+    "A reported counterexample contains the declared secret globals' values. Case inputs must be synthetic; never point a case at a real key.",
     "A differing execution path is not a measured timing signal; no hardware timing was observed.",
     "Linux x86-64 only. An instruction the analyzer does not model yields INCONCLUSIVE, by design.",
 ];
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CaseReport {
-    pub case: String,
     pub description: String,
-    pub function: String,
     pub rationale: String,
     /// The declared security lattice, so a reader can see what was treated as
     /// secret rather than inferring it.
@@ -42,9 +43,23 @@ pub struct CaseReport {
     pub max_depth: u32,
     pub solver_timeout_secs: u32,
     pub evidence: Evidence,
+    /// Flattened, so a case object is one flat record. `case` and `function`
+    /// live here and here only: carrying them on both sides produced duplicate
+    /// JSON keys, which most parsers silently resolve to the last occurrence
+    /// rather than reject.
     #[serde(flatten)]
     pub result: CaseResult,
     pub expectation: Expectation,
+}
+
+impl CaseReport {
+    pub fn case(&self) -> &str {
+        &self.result.case
+    }
+
+    pub fn function(&self) -> &str {
+        &self.result.function
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -83,9 +98,7 @@ pub fn build(
             let expected = Outcome::parse(&case.expected_outcome)
                 .expect("the case file was validated on load");
             CaseReport {
-                case: case.id,
                 description: case.description,
-                function: case.function,
                 rationale: case.rationale,
                 secret_globals: case.secret_globals,
                 public_globals: case.public_globals,
@@ -108,7 +121,9 @@ pub fn build(
         .map(|entry| {
             format!(
                 "{}: expected {} but observed {}",
-                entry.case, entry.expectation.expected, entry.expectation.observed
+                entry.case(),
+                entry.expectation.expected,
+                entry.expectation.observed
             )
         })
         .collect();
@@ -186,13 +201,49 @@ impl SymbolicReport {
                 "UNEXPECTED"
             };
             line!("");
-            line!("Case: {}", entry.case);
+            line!("Case: {}", entry.case());
             if !entry.description.is_empty() {
                 line!("  {}", entry.description);
             }
             line!("");
             line!("Function:");
-            line!("  {}", entry.function);
+            line!("  {}", entry.function());
+            // Whether the analysis actually got there, from the analyzer rather
+            // than from the case declaration.
+            match (&entry.result.target.reached, &entry.result.target.address) {
+                (true, Some(address)) => {
+                    line!("  reached at {address} from {}", entry.entry_symbol)
+                }
+                (true, None) => line!("  reached from {}", entry.entry_symbol),
+                (false, _) => line!(
+                    "  NOT REACHED from {} -- nothing here is attributed to it",
+                    entry.entry_symbol
+                ),
+            }
+            line!("");
+            line!("Observation model:");
+            line!(
+                "  checked:     {}",
+                if entry.result.checked_features.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    entry
+                        .result
+                        .checked_features
+                        .iter()
+                        .map(|feature| feature.property())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            );
+            line!(
+                "  NOT checked: {}",
+                if entry.result.unchecked_properties.is_empty() {
+                    "(nothing -- every modeled property was checked)".to_string()
+                } else {
+                    entry.result.unchecked_properties.join(", ")
+                }
+            );
             line!("");
             line!("Declared inputs:");
             line!("  secret: {}", entry.secret_globals.join(", "));
@@ -236,6 +287,15 @@ impl SymbolicReport {
                 line!("  concrete inputs: {}", entry.result.witness.as_str());
                 if let Some(detail) = &entry.result.witness_detail {
                     line!("    {detail}");
+                }
+                for counterexample in &entry.result.counterexamples {
+                    line!(
+                        "  {} = {} vs {}  (from {})",
+                        counterexample.global,
+                        counterexample.left,
+                        counterexample.right,
+                        counterexample.query
+                    );
                 }
             }
 
@@ -297,7 +357,7 @@ fn render(value: Option<u64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::symbolic::{CheckFeature, Divergence, Exploration, WitnessStatus};
+    use crate::symbolic::{CheckFeature, Divergence, Exploration, TargetEvidence, WitnessStatus};
 
     fn provenance() -> SymbolicProvenance {
         SymbolicProvenance {
@@ -352,11 +412,21 @@ mod tests {
         CaseResult {
             case: id.into(),
             function: "f".into(),
+            target: TargetEvidence {
+                function: "f".into(),
+                entry_symbol: "tc_harness_f".into(),
+                reached: true,
+                address: Some("0x2014c0".into()),
+                directive: "reach <f>".into(),
+            },
+            checked_features: vec![CheckFeature::ControlFlow, CheckFeature::MemoryAccess],
+            unchecked_properties: Vec::new(),
             artifact_sha256: "a".repeat(64),
             outcome,
             message: "m".into(),
             divergences,
             witness: WitnessStatus::UnavailableFromAnalyzer,
+            counterexamples: Vec::new(),
             witness_detail: Some("the analyzer does not expose the model".into()),
             exploration: complete_stats(),
             script: "starting from <tc_harness_f>\n".into(),
@@ -495,6 +565,109 @@ mod tests {
         assert!(text.contains("scoped to the declared input domain"));
         assert!(text.contains("not a measured timing signal"));
         assert!(text.contains("exploration complete: true"));
+    }
+
+    /// Every key of a JSON object in source order, duplicates kept.
+    struct ObjectKeys(Vec<String>);
+
+    impl<'de> serde::Deserialize<'de> for ObjectKeys {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct Visitor;
+            impl<'de> serde::de::Visitor<'de> for Visitor {
+                type Value = ObjectKeys;
+
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("a JSON object")
+                }
+
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<ObjectKeys, A::Error> {
+                    let mut keys = Vec::new();
+                    while let Some((key, _)) = map.next_entry::<String, serde_json::Value>()? {
+                        keys.push(key);
+                    }
+                    Ok(ObjectKeys(keys))
+                }
+            }
+            deserializer.deserialize_map(Visitor)
+        }
+    }
+
+    /// A serialized case object carries each key once.
+    ///
+    /// `#[serde(flatten)]` over a struct that repeats an outer field emits the
+    /// key twice. `serde_json` and Python's `json` both accept that and keep
+    /// the last occurrence, so neither the tests nor CI would have noticed --
+    /// the same class of defect corrected in the M2 reporting layer.
+    #[test]
+    fn a_serialized_case_has_no_duplicate_keys() {
+        let report = build(
+            vec![(
+                case("table-lookup", "LEAK_DETECTED"),
+                result("table-lookup", Outcome::LeakDetected, vec![divergence()]),
+            )],
+            provenance(),
+            1,
+        );
+        let text = serde_json::to_string(&report.cases[0]).expect("serializable");
+
+        // Collected through MapAccess, which yields every entry including the
+        // duplicates a serde_json::Value would collapse to the last one.
+        let keys: ObjectKeys = serde_json::from_str(&text).expect("an object");
+        let mut seen: Vec<&str> = Vec::new();
+        for key in &keys.0 {
+            assert!(
+                !seen.contains(&key.as_str()),
+                "duplicate key {key:?} in {text}"
+            );
+            seen.push(key);
+        }
+        // The two that previously collided, named explicitly.
+        assert!(seen.contains(&"case"), "{text}");
+        assert!(seen.contains(&"function"), "{text}");
+    }
+
+    /// The report states which observation classes a result covers and which it
+    /// does not.
+    #[test]
+    fn the_report_names_the_observation_model() {
+        let mut narrow = result("masked-scan", Outcome::VerifiedBounded, vec![]);
+        narrow.checked_features = vec![CheckFeature::ControlFlow];
+        narrow.unchecked_properties = vec!["memory-address noninterference"];
+        let report = build(
+            vec![(case("masked-scan", "VERIFIED_BOUNDED"), narrow)],
+            provenance(),
+            1,
+        );
+        let text = report.to_text();
+        assert!(text.contains("Observation model:"), "{text}");
+        assert!(
+            text.contains("checked:     control-flow noninterference"),
+            "{text}"
+        );
+        assert!(
+            text.contains("NOT checked: memory-address noninterference"),
+            "{text}"
+        );
+    }
+
+    /// A result that could not be attributed to its function says so where a
+    /// reader will see it.
+    #[test]
+    fn an_unreached_target_is_visible_in_the_report() {
+        let mut orphan = result("masked-scan", Outcome::Inconclusive, vec![]);
+        orphan.target.reached = false;
+        orphan.target.address = None;
+        let report = build(
+            vec![(case("masked-scan", "VERIFIED_BOUNDED"), orphan)],
+            provenance(),
+            1,
+        );
+        let text = report.to_text();
+        assert!(text.contains("NOT REACHED"), "{text}");
+        assert!(text.contains("nothing here is attributed to it"), "{text}");
     }
 
     /// The JSON report carries schema, provenance, bounds, declared inputs and
