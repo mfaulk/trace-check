@@ -216,49 +216,138 @@ instrumentation, no behavior change in production. It additionally emits a
 validated against the signature at compile time, so `secret = "expceted"` is a
 compile error rather than a silently uncovered contract.
 
-Coverage states are distinguished, and an annotation with no tests is never
-reported as verified:
+Coverage states are listed under
+[Contract identity and verified invocation](#coverage-requires-proof-of-invocation).
+An annotation with no tests, or with a test that never invoked it, is never
+reported as verified.
 
-| State | Reported as |
-| --- | --- |
-| contract with passing tests | `covered` |
-| contract with a detected violation | `violated` |
-| contract whose tests were inconclusive | `inconclusive` |
-| contract with no registered tests | `untested` — fails the run |
-| contract registered but not executed | `not-executed` — fails the run |
+## Discovery, isolation, and ignore semantics
 
-## Discovery and the three execution modes
+No manual manifest, and no `inventory`/`linkme` dependency — the standard test
+harness provides everything needed.
 
-No manual manifest, and no `inventory`/`linkme` dependency. The mechanism is the
-standard test harness plus one environment variable.
+`#[ct_test]` generates **two** items:
 
-`#[ct_test]` generates an ordinary `#[test]` function whose body dispatches on
-`TRACE_CHECK_MODE`:
+* the check itself, as a `#[test]` carrying `#[ignore]`. Plain `cargo test`
+  reports it as `ignored` with the reason attached, never as `ok`;
+* a separate metadata test named `__trace_check_meta_<name>`, also `#[ignore]`,
+  which only prints a `trace-check-meta:` record.
 
-| Mode | Behavior |
-| --- | --- |
-| unset | Print a skip notice and return. Plain `cargo test` passes with no Valgrind, and prints that the check did **not** run |
-| `list` | Print one `trace-check-meta:` JSON line describing this test, then return |
-| `run` | Execute calibration and the assertion body under instrumentation |
-
-`#[constant_time]` generates a `#[cfg(test)]` test that emits its contract
-record in `list` mode and returns otherwise, so contracts are discovered even
-when a function has no `ct_test` at all — which is exactly the `untested` case
-that must be detectable.
+`#[constant_time]` likewise generates a `__trace_check_contract_<name>` metadata
+test, so contracts are discovered even when a function has no `ct_test` at all —
+exactly the `untested` case that must be detectable.
 
 The runner then:
 
 1. builds test binaries and locates them from cargo's JSON output,
-2. runs each binary once with `TRACE_CHECK_MODE=list --nocapture` to collect
-   metadata,
-3. runs each selected test as `<exe> --exact <name> --nocapture` under Memcheck
-   with `TRACE_CHECK_MODE=run` — one process per test, for isolation and
+2. **enumerates** each binary with `--list --format=terse --include-ignored`,
+   which runs nothing,
+3. executes **only** the `__trace_check_*` metadata tests, in one bounded
+   subprocess per binary, to collect the records,
+4. runs each selected check as
+   `<exe> --include-ignored --exact <name> --nocapture` under Memcheck with
+   `TRACE_CHECK_MODE=run` — one process per check, for isolation and
    unambiguous attribution,
-4. parses the XML with M2's parser, classifies with M2's rules,
-5. enforces contracts and aggregates.
+5. parses the XML with M2's parser and classifies with M2's rules,
+6. enforces contracts and aggregates.
 
-Plain `cargo test` keeps working without Valgrind, and a skipped check says so
-rather than reporting success.
+### Why discovery enumerates before executing
+
+An earlier design ran every test with `TRACE_CHECK_MODE=list`, relying on
+generated tests to recognize the mode and return early. Ordinary `#[test]`
+functions do not recognize it, so **discovery executed the consumer's entire
+unit-test suite**: side effects fired, an unrelated failure blocked discovery,
+and a slow or hanging test delayed or stalled it. `--filter` did not help,
+because the damage was already done before filtering.
+
+Enumerating first and executing only our own generated tests removes the class.
+Both discovery subprocesses are also wall-clock bounded, so a pathological test
+binary cannot stall the run.
+
+### Why checks are `#[ignore]`d rather than self-skipping
+
+The earlier design had the check print a skip notice and return successfully, so
+plain `cargo test` showed:
+
+```text
+test tests::verify_tag_is_constant_time ... ok
+```
+
+with the notice hidden by libtest's output capture. A developer saw a green test
+for a security assertion that never ran. `#[ignore]` makes libtest report the
+truth:
+
+```text
+test tests::verify_tag_is_constant_time ... ignored, trace-check constant-time
+    check; run `cargo trace-check test`
+```
+
+### Execution evidence is a marker, not a substring
+
+A generated check prints `trace-check-executed: <identity>` as its last act, and
+the runner requires that exact line. Counting on libtest's `"1 passed"` summary
+would match arbitrary output from the test binary itself, and `--exact` on a
+renamed test runs zero tests while still exiting 0 — which must never read as a
+pass.
+
+## Contract identity and verified invocation
+
+### Identity is module-qualified
+
+A contract is keyed on `module_path!()::function`, not on the bare name. Two
+modules may each define `verify`:
+
+```rust
+mod authentication { #[constant_time(secret = "key")] fn verify(…) }
+mod encryption     { #[constant_time(secret = "key")] fn verify(…) }
+```
+
+Keyed on `verify`, one silently overwrote the other, and a test targeting
+`"verify"` could mark the survivor covered while the second contract vanished
+from the report entirely. Both now appear with distinct identities. A test's
+`target` may be a bare name or any path suffix; an **ambiguous** name is a hard
+error rather than a guess, and an unknown one is rejected before anything runs.
+
+### Coverage requires proof of invocation
+
+`target` is not a label. Without evidence, this would have passed:
+
+```rust
+#[constant_time(secret = "key")]
+fn vulnerable(key: u8) -> u8 { if key == 0 { 0 } else { 1 } }
+
+#[ct_test(target = "vulnerable")]
+fn purported_test() {
+    assert_constant_time!(secret = 42u8, call = |_key| 0u8);   // never calls it
+}
+```
+
+The test marks a secret, calibration confirms, no findings appear, and the
+contract would have been reported `covered` with the command exiting 0 — for a
+function that was never executed.
+
+So `#[constant_time]` additionally emits, **under `#[cfg(test)]` only**:
+
+* an invocation counter, and
+* an `#[inline(never)]` adapter `<function>_ct` with the same signature, which
+  increments the counter and delegates to the untouched function.
+
+Tests call the adapter. `#[ct_test(target = …)]` snapshots the counter, and
+fails with a message naming the adapter if it did not advance. The adapter is a
+separate frame delegating to the original, so **the code being analyzed is
+unchanged** — important, because this project's recurring lesson is that the
+compiled artifact is what matters.
+
+Coverage states are therefore:
+
+| State | Meaning |
+| --- | --- |
+| `covered` | a test ran clean **and** proved it invoked the function |
+| `claimed-not-invoked` | a test named the contract but did not invoke it — blocks the run |
+| `violated` | a test detected a violation |
+| `inconclusive` | tests ran but could not answer |
+| `untested` | no test names this contract — blocks the run |
+| `not-executed` | a test exists but did not run; excused only under `--filter` |
 
 ## Positive control
 
@@ -419,6 +508,42 @@ through the real CLI: `0` for `--filter constant_time`, `1` for the full run,
 * **`run_under_memcheck` was extracted from M2** rather than reimplemented, so
   both backends share the bounded execution, scratch-directory safety, XML size
   bound and completeness checks.
+
+### Corrections after review (PR #3)
+
+Five defects, three of them blockers. All shared one root cause: discovery and
+contract association were built on weak signals — running every test in a mode
+only some tests understand, and matching contracts by bare string name.
+
+**Discovery executed every ordinary unit test.** Verified against a crate whose
+ordinary test writes a sentinel file and then fails: the sentinel appeared and
+the failure blocked discovery. Now `--list` enumerates and only
+`__trace_check_*` tests execute, both subprocesses bounded by a timeout.
+`examples/discovery-hazard` is a non-workspace crate carrying that hazard, and
+the regression test asserts the sentinel stays absent and `list` still exits 0.
+
+**A contract could be reported covered without its function ever running.** The
+reviewer's counterexample reproduced exactly. Fixed with the `#[cfg(test)]`
+counter and `_ct` adapter described above; the claiming test now fails with a
+message naming the adapter, and the contract reports `inconclusive` rather than
+`covered`.
+
+**Same-named contracts overwrote each other.** Two modules each defining
+`verify` left one contract in the report. Identities are now module-qualified,
+duplicates are an explicit error rather than a silent overwrite, and an
+ambiguous `target` is rejected.
+
+**An unrun check looked like a passing test.** Replaced the self-skipping
+passing test with `#[ignore]`, so libtest reports `ignored` with a reason.
+
+**Execution was detected by substring.** Replaced `"1 passed"` with a marker the
+generated check prints itself, compared against the full test identity.
+
+Two bugs surfaced while fixing these, both found by running the real harness:
+`--exact` is a boolean flag rather than a repeatable argument, so repeating
+`--exact NAME` pairs silently selected only the first; and a `--list` line is
+`path::to::test: test`, so splitting on `:` truncated the module path and
+discovered nothing.
 
 ### Deferred annotation capability
 

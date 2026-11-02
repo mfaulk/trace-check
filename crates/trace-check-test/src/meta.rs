@@ -37,20 +37,29 @@ pub fn harness_path(module_path: &str, test: &str) -> String {
     }
 }
 
+/// Builds a module-qualified identity, e.g. `my_crate::auth::verify`.
+///
+/// Contract identity has to be qualified. Two modules can each define a
+/// `verify`, and keying anything on the bare name silently loses one of them —
+/// along with any claim that it was tested.
+pub fn qualified(module_path: &str, name: &str) -> String {
+    format!("{module_path}::{name}")
+}
+
 /// Emits a constant-time test record.
 ///
-/// `name` is the harness test path (`module::test_name`), which is also what
-/// `--exact` takes. `target` is the declared contract this test covers, if any.
-pub fn emit_test(name: &str, target: Option<&str>, secrets: &[&str]) {
+/// `harness_name` is what `--exact` takes; `id` is the qualified identity used
+/// in reports. `target` is the qualified contract this test covers, if any.
+pub fn emit_test(harness_name: &str, id: &str, target: Option<&str>) {
     let target = match target {
         Some(target) => format!("\"{}\"", escape(target)),
         None => "null".to_string(),
     };
     println!(
-        "{META_PREFIX} {{\"kind\":\"test\",\"name\":\"{}\",\"target\":{},\"secrets\":[{}]}}",
-        escape(name),
+        "{META_PREFIX} {{\"kind\":\"test\",\"name\":\"{}\",\"id\":\"{}\",\"target\":{}}}",
+        escape(harness_name),
+        escape(id),
         target,
-        join_strings(secrets),
     );
 }
 
@@ -58,10 +67,13 @@ pub fn emit_test(name: &str, target: Option<&str>, secrets: &[&str]) {
 ///
 /// Emitted by `#[constant_time]` independently of any test, so a contract with
 /// no coverage is still discovered and can be reported as `untested`.
-pub fn emit_contract(function: &str, secrets: &[&str], file: &str, line: u32) {
+///
+/// `id` is module-qualified; `function` is the bare name, for display.
+pub fn emit_contract(id: &str, function: &str, secrets: &[&str], file: &str, line: u32) {
     println!(
-        "{META_PREFIX} {{\"kind\":\"contract\",\"function\":\"{}\",\"secrets\":[{}],\
-         \"file\":\"{}\",\"line\":{line}}}",
+        "{META_PREFIX} {{\"kind\":\"contract\",\"id\":\"{}\",\"function\":\"{}\",\
+         \"secrets\":[{}],\"file\":\"{}\",\"line\":{line}}}",
+        escape(id),
         escape(function),
         join_strings(secrets),
         escape(file),
@@ -142,5 +154,15 @@ mod tests {
     #[test]
     fn harness_path_at_the_crate_root_is_the_bare_name() {
         assert_eq!(harness_path("my_integration_test", "t"), "t");
+    }
+
+    /// Identities are module-qualified, so two modules each defining `verify`
+    /// produce distinct contracts instead of silently overwriting each other.
+    #[test]
+    fn qualified_identities_distinguish_same_named_functions() {
+        let first = qualified("my_crate::authentication", "verify");
+        let second = qualified("my_crate::encryption", "verify");
+        assert_ne!(first, second);
+        assert_eq!(first, "my_crate::authentication::verify");
     }
 }

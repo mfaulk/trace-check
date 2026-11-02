@@ -145,6 +145,10 @@ fn test(
         .map_err(|e| e.to_string())?;
     let discovery = discover::discover(&binaries, &used_profile).map_err(|e| e.to_string())?;
 
+    // An unknown or ambiguous target is an error before anything runs: a test
+    // that names a contract which does not exist claims coverage of nothing.
+    report::resolve_targets(&discovery.tests, &discovery.contracts)?;
+
     let selected: Vec<_> = discovery
         .tests
         .iter()

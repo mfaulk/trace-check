@@ -31,9 +31,13 @@ use trace_check_test::{assert_constant_time, ct_test};
 fn verify_tag_is_constant_time() {
     let supplied = [0u8; 32];
 
+    // `verify_tag_ct` is the adapter `#[constant_time]` generates. It counts
+    // the call and delegates to the untouched `verify_tag`, which is how the
+    // runner proves this test actually exercised the contract rather than
+    // merely naming it. Calling `verify_tag` directly fails the test.
     let accepted = assert_constant_time!(
         secret = secret_tag(),
-        call = |expected| verify_tag(expected, &supplied),
+        call = |expected| verify_tag_ct(expected, &supplied),
     );
 
     // The macro evaluates to the call's return value, so ordinary functional
@@ -69,9 +73,15 @@ cargo trace-check test --format json            # machine-readable
 cargo trace-check list                          # what would run
 ```
 
-Plain `cargo test` keeps working without Valgrind. It passes, and prints that
-the constant-time checks were **skipped** — a skipped check must never read as a
-successful one.
+Plain `cargo test` keeps working without Valgrind. The checks are `#[ignore]`d,
+so libtest reports them as:
+
+```text
+test tests::verify_tag_is_constant_time ... ignored, trace-check constant-time
+    check; run `cargo trace-check test`
+```
+
+An unrun security check must never look like a passing one.
 
 ## What this crate demonstrates
 
@@ -92,7 +102,8 @@ by design. That is the demonstration, not a defect. For a run that exits 0, use
 `cargo trace-check test --features untested-contract` adds a `#[constant_time]`
 function with no test covering it, and shows the runner reporting it as
 `untested` and exiting 2. An annotation never counts as verified without
-coverage.
+coverage — and a test that names a contract without invoking it is reported
+`claimed-not-invoked` rather than covered.
 
 ## What a passing check means
 

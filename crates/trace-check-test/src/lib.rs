@@ -51,39 +51,45 @@ pub use mark::{MarkSecret, SecretGuard};
 /// Environment variable selecting the execution mode of a generated test.
 pub const MODE_ENV: &str = "TRACE_CHECK_MODE";
 
-/// How a generated `#[ct_test]` should behave in this process.
+/// Whether this process was started by the instrumented runner.
+///
+/// Generated checks are `#[ignore]`d, so plain `cargo test` never reaches them
+/// and there is no "skip" path to get wrong. This only distinguishes a genuine
+/// runner invocation from someone running the test directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// Plain `cargo test`: print a notice and do not claim a security result.
-    Skip,
-    /// Emit metadata for discovery, then return.
-    List,
-    /// Execute calibration and the assertion under instrumentation.
+    /// Not started by the runner. A check must refuse to claim a result.
+    Unmanaged,
+    /// Started by `cargo trace-check test` to execute a check.
     Run,
 }
 
 impl Mode {
-    /// Reads [`MODE_ENV`]. Anything unrecognized is [`Mode::Skip`], because the
-    /// safe default is to not claim a result.
+    /// Reads [`MODE_ENV`]. Anything unrecognized is [`Mode::Unmanaged`],
+    /// because the safe default is to not claim a result.
     pub fn from_env() -> Mode {
         match std::env::var(MODE_ENV).unwrap_or_default().as_str() {
-            "list" => Mode::List,
             "run" => Mode::Run,
-            _ => Mode::Skip,
+            _ => Mode::Unmanaged,
         }
     }
 }
 
-/// Prints the notice shown when a constant-time test is run outside the
-/// instrumented runner.
+/// Refuses to run a check outside the instrumented runner.
 ///
-/// Deliberately explicit: a developer running `cargo test` must not conclude
-/// that the constant-time property was checked.
-pub fn print_skip_notice(test: &str) {
-    println!(
-        "trace-check: SKIPPED constant-time check for `{test}` \
-         (no instrumentation; run `cargo trace-check test`)"
+/// Generated tests are `#[ignore]`d, so reaching this function at all means
+/// something explicitly selected the test. If that was not `cargo trace-check
+/// test`, the check cannot produce a meaningful result and saying so loudly
+/// beats returning quietly.
+pub fn require_run_mode(test: &str) {
+    assert_eq!(
+        Mode::from_env(),
+        Mode::Run,
+        "trace-check: `{test}` is a constant-time check and was run directly. It needs the \
+         instrumented runner: `cargo trace-check test`. Running it with `cargo test \
+         --include-ignored` cannot produce a security result."
     );
+    require_instrumentation(test);
 }
 
 /// Refuses to continue when a `run`-mode test is not actually instrumented.
@@ -251,27 +257,19 @@ macro_rules! assert_constant_time {
 mod tests {
     use super::*;
 
-    /// An unset or unrecognized mode is Skip, so the default never claims a
-    /// security result.
+    /// An unset or unrecognized mode is Unmanaged, so the default never
+    /// claims a security result.
     #[test]
-    fn unknown_mode_is_skip() {
+    fn unknown_mode_is_unmanaged() {
         // The variable is not set in the ordinary test environment.
-        assert_eq!(Mode::from_env(), Mode::Skip);
+        assert_eq!(Mode::from_env(), Mode::Unmanaged);
     }
 
-    /// The skip notice names the test and points at the real command, so a
-    /// developer cannot mistake it for a passing check.
+    /// A check run outside the runner refuses, naming the right command.
     #[test]
-    fn skip_notice_is_explicit() {
-        // Captured by the harness; assert on the formatting contract instead.
-        let rendered = format!(
-            "trace-check: SKIPPED constant-time check for `{}` \
-             (no instrumentation; run `cargo trace-check test`)",
-            "my_test"
-        );
-        assert!(rendered.contains("SKIPPED"));
-        assert!(rendered.contains("cargo trace-check test"));
-        print_skip_notice("my_test");
+    #[should_panic(expected = "cargo trace-check test")]
+    fn running_a_check_directly_refuses() {
+        require_run_mode("my_test");
     }
 
     /// Outside Valgrind, a run-mode test refuses rather than passing.
