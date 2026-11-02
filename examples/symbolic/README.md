@@ -42,11 +42,44 @@ Declaring a leak there would be manufacturing one.
 
 ## What a `VERIFIED_BOUNDED` result means
 
-Exploration completed and every relational obligation was discharged — within
-the declared input domain, the exploration bound, and the modeled observations
-(control flow and memory addresses). It is not a claim about other domains,
-other artifacts, or unmodeled effects such as cache behavior, operand latency,
-or speculation. See `docs/limitations.md`.
+Exploration completed, every relational obligation the case asked for was
+discharged, and the analyzer reported reaching the function the case names —
+within the declared input domain, the exploration bound, and the declared
+observation classes. It is not a claim about other domains, other artifacts,
+unchecked observation classes, or unmodeled effects such as cache behavior,
+operand latency, or speculation. See `docs/limitations.md`.
+
+Three fields decide how far a result reaches, and every case carries them:
+
+| Field | Why it matters |
+| --- | --- |
+| `target.reached` | Without it nothing is attributed to the function; the entry symbol, not the declared function, decides what gets explored |
+| `checked_features` | A case checking `control-flow` alone says nothing about addresses — and `secret_lookup` reports `secure` under exactly that model |
+| `unchecked_properties` | What the result leaves open, named rather than left to inference |
+
+## Counterexamples
+
+A leak the analyzer settles with a relational satisfiability query comes with
+the solver's own model: two concrete secret values whose executions diverge,
+read back from the cached query rather than constructed here.
+
+```text
+Witness:
+  concrete inputs: solver_counterexample
+  TC_SECRET = #xfe vs #xff  (from query_10.smt2)
+```
+
+`0xfe & 7` is 6 and `0xff & 7` is 7, so `secret_trip_count` runs a different
+number of iterations — the divergence the analyzer found.
+
+Not every leak has one. `table-lookup` and `conditional-lookup` are settled by
+taint analysis without any satisfiability query, so there is no assignment to
+extract and the report says so. A pair is also refused when the two values are
+equal, which would witness nothing.
+
+Because a counterexample contains the declared secrets' values, case inputs
+must be synthetic. The globals here are meaningless outside the harness; never
+point a case at a real key.
 
 ## Not a Cargo package
 
@@ -77,13 +110,17 @@ podman pull docker.io/binsec/binsec@sha256:19a0ff4b0278906bd6f00a5752cab19e8cad7
 2. Add an entry to `cases.json` naming the function, its entry and halt
    symbols, the secret and public globals, a depth bound, and the outcome you
    expect with a `rationale` for it.
-3. Run `cargo trace-check verify --case <id>`.
+3. Declare the observation classes in `features`. There is no default: a case
+   must say whether it checks control flow, memory addresses, or both.
+4. Run `cargo trace-check verify --case <id>`.
 
-A case is rejected before analysis if it declares no secret, names a global as
-both secret and public, uses a symbol name that is not a plain identifier, sets
-`max_depth` to zero, or expects `NO_LEAK_OBSERVED` — which only the dynamic
-backend produces. An entry, halt, or target symbol missing from the built
-artifact is an explicit error, never an analysis attempt.
+A case is rejected before analysis if it declares no secret, declares no
+features or repeats one, names a global as both secret and public, uses a
+symbol name that is not a plain identifier, sets `max_depth` to zero, or
+expects `NO_LEAK_OBSERVED` — which only the dynamic backend produces. An entry,
+halt, or target symbol missing from the built artifact is an explicit error,
+never an analysis attempt. A `function` the analyzer never reaches from
+`entry_symbol` yields `INCONCLUSIVE`, so the two cannot drift apart unnoticed.
 
 **Declare what the artifact does, not what the source suggests.** `erased-branch`
 exists because those differ, and the expectation that matches the compiled code

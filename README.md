@@ -273,9 +273,12 @@ Observed event counts for `early_exit_opaque`, by mismatch position:
   podman pull docker.io/binsec/binsec@sha256:19a0ff4b0278906bd6f00a5752cab19e8cad7153715cecf32d4f885826f62967
   ```
 
-  Docker works too. `verify` refuses to run if the runtime or the image is
-  missing, rather than skipping and reporting success. Nothing else needs it:
-  a developer without a container runtime can still run every other command.
+  Docker works too; with both installed, the runtime that *holds* the image is
+  the one used, and `--container-runtime` or
+  `TRACE_CHECK_CONTAINER_RUNTIME` overrides the choice. `verify` refuses to run
+  if no runtime has the image, rather than skipping and reporting success.
+  Nothing else needs it: a developer without a container runtime can still run
+  every other command.
 
 ## Commands
 
@@ -327,6 +330,7 @@ cargo trace-check verify                        # every bundled case
 cargo trace-check verify --case table-lookup    # one case
 cargo trace-check verify --format json
 cargo trace-check verify --cases path/to/cases.json
+cargo trace-check verify --container-runtime docker
 ```
 
 Builds `examples/symbolic/src/targets.rs` as an optimized freestanding
@@ -336,34 +340,59 @@ analysis starts and halts, any `assume` constraints on the input domain, and
 the outcome it expects.
 
 ```text
-Case: conditional-lookup
-  a leak reachable only under one public mode
+Case: trip-count
+  secret-dependent loop trip count: a branch that survives optimization
+
+Function:
+  secret_trip_count
+  reached at 0x2016c0 from tc_harness_trip_count
+
+Observation model:
+  checked:     control-flow noninterference, memory-address noninterference
+  NOT checked: (nothing -- every modeled property was checked)
 
 Result:
   LEAK_DETECTED
-  1 divergence site(s): 0 secret-dependent branch(es), 1 secret-dependent memory access(es)
+  7 divergence site(s): 7 secret-dependent branch(es), 0 secret-dependent memory access(es)
 
 Divergence:
-  Secret-dependent memory access at 0x2016b3
-    secret_lookup (targets.rs:47)
-    inlined through: core::ptr::read_volatile::<u8> (mod.rs:2107) <- secret_lookup (targets.rs:47)
+  Secret-dependent control flow at 0x2016c4
+    secret_trip_count (targets.rs:78)
+  ... 6 more, one per surviving iteration
 
 Witness:
-  concrete inputs: unavailable_from_analyzer
+  concrete inputs: solver_counterexample
+    the values below are the solver's own model, read back from the analyzer's cached query
+  TC_SECRET = #xfe vs #xff  (from query_10.smt2)
 
 Analysis:
-  paths 2 of 2 explored, 0 pending
-  checks: 3 / 3 control flow, 33 / 34 memory access
-  unknown solver answers 0, depth bound 2000, max depth reached 105
+  paths 8 of 8 explored, 0 pending
+  checks: 8 / 15 control flow, 35 / 35 memory access
+  unknown solver answers 0, depth bound 2000, max depth reached 30
   exploration complete: true
 ```
 
-Classification is **fail-closed**. A clean verdict becomes
-`VERIFIED_BOUNDED` only if exploration also demonstrably completed, no solver
-query returned `unknown`, and a non-zero number of relational obligations were
-actually discharged; otherwise it is `INCONCLUSIVE`. The analyzer reports the
-leaking instruction but not its satisfying model, so no concrete witness values
-are available — the report says so rather than inventing a pair.
+Classification is **fail-closed**. A clean verdict becomes `VERIFIED_BOUNDED`
+only if the run also shows complete exploration, zero `unknown` solver answers,
+every requested class of obligation fully discharged, and analyzer-produced
+evidence that the declared function was reached. Anything else is
+`INCONCLUSIVE`.
+
+Three things that follow from that, worth knowing before reading a result:
+
+* **A result is attributed to a function only on evidence.** Each script
+  carries a `reach <function>` directive; without the analyzer's matching
+  "reached address" line, a case naming a function the harness never calls is
+  `INCONCLUSIVE` rather than inheriting the harness's verdict.
+* **A result is only as strong as its declared observation model.**
+  `secret_lookup`'s instruction path is genuinely secret-independent, so under
+  control-flow checks alone it reports `secure` — a legitimate but narrow
+  result. Every report prints what was checked and what was not.
+* **Counterexamples come from the solver, where one exists.** `-smt-dir` makes
+  the analyzer cache each query with its model; a query over both a secret and
+  its `mirror_` copy is the relational one, and that pair is the witness. Leaks
+  the analyzer settles by taint analysis without a satisfiability query have no
+  model, and the report says so instead of inventing a pair.
 
 This is the one backend whose result is a statement about *all* secrets in a
 domain. It is also the narrowest in scope: see

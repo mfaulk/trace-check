@@ -32,9 +32,10 @@ Specifically, it does **not** rule out:
 The symbolic backend (`verify`) is the only one whose clean result quantifies
 over inputs rather than sampling them. When it reports `VERIFIED_BOUNDED` it
 has established: for the **declared** secret and public globals, within the
-**declared** `assume` constraints and the exploration depth bound, no secret
-assignment changes the executed instruction path or any effective memory
-address, in **this one** compiled artifact.
+**declared** `assume` constraints and the exploration depth bound, and under
+the **declared** observation classes, no secret assignment changes what those
+classes observe, in **this one** compiled artifact, in a function the analyzer
+reported reaching.
 
 Everything outside those words is unestablished. In particular it does **not**
 rule out:
@@ -55,9 +56,28 @@ A differing execution path is also not a measured timing signal. The solver
 proves that two executions diverge; nothing in this project measures what that
 divergence costs on real hardware. That is Milestone 5.
 
-Finally, the analyzer localizes a leak without exposing the satisfying model,
-so there is no concrete pair of secrets to replay. The report records
-`unavailable_from_analyzer` rather than manufacturing a witness.
+Two further scoping rules decide what a result may be read as saying.
+
+**A result covers only the observation classes its case declared.** Each case
+lists them explicitly and every report prints both `checked_features` and
+`unchecked_properties`. This matters because the two are easy to confuse:
+`secret_lookup`'s instruction path really is secret-independent, so under
+control-flow checks alone the analyzer reports `secure`. That verdict is
+correct and says nothing whatever about the secret-dependent address the same
+function contains.
+
+**A result is attributed to a function only on the analyzer's own evidence that
+exploration reached it.** The entry symbol decides what gets explored, so a
+case naming a function its harness never calls would otherwise inherit the
+harness's verdict. Each generated script carries a `reach <function>`
+directive, and without the matching report the outcome is `INCONCLUSIVE`.
+
+Where a counterexample exists it is the solver's own model, read back from the
+analyzer's cached query — never constructed here. Where the analyzer settled a
+leak without issuing a satisfiability query there is no model, and the report
+records `unavailable_from_analyzer` with that reason rather than manufacturing
+a witness. A counterexample necessarily contains the declared secret globals'
+values, which is why case inputs must be synthetic.
 
 ## `DIFFERENCE_DETECTED` does not quantify a vulnerability
 
