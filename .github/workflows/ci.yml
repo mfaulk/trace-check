@@ -171,12 +171,26 @@ jobs:
 
       # Pinned by digest, so the analyzer and its bundled solver are one
       # reproducible artifact. A tag could change underneath a recorded result.
-      - name: Pull the pinned analyzer image
+      #
+      # Deliberately pulled into Docker only, while Podman stays installed and
+      # probes first. That is the exact configuration that made this job fail:
+      # the runner must select the runtime that *holds* the image, not the one
+      # that appears first. The assertion below keeps the regression covered,
+      # and verify-m4-symbolic.py checks the report agrees.
+      - name: Pull the pinned analyzer image (Docker only)
         run: |
           set -euo pipefail
           docker pull "${ANALYZER_IMAGE}"
           docker image inspect "${ANALYZER_IMAGE}" > /dev/null
           echo "analyzer build: $(docker run --rm "${ANALYZER_IMAGE}" binsec -version)"
+          if ! command -v podman > /dev/null; then
+            echo "podman is absent, so runtime selection is not being exercised here"
+            exit 1
+          fi
+          if podman image inspect "${ANALYZER_IMAGE}" > /dev/null 2>&1; then
+            echo "podman also has the image; the selection regression is not covered"
+            exit 1
+          fi
 
       # The solver is linked into the analyzer rather than invoked as a
       # subprocess, so pinning the image digest pins the solver too. Asserted
@@ -199,17 +213,28 @@ jobs:
       - name: Symbolic backend tests
         env:
           TRACE_CHECK_REQUIRE_SYMBOLIC: "1"
+          EXPECTED_CONTAINER_RUNTIME: docker
         run: |
           cargo test --locked -p trace-check --test symbolic
           cargo test --locked -p cargo-trace-check --test verify
 
+      # No --container-runtime here on purpose: automatic selection is what
+      # must work.
       - name: Verify every bundled case
+        env:
+          EXPECTED_CONTAINER_RUNTIME: docker
         run: |
           set -euo pipefail
           cargo run --locked --release -p cargo-trace-check -- verify
           cargo run --locked --release -p cargo-trace-check -- verify --format json \
             > m4-symbolic.json
           python3 ci/verify-m4-symbolic.py m4-symbolic.json
+
+      # The explicit override is part of the interface, so it is exercised too.
+      - name: Honor an explicit container runtime
+        run: |
+          cargo run --locked --release -p cargo-trace-check -- verify \
+            --case masked-scan --container-runtime docker
 
       - uses: actions/upload-artifact@v4
         with:
