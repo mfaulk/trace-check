@@ -10,6 +10,9 @@ env:
   # Instruction offsets and the trace grammar are specific to this release.
   WABT_VERSION: "1.0.42"
   WABT_SHA256: "84895407a6bbb80e918f33b16b2fb2206021c150b6bc9ff6f761263a745ab131"
+  # Must match trace_check::symbolic::ANALYZER_IMAGE; a test asserts the digest
+  # form, and ci/verify-m4-symbolic.py asserts the report agrees with this.
+  ANALYZER_IMAGE: "docker.io/binsec/binsec@sha256:19a0ff4b0278906bd6f00a5752cab19e8cad7153715cecf32d4f885826f62967"
 
 jobs:
   check:
@@ -50,8 +53,12 @@ jobs:
         run: |
           test "$(wasm-interp --version)" = "${WABT_VERSION}"
 
+      # examples/symbolic is not a Cargo package -- it is compiled directly by
+      # rustc -- so cargo fmt does not reach it.
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: |
+          cargo fmt --all -- --check
+          rustfmt --edition 2021 --check examples/symbolic/src/targets.rs
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -145,3 +152,66 @@ jobs:
             mac-compare-report.json
             mac-compare-screen.json
             native-memcheck.json
+
+  # M4: bounded relational verification. A separate job because its backend is
+  # a container image rather than a package, and because it must not be able to
+  # mask an M1-M3 regression or be masked by one.
+  verify:
+    name: Bounded relational verification (BINSEC)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Pinned by digest, so the analyzer and its bundled solver are one
+      # reproducible artifact. A tag could change underneath a recorded result.
+      - name: Pull the pinned analyzer image
+        run: |
+          set -euo pipefail
+          docker pull "${ANALYZER_IMAGE}"
+          docker image inspect "${ANALYZER_IMAGE}" > /dev/null
+          echo "analyzer build: $(docker run --rm "${ANALYZER_IMAGE}" binsec -version)"
+
+      # The solver is linked into the analyzer rather than invoked as a
+      # subprocess, so pinning the image digest pins the solver too. Asserted
+      # here: no external solver binary is what makes that claim true.
+      - name: Record the solver
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint /bin/sh "${ANALYZER_IMAGE}" -c '
+            strings -a /usr/bin/binsec | grep -oE "bitwuzla-c\.[0-9.]+" | sort -u
+            strings -a /usr/bin/binsec | grep -oiE "cadical-[0-9.]+" | sort -u
+            for solver in z3 bitwuzla cvc4 cvc5 yices boolector; do
+              if command -v "$solver" > /dev/null; then
+                echo "unexpected external solver on PATH: $solver"
+                exit 1
+              fi
+            done'
+
+      # TRACE_CHECK_REQUIRE_SYMBOLIC makes a missing analyzer a failure, so a
+      # skipped verification can never be reported as a pass.
+      - name: Symbolic backend tests
+        env:
+          TRACE_CHECK_REQUIRE_SYMBOLIC: "1"
+        run: |
+          cargo test --locked -p trace-check --test symbolic
+          cargo test --locked -p cargo-trace-check --test verify
+
+      - name: Verify every bundled case
+        run: |
+          set -euo pipefail
+          cargo run --locked --release -p cargo-trace-check -- verify
+          cargo run --locked --release -p cargo-trace-check -- verify --format json \
+            > m4-symbolic.json
+          python3 ci/verify-m4-symbolic.py m4-symbolic.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: m4-symbolic-report
+          path: m4-symbolic.json
