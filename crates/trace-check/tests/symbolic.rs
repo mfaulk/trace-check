@@ -64,7 +64,7 @@ fn suite() -> Option<&'static SymbolicReport> {
             let file = cases();
             let out = std::env::temp_dir().join("trace-check-symbolic-it");
             Some(
-                trace_check::run_symbolic(&file, &case_dir(), &file.cases, &out)
+                trace_check::run_symbolic(&file, &case_dir(), &file.cases, &out, None)
                     .expect("the bundled suite verifies"),
             )
         })
@@ -78,7 +78,7 @@ fn report_case<'a>(
     report
         .cases
         .iter()
-        .find(|entry| entry.case == id)
+        .find(|entry| entry.case() == id)
         .unwrap_or_else(|| panic!("no case {id} in the report"))
 }
 
@@ -245,22 +245,78 @@ fn a_run_that_hits_the_depth_bound_is_inconclusive_not_verified() {
     );
 }
 
-/// No concrete witness is fabricated: the analyzer localizes the leak but does
-/// not expose the satisfying model, and the report says so.
+/// A control-flow leak reports the solver's own counterexample pair.
+///
+/// `-smt-dir` makes the analyzer cache each query with the model it got back,
+/// and a query constraining both a secret and its `mirror_` copy is exactly
+/// the relational one. The values are the solver's; nothing here constructs
+/// them.
 #[test]
-fn a_witness_is_reported_as_unavailable_rather_than_fabricated() {
+fn a_control_flow_leak_reports_a_solver_counterexample() {
+    let Some(report) = suite() else { return };
+    let entry = report_case(report, "trip-count");
+    assert_eq!(entry.result.outcome, Outcome::LeakDetected);
+    assert_eq!(
+        entry.result.witness,
+        trace_check::symbolic::WitnessStatus::SolverCounterexample
+    );
+
+    let counterexample = entry
+        .result
+        .counterexamples
+        .first()
+        .unwrap_or_else(|| panic!("no counterexample for {}", entry.case()));
+    assert_eq!(counterexample.global, "TC_SECRET");
+    assert_ne!(
+        counterexample.left, counterexample.right,
+        "an identical pair witnesses nothing"
+    );
+    assert!(counterexample.query.ends_with(".smt2"));
+
+    // The pair really does diverge: the target loops `secret & 7` times, so
+    // the two low 3-bit values must differ.
+    let parse = |value: &str| -> u8 {
+        u8::from_str_radix(value.trim_start_matches("#x"), 16).expect("a hex byte")
+    };
+    assert_ne!(
+        parse(&counterexample.left) & 7,
+        parse(&counterexample.right) & 7,
+        "{counterexample:?} would take the same number of iterations"
+    );
+}
+
+/// A leak the analyzer settled without a solver query reports no witness, and
+/// says why instead of inventing one.
+#[test]
+fn a_leak_without_a_solver_query_reports_no_witness() {
     let Some(report) = suite() else { return };
     let entry = report_case(report, "table-lookup");
+    assert_eq!(entry.result.outcome, Outcome::LeakDetected);
     assert_eq!(
         entry.result.witness,
         trace_check::symbolic::WitnessStatus::UnavailableFromAnalyzer
     );
+    assert!(entry.result.counterexamples.is_empty());
     let detail = entry
         .result
         .witness_detail
         .as_deref()
         .expect("the gap is explained");
-    assert!(detail.contains("does not expose the satisfying model"));
+    assert!(
+        detail.contains("without issuing a relational satisfiability query"),
+        "{detail}"
+    );
+}
+
+/// A verified case has no counterexample, which is the point.
+#[test]
+fn a_verified_case_reports_no_counterexample() {
+    let Some(report) = suite() else { return };
+    for entry in &report.cases {
+        if entry.result.outcome == Outcome::VerifiedBounded {
+            assert!(entry.result.counterexamples.is_empty(), "{}", entry.case());
+        }
+    }
 }
 
 /// Provenance pins the analyzer and its bundled solver by image digest, not by
@@ -356,7 +412,7 @@ fn a_case_naming_a_missing_symbol_is_an_error() {
 
     let staged = tempfile::tempdir().expect("temp dir");
     let out = staged.path().join("build");
-    let error = trace_check::run_symbolic(&file, &case_dir(), &file.cases, &out)
+    let error = trace_check::run_symbolic(&file, &case_dir(), &file.cases, &out, None)
         .expect_err("a missing entry symbol cannot be analyzed");
     match &error {
         SymbolicError::MissingSymbols { missing, .. } => {
@@ -396,7 +452,7 @@ fn the_verdict_follows_the_artifact_not_the_declared_expectation() {
     assert_eq!(file.cases[0].expected_outcome, "VERIFIED_BOUNDED");
 
     let out = staged.path().join("build");
-    let report = trace_check::run_symbolic(&file, staged.path(), &file.cases, &out)
+    let report = trace_check::run_symbolic(&file, staged.path(), &file.cases, &out, None)
         .expect("the mutated artifact analyzes");
     let entry = report_case(&report, "masked-scan");
     assert_eq!(
@@ -468,4 +524,163 @@ fn concurrent_builds_into_one_directory_do_not_collide() {
         hashes.windows(2).all(|pair| pair[0] == pair[1]),
         "{hashes:?}"
     );
+}
+
+/// A vulnerable function paired with a safe harness must never be reported
+/// VERIFIED_BOUNDED.
+///
+/// The reviewed hole: `function` and `entry_symbol` were independent and only
+/// checked for existence, so this case analyzed the constant-time
+/// `masked_scan` harness while the report named `secret_lookup` -- a function
+/// with a known secret-dependent load that was never executed. The analyzer
+/// is now asked whether it reached the declared function, and without that
+/// evidence the outcome is INCONCLUSIVE.
+#[test]
+fn a_safe_harness_cannot_verify_a_vulnerable_declared_function() {
+    if !analyzer_available() {
+        return;
+    }
+    let mut file = cases();
+    file.cases.retain(|case| case.id == "masked-scan");
+    file.cases[0].function = "secret_lookup".into();
+    assert_eq!(file.cases[0].entry_symbol, "tc_harness_masked_scan");
+    assert_eq!(file.cases[0].expected_outcome, "VERIFIED_BOUNDED");
+
+    let staged = tempfile::tempdir().expect("temp dir");
+    let report = trace_check::run_symbolic(
+        &file,
+        &case_dir(),
+        &file.cases,
+        &staged.path().join("build"),
+        None,
+    )
+    .expect("the mismatched case still analyzes");
+
+    let entry = report_case(&report, "masked-scan");
+    assert_eq!(
+        entry.result.outcome,
+        Outcome::Inconclusive,
+        "a function the analyzer never reached cannot be verified"
+    );
+    assert_ne!(entry.result.outcome, Outcome::VerifiedBounded);
+    assert!(!entry.result.target.reached);
+    assert_eq!(entry.result.target.address, None);
+    assert!(
+        entry
+            .result
+            .message
+            .contains("never reached `secret_lookup`"),
+        "{}",
+        entry.result.message
+    );
+    // The declared expectation is not met, so the run fails rather than
+    // quietly producing a weaker result.
+    assert!(!entry.expectation.met);
+    assert_eq!(report.exit_code(), 2);
+}
+
+/// Every verified case carries analyzer-produced evidence that its function was
+/// reached.
+#[test]
+fn a_verified_case_proves_its_function_was_reached() {
+    let Some(report) = suite() else { return };
+    for entry in &report.cases {
+        if entry.result.outcome != Outcome::VerifiedBounded {
+            continue;
+        }
+        assert!(
+            entry.result.target.reached,
+            "{} was verified without reaching {}",
+            entry.case(),
+            entry.function()
+        );
+        let address = entry
+            .result
+            .target
+            .address
+            .as_deref()
+            .unwrap_or_else(|| panic!("{} has no reached address", entry.case()));
+        assert!(address.starts_with("0x"), "{address}");
+        assert!(entry.result.target.directive.contains(entry.function()));
+    }
+}
+
+/// A control-flow-only analysis of the known secret-indexed lookup reports a
+/// narrow result that cannot be mistaken for a full one.
+///
+/// Its instruction path really is secret-independent, so BINSEC reports
+/// `secure` and the verdict is legitimate. What must not happen is a report
+/// that reads like address noninterference was established.
+#[test]
+fn a_control_flow_only_result_cannot_be_mistaken_for_a_full_one() {
+    if !analyzer_available() {
+        return;
+    }
+    let mut file = cases();
+    file.cases.retain(|case| case.id == "table-lookup");
+    file.cases[0].features = vec![CheckFeature::ControlFlow];
+    file.cases[0].expected_outcome = "VERIFIED_BOUNDED".into();
+
+    let staged = tempfile::tempdir().expect("temp dir");
+    let report = trace_check::run_symbolic(
+        &file,
+        &case_dir(),
+        &file.cases,
+        &staged.path().join("build"),
+        None,
+    )
+    .expect("a narrow case analyzes");
+
+    let entry = report_case(&report, "table-lookup");
+    assert_eq!(entry.result.outcome, Outcome::VerifiedBounded);
+    assert_eq!(
+        entry.result.checked_features,
+        vec![CheckFeature::ControlFlow]
+    );
+    assert_eq!(
+        entry.result.unchecked_properties,
+        vec!["memory-address noninterference"]
+    );
+    assert!(
+        entry
+            .result
+            .message
+            .contains("memory-address noninterference was NOT checked"),
+        "{}",
+        entry.result.message
+    );
+
+    let text = report.to_text();
+    assert!(
+        text.contains("NOT checked: memory-address noninterference"),
+        "{text}"
+    );
+
+    // And the full model still finds the leak in the same function, which is
+    // what makes the narrow result narrow rather than wrong.
+    let full = report_case(suite().expect("the suite ran"), "table-lookup");
+    assert_eq!(full.result.outcome, Outcome::LeakDetected);
+}
+
+/// Every bundled case states the observation model it was analyzed under.
+#[test]
+fn every_case_declares_its_observation_model() {
+    let Some(report) = suite() else { return };
+    for entry in &report.cases {
+        assert!(
+            !entry.result.checked_features.is_empty(),
+            "{} declares no checks",
+            entry.case()
+        );
+        // The bundled suite checks both classes, so nothing is left out.
+        assert!(
+            entry.result.unchecked_properties.is_empty(),
+            "{} leaves {:?} unchecked",
+            entry.case(),
+            entry.result.unchecked_properties
+        );
+    }
+    let text = report.limitations.join(" ");
+    assert!(text.contains("only the observation classes the case declared"));
+    assert!(text.contains("target.reached"));
 }

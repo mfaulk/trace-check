@@ -48,6 +48,18 @@ fn analyzer_available() -> bool {
     present
 }
 
+/// The first probed runtime whose store holds the analyzer image.
+fn runtime_with_image() -> Option<String> {
+    ["podman", "docker"].into_iter().find_map(|tool| {
+        Command::new(tool)
+            .args(["image", "inspect", trace_check::symbolic::ANALYZER_IMAGE])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|_| tool.to_string())
+    })
+}
+
 struct Run {
     code: i32,
     stdout: String,
@@ -183,6 +195,7 @@ fn an_invalid_secret_specification_is_refused() {
             "halt_symbol": "tc_halt",
             "secret_globals": [],
             "public_globals": ["TC_TABLE"],
+            "features": ["control-flow", "memory-access"],
             "max_depth": 100,
             "expected_outcome": "VERIFIED_BOUNDED"
           }]
@@ -217,6 +230,7 @@ fn an_injected_symbol_name_is_refused() {
             "halt_symbol": "tc_halt",
             "secret_globals": ["TC_SECRET\nexplore all"],
             "public_globals": [],
+            "features": ["control-flow", "memory-access"],
             "max_depth": 100,
             "expected_outcome": "VERIFIED_BOUNDED"
           }]
@@ -231,6 +245,68 @@ fn an_injected_symbol_name_is_refused() {
         "{}",
         run.stderr
     );
+}
+
+/// An explicit `--container-runtime` is honored, and an unsupported one is
+/// rejected by argument parsing rather than attempted.
+#[test]
+fn an_explicit_container_runtime_is_honored() {
+    let run = verify(&["--case", "masked-scan", "--container-runtime", "containerd"]);
+    assert_ne!(run.code, 0);
+    assert!(
+        run.stderr.contains("containerd"),
+        "the rejected value should be named: {}",
+        run.stderr
+    );
+
+    if !analyzer_available() {
+        return;
+    }
+    // The runtime that holds the image is what CI pulls into; naming it
+    // explicitly must produce the same result as automatic selection.
+    let tool = runtime_with_image().expect("a runtime holds the image");
+    let run = verify(&[
+        "--case",
+        "masked-scan",
+        "--container-runtime",
+        &tool,
+        "--format",
+        "json",
+    ]);
+    assert_eq!(run.code, 0, "stderr:\n{}", run.stderr);
+    let value: serde_json::Value = serde_json::from_str(&run.stdout).expect("JSON");
+    assert_eq!(value["provenance"]["container_tool"], tool);
+}
+
+/// Automatic selection picks a runtime that actually holds the image, not
+/// whichever appears first.
+///
+/// The CI failure this covers: the image was pulled with Docker, Podman probed
+/// first and was chosen, and every case failed with "not present locally"
+/// before any analysis ran.
+#[test]
+fn automatic_selection_picks_a_runtime_holding_the_image() {
+    if !analyzer_available() {
+        return;
+    }
+    let run = verify(&["--case", "masked-scan", "--format", "json"]);
+    assert_eq!(run.code, 0, "stderr:\n{}", run.stderr);
+    let value: serde_json::Value = serde_json::from_str(&run.stdout).expect("JSON");
+    let used = value["provenance"]["container_tool"]
+        .as_str()
+        .expect("the runtime is recorded");
+    let holds = Command::new(used)
+        .args(["image", "inspect", trace_check::symbolic::ANALYZER_IMAGE])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    assert!(holds, "{used} was selected but does not hold the image");
+
+    // CI pulls into one runtime only; when it says which, the selection must
+    // agree.
+    if let Ok(expected) = std::env::var("EXPECTED_CONTAINER_RUNTIME") {
+        assert_eq!(used, expected);
+    }
 }
 
 /// `verify` does not change `test`: the M3 backend stays independent of the
@@ -256,4 +332,39 @@ fn the_dynamic_subcommands_are_still_available() {
             "{subcommand} missing from {help}"
         );
     }
+}
+
+/// A case file that does not state its observation model is refused before any
+/// analysis runs.
+#[test]
+fn a_case_without_a_declared_observation_model_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("cases.json");
+    std::fs::write(
+        &path,
+        r#"{
+          "schema_version": 1,
+          "target_source": "src/targets.rs",
+          "cases": [{
+            "id": "unstated",
+            "function": "masked_scan",
+            "entry_symbol": "tc_harness_masked_scan",
+            "halt_symbol": "tc_halt",
+            "secret_globals": ["TC_SECRET"],
+            "public_globals": ["TC_TABLE"],
+            "features": [],
+            "max_depth": 100,
+            "expected_outcome": "VERIFIED_BOUNDED"
+          }]
+        }"#,
+    )
+    .expect("write cases");
+
+    let run = verify(&["--cases", path.to_str().expect("utf-8 path")]);
+    assert_eq!(run.code, 2, "stdout:\n{}", run.stdout);
+    assert!(
+        run.stderr.contains("observation model"),
+        "the cause should be named: {}",
+        run.stderr
+    );
 }
