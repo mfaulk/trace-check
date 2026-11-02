@@ -9,6 +9,11 @@
 /traces/
 
 # Generated reports. The committed artifact-baseline.json is not one of these.
+# A symbolic report can contain a counterexample's secret values, which is
+# another reason not to track one.
 *-report.json
 *-screen.json
 native-memcheck.json
+m3-consumer.json
+m4-symbolic.json
+m5-library.json

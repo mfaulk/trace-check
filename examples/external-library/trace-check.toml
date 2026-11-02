@@ -1,0 +1,16 @@
+schema_version = 1
+description = "Verification settings for a library outside the trace-check workspace."
+
+[verify."external_library::select"]
+description = "constant-time selection between two words"
+rationale = "the choice is applied as a full-width mask, so neither secret reaches a branch or an address"
+max_depth = 4000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "VERIFIED_BOUNDED"
+
+[verify."external_library::digest_nibble"]
+description = "vulnerable: the secret's low nibble selects a load address"
+rationale = "every secret executes the same instructions, so only an address-aware analysis can see this"
+max_depth = 4000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "LEAK_DETECTED"

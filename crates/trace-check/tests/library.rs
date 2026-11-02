@@ -1,0 +1,675 @@
+//! Contract verification against a real Cargo library, driven against the real
+//! analyzer.
+//!
+//! The whole configured suite is verified once in a [`OnceLock`] and the
+//! assertions read from that shared report; tests that need a *different*
+//! library or a *different* configuration stage their own copy.
+//!
+//! They skip when no container runtime or analyzer image is present, but
+//! `TRACE_CHECK_REQUIRE_SYMBOLIC=1` — which CI sets — turns a missing backend
+//! into a failure, so a skip can never be mistaken for a pass.
+//!
+//! The load-bearing test here is
+//! [`the_verdict_follows_the_library_implementation`]. It rewrites one function
+//! body in a copy of the library, leaves the configuration and the generated
+//! harness design untouched, and requires the verdict to flip. Nothing keyed on
+//! a contract name, a declared expectation, or a copy of the algorithm can pass
+//! it — and there is no copy of the algorithm to key on, which is the whole
+//! point of the milestone.
+
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+use trace_check::contract::{ContractError, VerifyConfig, CONFIG_FILE};
+use trace_check::harness::{self, HarnessError, Library};
+use trace_check::library_report::LibraryReport;
+use trace_check::security::Outcome;
+use trace_check::symbolic::{CheckFeature, Verifier};
+
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("crate lives two levels below the workspace root")
+        .to_path_buf()
+}
+
+fn library_dir() -> PathBuf {
+    workspace_root().join("examples/crypto-library")
+}
+
+fn manifest() -> PathBuf {
+    library_dir().join("Cargo.toml")
+}
+
+fn config() -> VerifyConfig {
+    VerifyConfig::load(&library_dir().join(CONFIG_FILE))
+        .expect("the bundled configuration is valid")
+}
+
+fn analyzer_available() -> bool {
+    let reason = match Verifier::prepare() {
+        Err(e) => Some(e.to_string()),
+        Ok(mut verifier) => verifier.check_image().err().map(|e| e.to_string()),
+    };
+    match reason {
+        None => true,
+        Some(reason) => {
+            assert!(
+                std::env::var_os("TRACE_CHECK_REQUIRE_SYMBOLIC").is_none(),
+                "TRACE_CHECK_REQUIRE_SYMBOLIC is set but the symbolic backend is unavailable: \
+                 {reason}"
+            );
+            eprintln!("skipping: {reason}");
+            false
+        }
+    }
+}
+
+/// Verifies `contracts` from `manifest_path` with `config`, in a private
+/// working directory.
+fn verify_with(
+    manifest_path: &Path,
+    config: &VerifyConfig,
+    contracts: &[String],
+    work_root: &Path,
+) -> Result<LibraryReport, HarnessError> {
+    let library = Library::resolve(manifest_path, &[])?;
+    trace_check::run_contract_verification(&library, config, contracts, work_root, None)
+}
+
+/// Every configured contract, verified once per test binary.
+fn suite() -> Option<&'static LibraryReport> {
+    static REPORT: OnceLock<Option<LibraryReport>> = OnceLock::new();
+    REPORT
+        .get_or_init(|| {
+            if !analyzer_available() {
+                return None;
+            }
+            let config = config();
+            let contracts: Vec<String> = config.contracts().iter().map(|c| c.to_string()).collect();
+            let work = std::env::temp_dir().join("trace-check-library-it");
+            Some(
+                verify_with(&manifest(), &config, &contracts, &work)
+                    .expect("the bundled contracts verify"),
+            )
+        })
+        .as_ref()
+}
+
+fn contract_report<'a>(
+    report: &'a LibraryReport,
+    id: &str,
+) -> &'a trace_check::library_report::ContractReport {
+    report
+        .contracts
+        .iter()
+        .find(|entry| entry.contract == id)
+        .unwrap_or_else(|| panic!("no contract {id} in the report"))
+}
+
+/// Every configured contract reproduces the outcome it declares, and the run
+/// exits 0.
+#[test]
+fn every_configured_contract_meets_its_declared_expectation() {
+    let Some(report) = suite() else { return };
+    assert!(
+        report.summary.unmet_expectations.is_empty(),
+        "unmet: {:?}",
+        report.summary.unmet_expectations
+    );
+    assert!(report.summary.expectations_reproduced);
+    assert_eq!(report.executed, report.selected);
+    assert_eq!(report.executed, config().contracts().len());
+    assert_eq!(report.exit_code(), 0);
+}
+
+/// A real library function earns VERIFIED_BOUNDED: complete exploration, no
+/// pending paths, no unknown answers, every requested obligation class
+/// discharged, and the analyzer's own evidence that it reached the function.
+#[test]
+fn a_real_library_function_earns_verified_bounded() {
+    let Some(report) = suite() else { return };
+    let entry = contract_report(report, "crypto::tag::verify_tag");
+    assert_eq!(entry.analysis.outcome, Outcome::VerifiedBounded);
+    assert!(entry.analysis.exploration.is_complete());
+    assert_eq!(entry.analysis.exploration.pending_paths, Some(0));
+    assert_eq!(entry.analysis.exploration.unknown_queries, Some(0));
+    assert!(entry.analysis.exploration.performed_checks() > 0);
+    assert!(entry.analysis.divergences.is_empty());
+    assert!(entry.analysis.unchecked_properties.is_empty());
+    // Attribution is evidence, not declaration.
+    assert!(entry.symbol.reached);
+    assert!(entry.symbol.reached_at.is_some());
+    // And it is the library's own function, named by the contract.
+    assert!(
+        entry.symbol.mangled.contains("verify_tag"),
+        "{}",
+        entry.symbol.mangled
+    );
+    assert_eq!(entry.library.package, "crypto-library");
+}
+
+/// A secret-dependent branch in library code is found, and localized to the
+/// developer's own source line rather than to a generated file.
+#[test]
+fn a_secret_dependent_branch_in_library_code_is_found() {
+    let Some(report) = suite() else { return };
+    let entry = contract_report(report, "crypto::tag::verify_tag_volatile_early_exit");
+    assert_eq!(entry.analysis.outcome, Outcome::LeakDetected);
+    let control: Vec<_> = entry
+        .analysis
+        .divergences
+        .iter()
+        .filter(|divergence| divergence.kind == CheckFeature::ControlFlow)
+        .collect();
+    assert!(!control.is_empty(), "{:?}", entry.analysis.divergences);
+    let source = control[0].source.as_deref().unwrap_or_default();
+    assert!(
+        source.contains("verify_tag_volatile_early_exit") && source.contains("tag.rs"),
+        "a finding must name the library's own source, got {source:?}"
+    );
+}
+
+/// A secret-dependent memory address in library code is found. The instruction
+/// sequence is identical for every secret, so only an address-aware analysis
+/// can see this.
+#[test]
+fn a_secret_dependent_address_in_library_code_is_found() {
+    let Some(report) = suite() else { return };
+    let entry = contract_report(report, "crypto::lookup::substitute_indexed");
+    assert_eq!(entry.analysis.outcome, Outcome::LeakDetected);
+    assert!(entry
+        .analysis
+        .divergences
+        .iter()
+        .any(|divergence| divergence.kind == CheckFeature::MemoryAccess));
+    // One path: the leak is in the address, not in the instruction sequence.
+    assert_eq!(entry.analysis.exploration.total_paths, Some(1));
+    let source = entry.analysis.divergences[0]
+        .source
+        .as_deref()
+        .unwrap_or_default();
+    assert!(source.contains("lookup.rs"), "got {source:?}");
+}
+
+/// Branching on a public input is not a leak: both compared executions share
+/// their public inputs. A finding here would be wrong in the direction that
+/// makes the tool useless.
+#[test]
+fn a_public_branch_is_not_reported_as_a_leak() {
+    let Some(report) = suite() else { return };
+    let entry = contract_report(report, "crypto::controls::public_branch");
+    assert_eq!(entry.analysis.outcome, Outcome::VerifiedBounded);
+    assert!(entry.analysis.divergences.is_empty());
+}
+
+/// The milestone's key demonstration. The M3 dynamic test for this contract
+/// exercises `mode = 0` and observes nothing; the symbolic search over the
+/// public domain finds the vulnerable path.
+#[test]
+fn a_leak_behind_an_untested_public_mode_is_found() {
+    let Some(report) = suite() else { return };
+    let entry = contract_report(report, "crypto::lookup::substitute_mode");
+    assert_eq!(entry.analysis.outcome, Outcome::LeakDetected);
+    // Both modes were explored; the dynamic test visited one of them.
+    assert_eq!(entry.analysis.exploration.total_paths, Some(2));
+    assert!(entry
+        .analysis
+        .divergences
+        .iter()
+        .any(|divergence| divergence.kind == CheckFeature::MemoryAccess));
+}
+
+/// The per-byte control: a leak that depends on **nothing but byte 15** of the
+/// secret array is found. A harness that declared only the pointer secret, only
+/// the leading byte, or the wrong width reports this as secure.
+#[test]
+fn a_leak_in_the_final_secret_byte_is_found() {
+    let Some(report) = suite() else { return };
+    let entry = contract_report(report, "crypto::controls::tail_byte_probe");
+    assert_eq!(entry.analysis.outcome, Outcome::LeakDetected);
+    assert!(entry
+        .analysis
+        .divergences
+        .iter()
+        .any(|divergence| divergence.kind == CheckFeature::MemoryAccess));
+    // The whole array is the secret, not its pointer: 16 bytes, one global.
+    let secret = entry
+        .inputs
+        .iter()
+        .find(|input| input.role == trace_check::contract::Role::Secret)
+        .expect("a declared secret");
+    assert_eq!(secret.bits, 128);
+    assert!(secret.passing.contains("pointer is public"));
+}
+
+/// A counterexample for an array secret is a pair of whole-array values, which
+/// is what shows the entire array was made symbolic rather than its first byte.
+#[test]
+fn a_counterexample_covers_the_whole_secret_array() {
+    let Some(report) = suite() else { return };
+    let entry = contract_report(report, "crypto::tag::verify_tag_volatile_early_exit");
+    let Some(counterexample) = entry.analysis.counterexamples.first() else {
+        // Not every leak has a model: the analyzer settles some by taint
+        // analysis without issuing a relational query, and that is reported
+        // rather than fabricated.
+        assert_eq!(
+            entry.analysis.witness,
+            trace_check::symbolic::WitnessStatus::UnavailableFromAnalyzer
+        );
+        return;
+    };
+    assert!(counterexample.global.starts_with("TC_SECRET_"));
+    assert_ne!(
+        counterexample.left, counterexample.right,
+        "two equal values witness nothing"
+    );
+    // The solver's model is over the full 128-bit input.
+    assert!(
+        counterexample.left.contains("128"),
+        "expected a 128-bit model, got {}",
+        counterexample.left
+    );
+}
+
+/// **The milestone's defining regression.** One function body is rewritten in a
+/// copy of the library; the configuration, the contract identity and the
+/// generated harness design are untouched. The verdict must flip.
+#[test]
+fn the_verdict_follows_the_library_implementation() {
+    if !analyzer_available() {
+        return;
+    }
+    let staged = tempfile::tempdir().expect("temp dir");
+    let copy = stage_library(staged.path());
+
+    // `substitute` is a branchless full-table scan and verifies. Make it index
+    // by the secret instead. Nothing else changes -- not the harness, not the
+    // configuration, not the declared expectation.
+    let path = copy.join("src/lookup.rs");
+    let original = std::fs::read_to_string(&path).expect("lookup.rs");
+    let leaking = original.replace(
+        "accumulator |= unsafe { core::ptr::read_volatile(&SBOX[position as usize]) } & hit;",
+        "accumulator |= unsafe { core::ptr::read_volatile(&SBOX[want as usize]) } & hit;",
+    );
+    assert_ne!(leaking, original, "the injection site must still exist");
+    std::fs::write(&path, leaking).expect("write lookup.rs");
+
+    let config = config();
+    let contracts = vec!["crypto::lookup::substitute".to_string()];
+    assert_eq!(
+        config
+            .settings(&contracts[0])
+            .expect("configured")
+            .expected_outcome,
+        "VERIFIED_BOUNDED",
+        "the declared expectation must still say the function is safe"
+    );
+
+    let report = verify_with(
+        &copy.join("Cargo.toml"),
+        &config,
+        &contracts,
+        &staged.path().join("work"),
+    )
+    .expect("the mutated library analyzes");
+
+    let entry = contract_report(&report, &contracts[0]);
+    assert_eq!(
+        entry.analysis.outcome,
+        Outcome::LeakDetected,
+        "changing only the library must change the verdict: {}",
+        entry.analysis.message
+    );
+    assert!(!entry.expectation.met);
+    assert_eq!(report.exit_code(), 1);
+    // A different artifact, and the report says so.
+    let baseline = suite().map(|report| {
+        contract_report(report, &contracts[0])
+            .artifact
+            .sha256
+            .clone()
+    });
+    if let Some(baseline) = baseline {
+        assert_ne!(entry.artifact.sha256, baseline);
+    }
+}
+
+/// A contract the library does not declare is an explicit error naming what is
+/// missing, not an inconclusive analysis of something else.
+#[test]
+fn an_undeclared_contract_is_an_explicit_error() {
+    let mut config = config();
+    // Reuse a valid section under a name the library does not define.
+    let settings = config
+        .verify
+        .remove("crypto::tag::verify_tag")
+        .expect("configured");
+    config
+        .verify
+        .insert("crypto::tag::no_such_function".to_string(), settings);
+
+    let staged = tempfile::tempdir().expect("temp dir");
+    let error = verify_with(
+        &manifest(),
+        &config,
+        &["crypto::tag::no_such_function".to_string()],
+        staged.path(),
+    )
+    .expect_err("an undeclared contract must be refused");
+    let message = error.to_string();
+    assert!(
+        message.contains("no_such_function") && message.contains("#[constant_time]"),
+        "{message}"
+    );
+}
+
+/// A function in the library that carries no annotation is refused for the same
+/// reason: there is no declaration to read roles and widths from.
+#[test]
+fn an_unannotated_function_is_an_explicit_error() {
+    let mut config = config();
+    let settings = config
+        .verify
+        .remove("crypto::lookup::substitute")
+        .expect("configured");
+    // `synthetic_table`-style helpers are ordinary functions with no contract.
+    config
+        .verify
+        .insert("crypto::tag::TAG_LEN".to_string(), settings);
+
+    let staged = tempfile::tempdir().expect("temp dir");
+    let error = verify_with(
+        &manifest(),
+        &config,
+        &["crypto::tag::TAG_LEN".to_string()],
+        staged.path(),
+    )
+    .expect_err("an unannotated item must be refused");
+    assert!(error.to_string().contains("#[constant_time]"), "{error}");
+}
+
+/// An identity qualified by the wrong crate is refused before anything is
+/// built, naming the crate the manifest actually describes.
+#[test]
+fn a_wrongly_qualified_identity_is_refused() {
+    let library = Library::resolve(&manifest(), &[]).expect("resolves");
+    let error = harness::split_contract(&library, "other::tag::verify_tag").expect_err("refused");
+    assert!(error.to_string().contains("crate `crypto`"), "{error}");
+    // A bare name says nothing about where the code lives.
+    assert!(harness::split_contract(&library, "verify_tag").is_err());
+}
+
+/// A signature the symbolic backend cannot represent is an actionable error
+/// naming the parameter and its type, not a guessed width.
+///
+/// `examples/consumer-crate` declares `verify_tag(expected: &[u8; TAG_LEN], …)`.
+/// A proc macro sees the token `TAG_LEN`, not `32`, so the contract is recorded
+/// as unsupported and refused here — while remaining fully usable under M3.
+#[test]
+fn an_unsupported_signature_is_an_actionable_error() {
+    let consumer = workspace_root().join("examples/consumer-crate/Cargo.toml");
+    let library = Library::resolve(&consumer, &[]).expect("resolves");
+    let staged = tempfile::tempdir().expect("temp dir");
+    let target = staged.path().join("target");
+    std::fs::create_dir_all(&target).expect("target dir");
+
+    let error = harness::probe_contract(
+        &library,
+        "consumer_crate::verify_tag",
+        staged.path(),
+        &target,
+    )
+    .expect_err("an unsupported signature must be refused");
+    let message = error.to_string();
+    assert!(message.contains("`expected`"), "{message}");
+    assert!(message.contains("TAG_LEN"), "{message}");
+    assert!(message.contains("literal N"), "{message}");
+}
+
+/// Configuration cannot assign a parameter's role. The refusal happens after
+/// the descriptor is read, so the message can name the declared secrets.
+#[test]
+fn configuration_cannot_reassign_a_role() {
+    if !analyzer_available() {
+        return;
+    }
+    let mut config = config();
+    config
+        .verify
+        .get_mut("crypto::tag::verify_tag")
+        .expect("configured")
+        .inputs
+        .insert("expected".to_string(), "public-symbolic".to_string());
+
+    let staged = tempfile::tempdir().expect("temp dir");
+    let error = verify_with(
+        &manifest(),
+        &config,
+        &["crypto::tag::verify_tag".to_string()],
+        staged.path(),
+    )
+    .expect_err("a role override must be refused");
+    let message = error.to_string();
+    assert!(message.contains("#[constant_time(secret"), "{message}");
+    assert!(
+        message.contains("Declared secret(s): expected"),
+        "{message}"
+    );
+}
+
+/// A contract that is not configured is refused rather than verified with
+/// invented bounds: a depth limit and an observation model cannot be inferred
+/// from an annotation.
+#[test]
+fn an_unconfigured_contract_is_refused() {
+    if !analyzer_available() {
+        return;
+    }
+    let mut config = config();
+    config.verify.remove("crypto::tag::verify_tag");
+    let staged = tempfile::tempdir().expect("temp dir");
+    let error = verify_with(
+        &manifest(),
+        &config,
+        &["crypto::tag::verify_tag".to_string()],
+        staged.path(),
+    )
+    .expect_err("an unconfigured contract must be refused");
+    assert!(
+        matches!(
+            error,
+            HarnessError::Contract(ContractError::NotConfigured { .. })
+        ),
+        "{error}"
+    );
+}
+
+/// A symbol the artifact does not define is an explicit error, not a verdict.
+/// This is the "inlined, removed, or misnamed" case: there is nothing to
+/// analyze, and the message says so.
+#[test]
+fn a_missing_symbol_is_an_explicit_error() {
+    if !analyzer_available() {
+        return;
+    }
+    let Some(report) = suite() else { return };
+    let artifact = Path::new(
+        &contract_report(report, "crypto::tag::verify_tag")
+            .artifact
+            .path,
+    )
+    .to_path_buf();
+    if !artifact.is_file() {
+        // The suite's working directory is per-process and may have been
+        // cleaned; nothing to assert against.
+        return;
+    }
+    // Present, by construction.
+    harness::resolve_symbol(&artifact, "crypto::tag::verify_tag").expect("resolves");
+    // Absent.
+    let error = harness::resolve_symbol(&artifact, "crypto::tag::vanished").expect_err("refused");
+    let message = error.to_string();
+    assert!(message.contains("resolves to no symbol"), "{message}");
+    assert!(message.contains("nothing to analyze"), "{message}");
+}
+
+/// Exploration cut short by a depth bound is INCONCLUSIVE, never a verdict —
+/// the M4 fail-closed rule, reached through the M5 path.
+#[test]
+fn exceeding_the_depth_bound_is_inconclusive() {
+    if !analyzer_available() {
+        return;
+    }
+    let mut config = config();
+    let settings = config
+        .verify
+        .get_mut("crypto::tag::verify_tag")
+        .expect("configured");
+    // The unbounded run reaches a maximum path depth in the hundreds.
+    settings.max_depth = 40;
+    let staged = tempfile::tempdir().expect("temp dir");
+    let report = verify_with(
+        &manifest(),
+        &config,
+        &["crypto::tag::verify_tag".to_string()],
+        staged.path(),
+    )
+    .expect("the bounded run analyzes");
+    let entry = contract_report(&report, "crypto::tag::verify_tag");
+    assert_eq!(
+        entry.analysis.outcome,
+        Outcome::Inconclusive,
+        "{}",
+        entry.analysis.message
+    );
+    assert!(!entry.expectation.met);
+    assert_eq!(report.exit_code(), 2);
+}
+
+/// A result covers only the observation classes the configuration asked for,
+/// and says which it does not cover. A narrow run must not read like the
+/// stronger one.
+#[test]
+fn a_narrow_observation_model_is_named_as_such() {
+    if !analyzer_available() {
+        return;
+    }
+    let mut config = config();
+    let settings = config
+        .verify
+        .get_mut("crypto::lookup::substitute_indexed")
+        .expect("configured");
+    // The secret-indexed load's instruction path really is secret-independent:
+    // only the address varies. Under control-flow checks alone the analyzer is
+    // right to report `secure`, and the report has to name the gap.
+    settings.checks = vec![CheckFeature::ControlFlow];
+    settings.expected_outcome = "VERIFIED_BOUNDED".to_string();
+
+    let staged = tempfile::tempdir().expect("temp dir");
+    let report = verify_with(
+        &manifest(),
+        &config,
+        &["crypto::lookup::substitute_indexed".to_string()],
+        staged.path(),
+    )
+    .expect("the narrow run analyzes");
+    let entry = contract_report(&report, "crypto::lookup::substitute_indexed");
+    assert_eq!(entry.analysis.outcome, Outcome::VerifiedBounded);
+    assert_eq!(
+        entry.analysis.unchecked_properties,
+        vec!["memory-address noninterference"]
+    );
+    let text = report.to_text();
+    assert!(
+        text.contains("NOT checked: memory-address noninterference"),
+        "{text}"
+    );
+}
+
+/// The report connects the developer's source to the analyzed executable, and
+/// never claims the production binary was analyzed.
+#[test]
+fn the_report_connects_source_to_artifact() {
+    let Some(report) = suite() else { return };
+    let entry = contract_report(report, "crypto::tag::verify_tag");
+    assert!(
+        entry.declared_at.contains("tag.rs"),
+        "{}",
+        entry.declared_at
+    );
+    assert_eq!(entry.library.lib_name, "crypto");
+    assert_eq!(entry.compilation.panic, "abort");
+    assert!(!entry.compilation.lto);
+    assert_eq!(
+        entry.compilation.target,
+        trace_check::symbolic::SUPPORTED_TARGET
+    );
+    assert_eq!(entry.harness.sha256.len(), 64);
+    assert_eq!(entry.artifact.sha256.len(), 64);
+    assert_eq!(entry.artifact.lockfile_sha256.len(), 64);
+    assert!(entry.artifact.production_artifact.contains("not analyzed"));
+    // The generated harness is kept verbatim, and contains no algorithm.
+    assert!(entry.harness.source.contains("crypto::tag::verify_tag"));
+    assert!(!entry.harness.source.contains("ct_eq"));
+}
+
+/// Each contract is analyzed in its own executable, so a result names the exact
+/// artifact it describes. A shared multi-entry artifact dropped entry symbols
+/// as dead code during the feasibility spike.
+#[test]
+fn each_contract_has_its_own_artifact() {
+    let Some(report) = suite() else { return };
+    let mut hashes: Vec<&str> = report
+        .contracts
+        .iter()
+        .map(|entry| entry.artifact.sha256.as_str())
+        .collect();
+    hashes.sort_unstable();
+    let distinct = hashes.len();
+    hashes.dedup();
+    assert_eq!(hashes.len(), distinct, "two contracts share one artifact");
+}
+
+/// Copies the library into `root`, with a self-contained manifest.
+///
+/// The bundled manifest inherits `version`, `edition` and `license` from the
+/// trace-check workspace, which does not exist outside the repository, so the
+/// copy pins them and declares itself a workspace root.
+fn stage_library(root: &Path) -> PathBuf {
+    let copy = root.join("crypto-library");
+    std::fs::create_dir_all(copy.join("src")).expect("src dir");
+    for entry in std::fs::read_dir(library_dir().join("src")).expect("read src") {
+        let entry = entry.expect("dir entry");
+        std::fs::copy(entry.path(), copy.join("src").join(entry.file_name())).expect("copy source");
+    }
+    std::fs::copy(library_dir().join(CONFIG_FILE), copy.join(CONFIG_FILE)).expect("copy config");
+
+    let manifest = std::fs::read_to_string(manifest()).expect("manifest");
+    let absolute = |relative: &str| {
+        workspace_root()
+            .join(relative)
+            .display()
+            .to_string()
+            .replace('\\', "/")
+    };
+    let staged = manifest
+        .replace("version.workspace = true", "version = \"0.1.0\"")
+        .replace("edition.workspace = true", "edition = \"2021\"")
+        .replace(
+            "license.workspace = true",
+            "license = \"MIT OR Apache-2.0\"",
+        )
+        .replace(
+            "path = \"../../crates/trace-check-macros\"",
+            &format!("path = {:?}", absolute("crates/trace-check-macros")),
+        )
+        .replace(
+            "path = \"../../crates/trace-check-test\"",
+            &format!("path = {:?}", absolute("crates/trace-check-test")),
+        );
+    std::fs::write(copy.join("Cargo.toml"), format!("{staged}\n[workspace]\n"))
+        .expect("write manifest");
+    copy
+}
