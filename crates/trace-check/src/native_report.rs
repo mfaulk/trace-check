@@ -149,6 +149,10 @@ impl NativeReport {
             let label = match entry.result.outcome {
                 Outcome::LeakDetected => "LEAK",
                 Outcome::NoLeakObserved => "NO LEAK OBSERVED",
+                // The dynamic backend never produces this; a symbolic result
+                // reaching here would be a wiring mistake, so it is labelled
+                // rather than silently folded into a dynamic verdict.
+                Outcome::VerifiedBounded => "VERIFIED BOUNDED (symbolic)",
                 Outcome::Inconclusive => "INCONCLUSIVE",
             };
             line!("{label}: {}", entry.result.case);

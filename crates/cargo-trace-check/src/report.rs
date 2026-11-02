@@ -355,6 +355,10 @@ impl Report {
             let label = match test.outcome {
                 Outcome::NoLeakObserved => "PASS",
                 Outcome::LeakDetected => "FAIL",
+                // `cargo trace-check test` is the dynamic backend and never
+                // produces a symbolic verdict; labelling it rather than folding
+                // it into PASS keeps a wiring mistake visible.
+                Outcome::VerifiedBounded => "VERIFIED (symbolic)",
                 Outcome::Inconclusive => "INCONCLUSIVE",
             };
             line!("  {:<44} {label}", short_name(&test.test));
