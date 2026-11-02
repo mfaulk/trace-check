@@ -15,6 +15,13 @@
 //! diagnostics into secret-dependent branches and addresses. The two backends
 //! share only the outcome vocabulary and provenance in [`security`] — their
 //! evidence is of different kinds and is reported separately.
+//!
+//! A third backend reasons *symbolically*: [`symbolic`] drives BINSEC's
+//! relational symbolic execution over an optimized native artifact, searching
+//! for a secret assignment that leaks rather than sampling chosen inputs. When
+//! the search completes it reports `VERIFIED_BOUNDED` — bounded noninterference
+//! over a declared domain, which is a different and stronger claim than the
+//! dynamic backend's `NO_LEAK_OBSERVED`.
 
 pub mod census;
 pub mod compare;
@@ -27,6 +34,8 @@ pub mod report;
 pub mod runner;
 pub mod screen;
 pub mod security;
+pub mod symbolic;
+pub mod symbolic_report;
 pub mod taint;
 pub mod wasm;
 
@@ -117,4 +126,37 @@ pub fn run_native_case(
         result,
         provenance,
     )]))
+}
+
+use symbolic::{CaseFile, SymbolicError, VerificationCase, Verifier};
+use symbolic_report::SymbolicReport;
+
+/// Runs symbolic verification for the selected cases and assembles the report.
+///
+/// The artifact is built once and shared: every case analyzes the *same* binary,
+/// so a reported hash describes all of them and a compiler change is visible as
+/// one hash change rather than several.
+pub fn run_symbolic(
+    case_file: &CaseFile,
+    case_dir: &Path,
+    selected: &[VerificationCase],
+    out_dir: &Path,
+) -> Result<SymbolicReport, SymbolicError> {
+    let mut verifier = Verifier::prepare()?;
+    verifier.check_image()?;
+
+    let source = case_dir.join(&case_file.target_source);
+    let (artifact, hash) = verifier.build(&source, out_dir)?;
+
+    let mut entries = Vec::new();
+    for case in selected {
+        let result = verifier.verify(case, &artifact, &hash)?;
+        entries.push((case.clone(), result));
+    }
+
+    Ok(symbolic_report::build(
+        entries,
+        verifier.provenance(&artifact, &hash),
+        selected.len(),
+    ))
 }
