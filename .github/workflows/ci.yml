@@ -59,9 +59,19 @@ jobs:
         run: |
           cargo fmt --all -- --check
           rustfmt --edition 2021 --check examples/symbolic/src/targets.rs
+          rustfmt --edition 2021 --check examples/external-library/src/lib.rs
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      # Outside the workspace, so `--workspace` does not reach it. Only the
+      # library target: it carries no dev-dependency on trace-check-test, so
+      # the annotation's #[cfg(test)] adapter has nothing to call into -- and
+      # the library target is the one verification builds.
+      - name: Clippy the out-of-workspace example
+        run: |
+          cargo clippy --locked --lib \
+            --manifest-path examples/external-library/Cargo.toml -- -D warnings
 
       # A missing backend must fail rather than silently skip the end-to-end
       # tests. The fast suite runs first so an ordinary regression surfaces
@@ -132,6 +142,23 @@ jobs:
           code=$?
           set -e
           test "$code" = "2" || { echo "expected exit 2 (incomplete), got $code"; exit 1; }
+
+      # M5's library, dynamically. The same annotated functions that
+      # `cargo trace-check verify` analyzes symbolically. The library
+      # deliberately contains vulnerable implementations, so a full run exits 1
+      # by design and the filtered run is the one that must exit 0.
+      - name: The library's clean contracts pass dynamically
+        working-directory: examples/crypto-library
+        run: cargo run --locked --release -p cargo-trace-check -- test --filter is_constant_time
+
+      - name: The library's vulnerable contracts are detected dynamically
+        working-directory: examples/crypto-library
+        run: |
+          set +e
+          cargo run --locked --release -p cargo-trace-check -- test
+          code=$?
+          set -e
+          test "$code" = "1" || { echo "expected exit 1 (leak detected), got $code"; exit 1; }
 
       - name: Reproduce the demonstration
         run: cargo run --locked --release -p trace-check -- demo mac-compare
@@ -218,6 +245,16 @@ jobs:
           cargo test --locked -p trace-check --test symbolic
           cargo test --locked -p cargo-trace-check --test verify
 
+      # M5: contract verification against a real Cargo library. Includes
+      # `the_verdict_follows_the_library_implementation`, which rewrites one
+      # function body in a copy of the library and requires the verdict to flip
+      # while the configuration and the generated harness design stay the same.
+      - name: Contract verification tests
+        env:
+          TRACE_CHECK_REQUIRE_SYMBOLIC: "1"
+          EXPECTED_CONTAINER_RUNTIME: docker
+        run: cargo test --locked -p trace-check --test library
+
       # No --container-runtime here on purpose: automatic selection is what
       # must work.
       - name: Verify every bundled case
@@ -236,7 +273,58 @@ jobs:
           cargo run --locked --release -p cargo-trace-check -- verify \
             --case masked-scan --container-runtime docker
 
+      # M5: every declared contract in the example library, through the CLI a
+      # developer uses. The validator checks the report, not the exit code.
+      - name: Verify every declared contract in the example library
+        env:
+          EXPECTED_CONTAINER_RUNTIME: docker
+        run: |
+          set -euo pipefail
+          cargo run --locked --release -p cargo-trace-check -- verify --all-contracts \
+            --manifest-path examples/crypto-library/Cargo.toml
+          cargo run --locked --release -p cargo-trace-check -- verify --all-contracts \
+            --manifest-path examples/crypto-library/Cargo.toml --format json \
+            > m5-library.json
+          python3 ci/verify-m5-library.py m5-library.json
+
+      # The workflow has to work for a crate trace-check knows nothing about:
+      # its own manifest, its own lockfile, no workspace membership.
+      - name: Verify a library outside the workspace
+        run: |
+          cargo run --locked --release -p cargo-trace-check -- verify --all-contracts \
+            --manifest-path examples/external-library/Cargo.toml
+
+      # The milestone's defining property, asserted against the checkout rather
+      # than only inside the test binary: change the library's actual
+      # implementation, leave the harness design and the configuration alone,
+      # and the verdict must change.
+      - name: Changing the library changes the verdict
+        run: |
+          set -euo pipefail
+          sed -i 's/read_volatile(&SBOX\[position as usize\])/read_volatile(\&SBOX[want as usize])/' \
+            examples/crypto-library/src/lookup.rs
+          if git diff --quiet examples/crypto-library/src/lookup.rs; then
+            echo "the injection site no longer exists"
+            exit 1
+          fi
+          set +e
+          cargo run --locked --release -p cargo-trace-check -- verify \
+            --contract crypto::lookup::substitute \
+            --manifest-path examples/crypto-library/Cargo.toml
+          code=$?
+          set -e
+          git checkout -- examples/crypto-library/src/lookup.rs
+          test "$code" = "1" || {
+            echo "a secret-indexed load must be found even though the contract declares"
+            echo "VERIFIED_BOUNDED; expected exit 1, got $code"
+            exit 1; }
+
       - uses: actions/upload-artifact@v4
         with:
           name: m4-symbolic-report
           path: m4-symbolic.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: m5-library-report
+          path: m5-library.json
