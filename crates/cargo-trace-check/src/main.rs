@@ -8,7 +8,7 @@ mod discover;
 mod report;
 mod run;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -16,6 +16,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use trace_check::native::{self, Limits};
 use trace_check::security::Provenance;
+use trace_check::symbolic::CaseFile;
 
 #[derive(Parser)]
 #[command(
@@ -57,6 +58,25 @@ enum Command {
         timeout_secs: u64,
         #[arg(long, default_value_t = 64 * 1024 * 1024)]
         max_output_bytes: usize,
+    },
+    /// Search for a secret assignment that leaks, using bounded relational
+    /// symbolic execution over an optimized native artifact.
+    ///
+    /// Unlike `test`, this does not run inputs you chose: it searches a declared
+    /// domain. When exploration completes it reports VERIFIED_BOUNDED, which is
+    /// a different and stronger claim than the dynamic backend's
+    /// NO_LEAK_OBSERVED.
+    Verify {
+        /// Run only this case.
+        #[arg(long)]
+        case: Option<String>,
+        /// Case file. Defaults to examples/symbolic/cases.json.
+        #[arg(long)]
+        cases: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = Format::Text)]
+        format: Format,
+        #[arg(long)]
+        workspace_root: Option<PathBuf>,
     },
     /// List the discovered checks and contracts without running them.
     List {
@@ -126,6 +146,17 @@ fn execute(cli: Cli) -> Result<u8, String> {
             &features,
             format,
         ),
+        Command::Verify {
+            case,
+            cases,
+            format,
+            workspace_root,
+        } => verify(
+            case.as_deref(),
+            cases.as_deref(),
+            format,
+            workspace_root.as_deref(),
+        ),
     }
 }
 
@@ -170,6 +201,80 @@ fn test(
         provenance,
         filter.is_some(),
     );
+
+    match format {
+        Format::Text => print!("{}", report.to_text()),
+        Format::Json => println!("{}", report.to_json()),
+    }
+    Ok(report.exit_code())
+}
+
+/// Resolves the repository root, preferring an explicit flag.
+///
+/// The compile-time manifest directory is the fallback so `cargo trace-check
+/// verify` works from anywhere inside the repository.
+fn resolve_workspace_root(override_path: Option<&Path>) -> Result<PathBuf, String> {
+    let root = match override_path {
+        Some(path) => path.to_path_buf(),
+        None => Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .ok_or("cannot derive the repository root; pass --workspace-root")?
+            .to_path_buf(),
+    };
+    if !root.join("Cargo.toml").is_file() {
+        return Err(format!(
+            "{} does not look like the repository root (no Cargo.toml); pass --workspace-root",
+            root.display()
+        ));
+    }
+    Ok(root)
+}
+
+/// Searches for a secret assignment that leaks, rather than running chosen
+/// inputs.
+fn verify(
+    case_filter: Option<&str>,
+    cases_override: Option<&Path>,
+    format: Format,
+    workspace_root_override: Option<&Path>,
+) -> Result<u8, String> {
+    let root = resolve_workspace_root(workspace_root_override)?;
+    let cases_path = cases_override
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| root.join("examples/symbolic/cases.json"));
+    let case_dir = cases_path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", cases_path.display()))?
+        .to_path_buf();
+
+    let case_file = CaseFile::load(&cases_path).map_err(|e| e.to_string())?;
+    let selected: Vec<_> = match case_filter {
+        None => case_file.cases.clone(),
+        Some(wanted) => vec![case_file
+            .case(wanted)
+            .ok_or_else(|| {
+                format!(
+                    "no verification case {wanted:?} in {}; available: {}",
+                    cases_path.display(),
+                    case_file
+                        .cases
+                        .iter()
+                        .map(|case| case.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?
+            .clone()],
+    };
+
+    // Keyed on the process so two concurrent invocations cannot overwrite each
+    // other's artifact while the other is being analyzed. The artifact's hash,
+    // not its path, is what a report is pinned to.
+    let out_dir =
+        std::env::temp_dir().join(format!("trace-check-symbolic-build-{}", std::process::id()));
+    let report = trace_check::run_symbolic(&case_file, &case_dir, &selected, &out_dir)
+        .map_err(|e| e.to_string())?;
 
     match format {
         Format::Text => print!("{}", report.to_text()),
