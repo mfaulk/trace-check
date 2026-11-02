@@ -22,6 +22,12 @@ EXPECTED = {
     "depth-bounded": "INCONCLUSIVE",
 }
 
+# Cases whose leak the analyzer settles with a relational satisfiability query,
+# so a solver-produced counterexample must be present. The others are settled
+# by taint analysis or preprocessing and have no model to extract; the report
+# must say so rather than invent one.
+WITNESS_REQUIRED = {"trip-count"}
+
 
 def main(path: str) -> int:
     report = json.load(open(path))
@@ -49,6 +55,15 @@ def main(path: str) -> int:
         failures.append("no compiler recorded")
     if not provenance.get("solver"):
         failures.append("no solver recorded")
+    # Regression: the runtime that holds the image must be the one used. CI
+    # pulls into Docker only while Podman probes first, so a tool-selection
+    # regression shows up here rather than as a confusing "not present".
+    expected_runtime = os.environ.get("EXPECTED_CONTAINER_RUNTIME")
+    if expected_runtime and provenance.get("container_tool") != expected_runtime:
+        failures.append(
+            f"analyzed with {provenance.get('container_tool')!r}, "
+            f"expected {expected_runtime!r}"
+        )
 
     cases = {case["case"]: case for case in report.get("cases", [])}
     for name, want in EXPECTED.items():
@@ -60,6 +75,24 @@ def main(path: str) -> int:
             failures.append(f"{name}: expected {want}, got {case['outcome']}")
         if not case["expectation"]["met"]:
             failures.append(f"{name}: declared expectation not met")
+
+        # A result must be attributed to the function it names, with the
+        # analyzer's own evidence that exploration reached it.
+        target = case.get("target") or {}
+        if want != "INCONCLUSIVE" and not target.get("reached"):
+            failures.append(
+                f"{name}: outcome {want} without evidence that "
+                f"{target.get('function')!r} was reached"
+            )
+
+        # A result is only as strong as the observation classes it checked.
+        if not case.get("checked_features"):
+            failures.append(f"{name}: no observation model recorded")
+        if want == "VERIFIED_BOUNDED" and case.get("unchecked_properties"):
+            failures.append(
+                f"{name}: verified while leaving {case['unchecked_properties']} unchecked; "
+                "the bundled suite checks every modeled class"
+            )
 
         exploration = case["exploration"]
         if want == "VERIFIED_BOUNDED":
@@ -85,6 +118,31 @@ def main(path: str) -> int:
             for divergence in divergences:
                 if not divergence.get("instruction", "").startswith("0x"):
                     failures.append(f"{name}: divergence without an address")
+
+            counterexamples = case.get("counterexamples") or []
+            if name in WITNESS_REQUIRED:
+                if case.get("witness") != "solver_counterexample":
+                    failures.append(
+                        f"{name}: expected a solver counterexample, "
+                        f"got witness={case.get('witness')!r}"
+                    )
+                if not counterexamples:
+                    failures.append(f"{name}: no counterexample pair reported")
+            elif case.get("witness") != "unavailable_from_analyzer":
+                failures.append(
+                    f"{name}: witness={case.get('witness')!r} but no model is expected"
+                )
+            for pair in counterexamples:
+                # An identical pair witnesses nothing.
+                if pair.get("left") == pair.get("right"):
+                    failures.append(f"{name}: counterexample pair is identical")
+                if not pair.get("query"):
+                    failures.append(f"{name}: counterexample names no source query")
+        else:
+            if case.get("counterexamples"):
+                failures.append(
+                    f"{name}: a {want} result must not carry a counterexample"
+                )
 
     extra = sorted(set(cases) - set(EXPECTED))
     if extra:
