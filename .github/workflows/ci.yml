@@ -64,14 +64,19 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      # Outside the workspace, so `--workspace` does not reach it. Only the
-      # library target: it carries no dev-dependency on trace-check-test, so
-      # the annotation's #[cfg(test)] adapter has nothing to call into -- and
-      # the library target is the one verification builds.
+      # Outside the workspace, so `--workspace` does not reach it. `--all-targets`
+      # on purpose: its contracts say `dynamic = false`, so an annotated library
+      # whose only dependency is the macro crate must still build its own test
+      # targets. Adding a verification annotation must not break `cargo test`.
       - name: Clippy the out-of-workspace example
         run: |
-          cargo clippy --locked --lib \
+          cargo clippy --locked --all-targets \
             --manifest-path examples/external-library/Cargo.toml -- -D warnings
+
+      - name: An annotated library still builds its own test suite
+        run: |
+          cargo test --locked --all-targets \
+            --manifest-path examples/external-library/Cargo.toml
 
       # A missing backend must fail rather than silently skip the end-to-end
       # tests. The fast suite runs first so an ordinary regression surfaces
@@ -288,11 +293,17 @@ jobs:
           python3 ci/verify-m5-library.py m5-library.json
 
       # The workflow has to work for a crate trace-check knows nothing about:
-      # its own manifest, its own lockfile, no workspace membership.
+      # its own manifest, its own lockfile, no workspace membership. Its
+      # `mix_when` contract also takes a public `bool`, whose domain the
+      # generator must restrict to Rust's two valid values -- a symbolic byte
+      # has 256, and a report that did not say so would describe a domain that
+      # was not the one searched.
       - name: Verify a library outside the workspace
         run: |
+          set -euo pipefail
           cargo run --locked --release -p cargo-trace-check -- verify --all-contracts \
-            --manifest-path examples/external-library/Cargo.toml
+            --manifest-path examples/external-library/Cargo.toml | tee m5-external.txt
+          grep -q 'generated: TC_PUBLIC_ENABLED <= 1' m5-external.txt
 
       # The milestone's defining property, asserted against the checkout rather
       # than only inside the test binary: change the library's actual

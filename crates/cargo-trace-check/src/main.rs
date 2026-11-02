@@ -15,7 +15,7 @@ use std::time::Duration;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use trace_check::contract::{self, VerifyConfig};
-use trace_check::harness::Library;
+use trace_check::harness::{Library, Workspace};
 use trace_check::native::{self, Limits};
 use trace_check::security::Provenance;
 use trace_check::symbolic::CaseFile;
@@ -87,6 +87,14 @@ enum Command {
         /// Cargo features to enable for the library's verification build.
         #[arg(long, value_delimiter = ',')]
         features: Vec<String>,
+        /// Keep the generated harnesses and analyzed executables under this
+        /// directory instead of a private one that is removed after the run.
+        ///
+        /// Each run still gets a freshly created directory inside it, so
+        /// nothing pre-existing is written through and two runs never share
+        /// one.
+        #[arg(long)]
+        artifact_dir: Option<PathBuf>,
         /// Run only this bundled standalone case (M4).
         #[arg(long)]
         case: Option<String>,
@@ -176,6 +184,7 @@ fn execute(cli: Cli) -> Result<u8, String> {
             manifest_path,
             config,
             features,
+            artifact_dir,
             case,
             cases,
             format,
@@ -189,17 +198,23 @@ fn execute(cli: Cli) -> Result<u8, String> {
                     manifest_path.as_deref(),
                     config.as_deref(),
                     &features,
+                    artifact_dir.as_deref(),
                     format,
                     container_runtime.as_deref(),
                 )
             } else {
-                // `--manifest-path`, `--config` and `--features` select a
-                // library, which only contract verification uses. Accepting
-                // them silently here would look like they had an effect.
-                if manifest_path.is_some() || config.is_some() || !features.is_empty() {
+                // `--manifest-path`, `--config`, `--features` and
+                // `--artifact-dir` select or describe a library, which only
+                // contract verification uses. Accepting them silently here
+                // would look like they had an effect.
+                if manifest_path.is_some()
+                    || config.is_some()
+                    || !features.is_empty()
+                    || artifact_dir.is_some()
+                {
                     return Err(
-                        "--manifest-path, --config and --features apply to contract \
-                         verification; pass --contract <identity> or --all-contracts"
+                        "--manifest-path, --config, --features and --artifact-dir apply to \
+                         contract verification; pass --contract <identity> or --all-contracts"
                             .to_string(),
                     );
                 }
@@ -324,16 +339,20 @@ fn verify(
             .clone()],
     };
 
-    // Keyed on the process so two concurrent invocations cannot overwrite each
-    // other's artifact while the other is being analyzed. The artifact's hash,
-    // not its path, is what a report is pinned to.
-    let out_dir =
-        std::env::temp_dir().join(format!("trace-check-symbolic-build-{}", std::process::id()));
+    // A private directory created atomically, not a path derived from the
+    // process id: a guessable name under a world-writable /tmp can be
+    // pre-created or symlinked, and the build writes an executable into it.
+    // The artifact's hash, not its path, is what a report is pinned to, so
+    // removing the directory afterwards costs nothing.
+    let out_dir = tempfile::Builder::new()
+        .prefix("trace-check-symbolic-build-")
+        .tempdir()
+        .map_err(|e| format!("cannot create a private build directory: {e}"))?;
     let report = trace_check::run_symbolic(
         &case_file,
         &case_dir,
         &selected,
-        &out_dir,
+        out_dir.path(),
         container_runtime,
     )
     .map_err(|e| e.to_string())?;
@@ -349,12 +368,18 @@ fn verify(
 ///
 /// This is M5's path: the analyzed function is compiled from the developer's
 /// own source, not from a verification-specific copy of the algorithm.
+///
+/// Validation is ordered so that everything decidable from the command line and
+/// the configuration happens **before** the container backend is touched: a
+/// misspelled contract name must report the typo, not a missing analyzer image.
+#[allow(clippy::too_many_arguments)]
 fn verify_contracts(
     selected: &[String],
     all_contracts: bool,
     manifest_path: Option<&Path>,
     config_path: Option<&Path>,
     features: &[String],
+    artifact_dir: Option<&Path>,
     format: Format,
     container_runtime: Option<&str>,
 ) -> Result<u8, String> {
@@ -367,10 +392,12 @@ fn verify_contracts(
             manifest.display()
         ));
     }
-    let library = Library::resolve(&manifest, features).map_err(|e| e.to_string())?;
 
+    // Derived from the manifest's directory rather than from resolved package
+    // metadata, so locating and validating the configuration needs neither
+    // Cargo nor the analyzer.
     let config_path = config_path.map(Path::to_path_buf).unwrap_or_else(|| {
-        Path::new(&library.manifest_path)
+        manifest
             .parent()
             .unwrap_or(Path::new("."))
             .join(contract::CONFIG_FILE)
@@ -390,29 +417,22 @@ fn verify_contracts(
     } else {
         selected.to_vec()
     };
-    if contracts.is_empty() {
-        return Err(format!(
-            "no contracts selected. {} configures: {}",
-            config_path.display(),
-            if config.contracts().is_empty() {
-                "(none)".to_string()
-            } else {
-                config.contracts().join(", ")
-            }
-        ));
-    }
+    config
+        .require_configured(&contracts)
+        .map_err(|e| e.to_string())?;
 
-    // Keyed on the process so two concurrent invocations cannot share a
-    // generated package or a target directory.
-    let work_root = std::env::temp_dir().join(format!(
-        "trace-check-contract-verify-{}",
-        std::process::id()
-    ));
+    let library = Library::resolve(&manifest, features).map_err(|e| e.to_string())?;
+    let workspace = match artifact_dir {
+        Some(directory) => Workspace::kept_in(directory),
+        None => Workspace::ephemeral(),
+    }
+    .map_err(|e| e.to_string())?;
+
     let report = trace_check::run_contract_verification(
         &library,
         &config,
         &contracts,
-        &work_root,
+        &workspace,
         container_runtime,
     )
     .map_err(|e| e.to_string())?;

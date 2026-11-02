@@ -52,7 +52,16 @@ production build, and none of them is glossed:
 * the build uses no LTO, `panic = "abort"` and static relocation.
 
 Every contract report records all three, and records that no production binary
-was analyzed.
+was analyzed. It also records the *build*, the artifact hash, the lockfile
+fingerprint and the resolved symbol **per contract**, because a run builds one
+executable per contract and no single artifact describes the whole report.
+
+Where a Rust type uses fewer byte patterns than its machine representation
+allows — `bool` is the supported case — the generated harness restricts the
+input's domain and the report names the restriction separately from the
+developer's own assumptions. Without that the analyzer would reason about
+states the compiled program can never be in, and the reported input domain
+would not be the domain that was searched.
 
 Everything outside those words is unestablished. In particular it does **not**
 rule out:

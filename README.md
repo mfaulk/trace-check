@@ -340,6 +340,7 @@ cargo trace-check verify --contract crypto::tag::verify_tag \
   --manifest-path crypto/Cargo.toml
 cargo trace-check verify --all-contracts --manifest-path crypto/Cargo.toml
 cargo trace-check verify --all-contracts --format json
+cargo trace-check verify --all-contracts --artifact-dir ./evidence
 ```
 
 This is the form that analyzes **your** code. You keep one implementation,
@@ -408,6 +409,20 @@ Input domain:
 Result: VERIFIED_BOUNDED
 ```
 
+Generated harnesses and the executables built from them live in a private
+directory created for the run and removed afterwards — a result is pinned to its
+artifact's **hash**, not to a path, and every report says whether the path it
+records still exists. Pass `--artifact-dir DIR` to keep the evidence bundle;
+each run still gets its own freshly created directory inside `DIR`.
+
+If your library is `no_std` and carries no dynamic tests, annotate with
+`#[constant_time(secret = "key", dynamic = false)]`. That drops the
+`#[cfg(test)]` adapter M3 uses — the part that needs `trace-check-test` and
+`std` — so `cargo test` still compiles with the macro crate as your only
+dependency. It is opt-out rather than opt-in on purpose: a contract without the
+adapter also disappears from `cargo trace-check test`'s coverage accounting, and
+that should take a deliberate keystroke.
+
 **What this is and is not.** The *function* analyzed is compiled from the single
 definition in your library — change its body and the verdict changes, which is
 the project's standing regression for this claim. Its *surroundings* are not
@@ -420,7 +435,10 @@ report states all of this, and never claims a production binary was analyzed.
 
 Supported signatures are deliberately narrow: `u8`/`u16`/`u32`/`u64`,
 `[u8; N]` and `&[u8; N]` with a **literal** `N`, and `bool` for a public
-parameter; return types are scalars or `bool`. Anything else is an actionable
+parameter; return types are scalars or `bool`. A `bool` input gets a *generated*
+domain restriction, reported alongside your own assumptions and kept separate
+from them — BINSEC reasons about machine bytes, and a symbolic byte has 256
+values where Rust's `bool` has two. Anything else is an actionable
 error naming the parameter and its type — including `&[u8; TAG_LEN]`, because a
 proc macro sees the token `TAG_LEN`, not its value, and a guessed width marked
 into the analysis would make a verified result meaningless. See

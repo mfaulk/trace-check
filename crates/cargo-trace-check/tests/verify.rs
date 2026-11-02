@@ -468,6 +468,28 @@ fn all_contracts_verify_and_emit_json() {
     let contracts = report["contracts"].as_array().expect("contracts");
     assert!(contracts.len() >= 8, "only {} contracts", contracts.len());
     assert_eq!(report["summary"]["expectations_reproduced"], true);
+    // Report-level provenance names the analyzer and nothing it analyzed:
+    // there is one executable per contract.
+    let analyzer = report["analyzer"].as_object().expect("an analyzer object");
+    assert!(analyzer["analyzer_image"]
+        .as_str()
+        .unwrap()
+        .contains("@sha256:"));
+    for forbidden in ["artifact_sha256", "artifact_path", "build_flags"] {
+        assert!(!analyzer.contains_key(forbidden), "{analyzer:?}");
+    }
+    let mut artifacts: Vec<&str> = contracts
+        .iter()
+        .map(|entry| entry["artifact"]["sha256"].as_str().expect("a hash"))
+        .collect();
+    artifacts.sort_unstable();
+    let distinct = artifacts.len();
+    artifacts.dedup();
+    assert_eq!(
+        artifacts.len(),
+        distinct,
+        "two contracts share one artifact"
+    );
     for entry in contracts {
         assert!(entry["symbol"]["reached"].as_bool().unwrap_or(false));
         assert_eq!(entry["artifact"]["sha256"].as_str().unwrap().len(), 64);
@@ -583,6 +605,115 @@ fn library_flags_without_a_contract_are_refused() {
         "stderr:\n{}",
         run.stderr
     );
+}
+
+/// A misspelled contract name is reported as a misspelled contract name even
+/// when the analyzer backend is unreachable.
+///
+/// The regression from review. Selection used to be validated after the
+/// container backend was prepared, so in CI's ordinary job — which has no
+/// analyzer image — this reported "cannot obtain the analyzer image" and the
+/// test failed. `PATH` is emptied here so *no* backend, and no Cargo, can be
+/// found: argument validation must not depend on either.
+#[test]
+fn a_selection_error_is_reported_without_any_backend() {
+    let empty = tempfile::tempdir().expect("temp dir");
+    let run = {
+        let output = Command::new(cli())
+            .arg("verify")
+            .args(["--contract", "crypto::tag::no_such_function"])
+            .args(["--manifest-path", &crypto_manifest()])
+            .env("PATH", empty.path())
+            .output()
+            .expect("the CLI runs");
+        Run {
+            code: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }
+    };
+    assert_eq!(run.code, 2, "stdout:\n{}", run.stdout);
+    assert!(
+        run.stderr.contains("no_such_function"),
+        "stderr:\n{}",
+        run.stderr
+    );
+    assert!(
+        !run.stderr.contains("analyzer image") && !run.stderr.contains("podman"),
+        "a selection error must not be masked by a missing backend:\n{}",
+        run.stderr
+    );
+
+    // The same hostile environment with a *valid* contract must fail on the
+    // missing backend, which is what shows the environment really was hostile
+    // and the assertion above was not vacuous.
+    let valid = {
+        let output = Command::new(cli())
+            .arg("verify")
+            .args(["--contract", "crypto::tag::verify_tag"])
+            .args(["--manifest-path", &crypto_manifest()])
+            .env("PATH", empty.path())
+            .output()
+            .expect("the CLI runs");
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+    assert!(
+        valid.contains("cargo") || valid.contains("podman") || valid.contains("docker"),
+        "expected a tooling failure in an empty PATH, got:\n{valid}"
+    );
+}
+
+/// `--artifact-dir` keeps the evidence bundle, and the report says the recorded
+/// path is one that still exists.
+#[test]
+fn artifact_dir_retains_the_analyzed_executable() {
+    if !analyzer_available() {
+        return;
+    }
+    let kept = tempfile::tempdir().expect("temp dir");
+    let run = verify_contracts(&[
+        "--contract",
+        "crypto::lookup::substitute",
+        "--manifest-path",
+        &crypto_manifest(),
+        "--artifact-dir",
+        &kept.path().display().to_string(),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(run.code, 0, "stderr:\n{}", run.stderr);
+    let report: serde_json::Value = serde_json::from_str(&run.stdout).expect("valid JSON");
+    let artifact = &report["contracts"][0]["artifact"];
+    assert_eq!(artifact["path_retained"], true);
+    let path = Path::new(artifact["path"].as_str().expect("a path"));
+    assert!(path.is_file(), "{} should still exist", path.display());
+    // Inside a freshly created run directory, not at the directory the caller
+    // named: nothing pre-existing there can be written through.
+    assert!(path.starts_with(kept.path()));
+    assert_ne!(path.parent(), Some(kept.path()));
+}
+
+/// Without `--artifact-dir` the analyzed executable does not outlive the run,
+/// and the report states that rather than leaving a dangling path.
+#[test]
+fn the_default_run_leaves_no_artifact_behind() {
+    if !analyzer_available() {
+        return;
+    }
+    let run = verify_contracts(&[
+        "--contract",
+        "crypto::lookup::substitute",
+        "--manifest-path",
+        &crypto_manifest(),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(run.code, 0, "stderr:\n{}", run.stderr);
+    let report: serde_json::Value = serde_json::from_str(&run.stdout).expect("valid JSON");
+    let artifact = &report["contracts"][0]["artifact"];
+    assert_eq!(artifact["path_retained"], false);
+    assert!(!Path::new(artifact["path"].as_str().expect("a path")).exists());
+    assert_eq!(artifact["sha256"].as_str().expect("a hash").len(), 64);
 }
 
 /// M4's standalone cases keep working beside contract verification: the two

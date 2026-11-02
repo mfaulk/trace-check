@@ -394,6 +394,31 @@ impl VerifyConfig {
         self.verify.get(contract)
     }
 
+    /// Rejects a selection this configuration cannot describe.
+    ///
+    /// Deliberately decidable from the configuration and the command line
+    /// alone — no Cargo, no compiler, no analyzer. A selection error used to
+    /// surface *after* the container backend was prepared, so on a machine
+    /// without the analyzer image an unknown contract name reported a missing
+    /// image instead of the typo. Argument validation must not depend on a
+    /// heavyweight backend.
+    pub fn require_configured(&self, contracts: &[String]) -> Result<(), ContractError> {
+        if contracts.is_empty() {
+            return Err(ContractError::NothingSelected {
+                available: self.contracts().iter().map(|c| c.to_string()).collect(),
+            });
+        }
+        for contract in contracts {
+            if !self.verify.contains_key(contract) {
+                return Err(ContractError::NotConfigured {
+                    contract: contract.clone(),
+                    available: self.contracts().iter().map(|c| c.to_string()).collect(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Every configured contract, in a stable order.
     pub fn contracts(&self) -> Vec<&str> {
         self.verify.keys().map(String::as_str).collect()
@@ -528,6 +553,10 @@ pub enum ContractError {
         contract: String,
         available: Vec<String>,
     },
+    /// No contract was selected at all.
+    NothingSelected {
+        available: Vec<String>,
+    },
     /// The library has no such contract, or it is not reachable from outside.
     NotAnnotated {
         contract: String,
@@ -575,6 +604,16 @@ impl fmt::Display for ContractError {
             } => write!(
                 f,
                 "no [verify.\"{contract}\"] section in {CONFIG_FILE}; configured contracts: {}",
+                if available.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    available.join(", ")
+                }
+            ),
+            ContractError::NothingSelected { available } => write!(
+                f,
+                "no contracts selected; pass --contract <identity> or --all-contracts. \
+                 {CONFIG_FILE} configures: {}",
                 if available.is_empty() {
                     "(none)".to_string()
                 } else {
@@ -888,6 +927,52 @@ max_dpeth = 2000
             error,
             ContractError::ConfigSchema { found: 99, .. }
         ));
+    }
+
+    /// A selection is checked against the configuration alone: no Cargo, no
+    /// compiler, no container runtime.
+    ///
+    /// This is the ordering regression. Selection used to be validated inside
+    /// the per-contract loop, *after* the analyzer backend was prepared, so on
+    /// a machine without the analyzer image a misspelled contract name reported
+    /// a missing image instead of the typo — and the CLI test covering the typo
+    /// failed in the CI job that has no image.
+    #[test]
+    fn a_selection_is_validated_without_any_backend() {
+        let text = r#"
+schema_version = 1
+
+[verify."crypto::tag::verify_tag"]
+max_depth = 10
+checks = ["control-flow"]
+expected_outcome = "VERIFIED_BOUNDED"
+"#;
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join(CONFIG_FILE);
+        std::fs::write(&path, text).expect("written");
+        let config = VerifyConfig::load(&path).expect("valid");
+
+        config
+            .require_configured(&["crypto::tag::verify_tag".to_string()])
+            .expect("a configured contract is accepted");
+
+        let error = config
+            .require_configured(&["crypto::tag::verify_tga".to_string()])
+            .expect_err("a typo is refused");
+        let message = error.to_string();
+        assert!(message.contains("verify_tga"), "{message}");
+        assert!(
+            message.contains("crypto::tag::verify_tag"),
+            "the message must list what is configured: {message}"
+        );
+        // Nothing in the message mentions a backend, because none was touched.
+        assert!(!message.contains("analyzer"), "{message}");
+        assert!(!message.contains("image"), "{message}");
+
+        let error = config
+            .require_configured(&[])
+            .expect_err("an empty selection is refused");
+        assert!(error.to_string().contains("--all-contracts"), "{error}");
     }
 
     /// A contract's generated item paths are derived from its module, so a
