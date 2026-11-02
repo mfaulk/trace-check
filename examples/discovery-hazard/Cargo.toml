@@ -1,0 +1,21 @@
+[package]
+name = "discovery-hazard"
+description = "Deliberate hazards for trace-check's discovery and coverage regression tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Excluded from the workspace on purpose. Its ordinary unit test fails by
+# design, so it must never be picked up by `cargo test --workspace`. The
+# regression tests drive it through --manifest-path instead.
+[workspace]
+
+[dependencies]
+trace-check-test = { path = "../../crates/trace-check-test" }
+
+[profile.memcheck]
+inherits = "release"
+opt-level = 3
+debug = true
+strip = false
+panic = "unwind"

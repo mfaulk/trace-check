@@ -324,13 +324,18 @@ fn repeated_findings_are_collapsed_in_text_output() {
     );
 }
 
-/// Plain `cargo test` works without Valgrind and never reports a successful
-/// security check — it says the checks were skipped.
+/// Plain `cargo test` works without Valgrind and never reports a constant-time
+/// check as a passing test.
+///
+/// The checks are `#[ignore]`d, so libtest reports them as `ignored` with the
+/// reason attached. An earlier design printed a skip notice from a passing
+/// test, which libtest's output capture hid — leaving a green test for a
+/// security assertion that never ran.
 #[test]
-fn plain_cargo_test_skips_without_claiming_success() {
+fn plain_cargo_test_reports_checks_as_ignored() {
     let output = Command::new("cargo")
         .current_dir(consumer_dir())
-        .args(["test", "--", "--nocapture"])
+        .arg("test")
         .output()
         .expect("cargo test runs");
     assert!(
@@ -339,67 +344,23 @@ fn plain_cargo_test_skips_without_claiming_success() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
+
     assert!(
-        stdout.contains("SKIPPED constant-time check"),
-        "the skip notice must be visible:\n{stdout}"
+        stdout.contains("ignored, trace-check constant-time check"),
+        "the checks should be reported as ignored with a reason:\n{stdout}"
     );
     assert!(
-        stdout.contains("cargo trace-check test"),
-        "the notice should name the real command"
+        stdout.contains("run `cargo trace-check test`"),
+        "the reason should name the real command:\n{stdout}"
     );
     assert!(
         !stdout.contains("NO_LEAK_OBSERVED"),
-        "an uninstrumented run must not report a security outcome"
+        "an uninstrumented run must not report a security outcome:\n{stdout}"
     );
-}
 
-/// A `#[constant_time]` function with no `ct_test` covering it is reported as
-/// `untested` and fails the run.
-///
-/// This is the requirement that keeps an annotation from implying verification
-/// it does not have. The consumer gates such a contract behind a feature so it
-/// can be demonstrated without making every other run fail.
-#[test]
-fn an_untested_contract_fails_the_run() {
-    if !valgrind_available() {
-        return;
-    }
-    let result = run(&[
-        "test",
-        "--features",
-        "untested-contract",
-        "--filter",
-        "verify_tag_is_constant_time",
-        "--format",
-        "json",
-    ]);
-    let value = result.json();
-
-    let contracts = value["contracts"].as_array().expect("contracts");
-    let orphan = contracts
-        .iter()
-        .find(|contract| contract["function"] == "unverified_mix")
-        .unwrap_or_else(|| {
-            panic!("the feature-gated contract should be discovered: {contracts:?}")
-        });
-    assert_eq!(orphan["coverage"], "untested");
-    assert_eq!(orphan["secrets"][0], "key");
-
-    // The covered contract is still reported as covered, so one orphan does not
-    // taint the others.
-    let covered = contracts
-        .iter()
-        .find(|contract| contract["function"] == "verify_tag")
-        .expect("the covered contract");
-    assert_eq!(covered["coverage"], "covered");
-
-    assert_eq!(value["summary"]["ok"], false);
-    assert!(value["summary"]["blocking_reasons"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|reason| reason.as_str().unwrap_or_default().contains("untested")));
-
-    // No leak was selected, so the failure is an incomplete analysis: exit 2.
-    assert_eq!(result.code, 2, "an untested contract must exit 2");
+    // The ordinary unit test still runs; only the checks are ignored.
+    assert!(
+        stdout.contains("both_lookups_agree_for_every_secret ... ok"),
+        "ordinary tests should be unaffected:\n{stdout}"
+    );
 }

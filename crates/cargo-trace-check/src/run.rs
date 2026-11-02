@@ -28,6 +28,26 @@ use crate::discover::TestRecord;
 /// `trace_check_test::calibration::PROBE_SYMBOL`.
 pub const PROBE_SYMBOL: &str = "secret_dependent_probe";
 
+/// Printed by a generated check as its last act. Structured, tool-controlled
+/// evidence that the check ran to completion.
+pub const EXECUTED_MARKER: &str = "trace-check-executed:";
+
+/// Printed by a generated check whose declared contract was actually invoked
+/// through its adapter.
+pub const INVOKED_MARKER: &str = "trace-check-invoked:";
+
+/// Whether `stdout` carries `marker` followed by exactly `value`.
+///
+/// Matching the full identity rather than a substring keeps one test's marker
+/// from being credited to another.
+fn emitted_marker(stdout: &str, marker: &str, value: &str) -> bool {
+    stdout.lines().any(|line| {
+        line.find(marker)
+            .map(|start| line[start + marker.len()..].trim() == value)
+            .unwrap_or(false)
+    })
+}
+
 /// Whether the positive control fired in a given run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -99,6 +119,9 @@ pub struct TestOutcome {
     pub executable_sha256: String,
     pub outcome: Outcome,
     pub calibration: Calibration,
+    /// Whether the declared contract's function was proven to have been
+    /// invoked. False when no contract is declared.
+    pub invoked_target: bool,
     pub message: String,
     pub findings: Vec<Finding>,
     /// Diagnostics that are not secret dependency. Retained, never dropped.
@@ -118,6 +141,9 @@ pub fn run_test(
     limits: Limits,
 ) -> Result<TestOutcome, NativeError> {
     let args = vec![
+        // Generated checks are #[ignore]d so plain `cargo test` cannot report
+        // an unrun check as passing; the runner opts in explicitly.
+        "--include-ignored".to_string(),
         "--exact".to_string(),
         record.name.clone(),
         "--nocapture".to_string(),
@@ -141,6 +167,7 @@ pub fn run_test(
         executable_sha256: record.executable_sha256.clone(),
         outcome,
         calibration,
+        invoked_target: false,
         message,
         findings: Vec::new(),
         other_diagnostics: Vec::new(),
@@ -182,18 +209,44 @@ pub fn run_test(
 
     // Did the test actually execute? `--exact` on a name that no longer exists
     // runs zero tests and still exits 0, which must not read as a pass.
-    // libtest prints `test result: ok. 1 passed; …` for a single match.
-    if !output.stdout.contains("1 passed") {
-        return Ok(base(
-            Outcome::Inconclusive,
-            Calibration::NotRun,
+    //
+    // The evidence is a marker the generated test prints as its last act, not a
+    // substring of libtest's summary: counting on `"1 passed"` would match
+    // arbitrary output from the test binary itself.
+    if !emitted_marker(&output.stdout, EXECUTED_MARKER, &record.id) {
+        // Distinguish "the test failed" from "the test never ran". Valgrind's
+        // --error-exitcode masks libtest's own 101, because the calibration
+        // probe always produces a diagnostic, so the exit code cannot tell
+        // these apart and the harness output has to.
+        let failed =
+            output.stdout.contains("test result: FAILED") || output.stdout.contains("1 failed");
+        let message = if failed {
             format!(
-                "the harness reported no executed test for `{}`; it may have been renamed \
-                 or filtered out",
-                record.name
-            ),
-        ));
+                "the test `{}` failed before completing its constant-time check, so no \
+                 security conclusion can be drawn: {}",
+                record.id,
+                // Under --nocapture the panic goes to stderr, not stdout.
+                panic_detail(&output.stderr)
+                    .or_else(|| panic_detail(&output.stdout))
+                    .unwrap_or_else(|| first_lines(&output.stderr, 4))
+            )
+        } else {
+            format!(
+                "the test `{}` did not report completing its constant-time check; it may have \
+                 been renamed, filtered out, or returned early",
+                record.id
+            )
+        };
+        return Ok(base(Outcome::Inconclusive, Calibration::NotRun, message));
     }
+
+    // When a contract is declared, the generated test also proves it invoked
+    // the contract's function through its adapter. Without this a test could
+    // claim a target it never exercised.
+    let invoked = match &record.target {
+        Some(target) => emitted_marker(&output.stdout, INVOKED_MARKER, target),
+        None => false,
+    };
 
     let run = match memcheck::parse(&output.xml) {
         Ok(run) => run,
@@ -234,6 +287,7 @@ pub fn run_test(
         .collect();
 
     let mut result = base(Outcome::Inconclusive, calibration, String::new());
+    result.invoked_target = invoked;
     result.findings = secret_findings;
     result.other_diagnostics = other;
 
@@ -303,6 +357,21 @@ pub fn run_test(
                       test exercised; this is not proof of constant-time behavior"
         .to_string();
     Ok(result)
+}
+
+/// Pulls the assertion message out of a libtest panic report, which is what a
+/// developer actually needs to see.
+fn panic_detail(stdout: &str) -> Option<String> {
+    let start = stdout.find("panicked at")?;
+    let detail: String = stdout[start..]
+        .lines()
+        .skip(1)
+        .take(4)
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("note:"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!detail.is_empty()).then_some(detail)
 }
 
 fn first_lines(text: &str, count: usize) -> String {
@@ -410,6 +479,28 @@ mod tests {
     #[test]
     fn probe_symbol_matches_the_test_library() {
         assert_eq!(PROBE_SYMBOL, "secret_dependent_probe");
+    }
+
+    /// A panicking test's assertion message is surfaced, since that is what a
+    /// developer needs in order to fix it.
+    #[test]
+    fn panic_detail_is_extracted() {
+        let stdout = "\
+test tests::my_check ... FAILED
+
+thread 'tests::my_check' panicked at src/lib.rs:80:9:
+trace-check: this test declares `target = \"never_invoked\"` but never invoked it
+note: run with `RUST_BACKTRACE=1` for a backtrace
+";
+        let detail = panic_detail(stdout).expect("a panic message is present");
+        assert!(detail.contains("never invoked it"), "{detail}");
+        assert!(!detail.contains("RUST_BACKTRACE"), "notes are dropped");
+    }
+
+    /// Output with no panic yields no detail, so the caller falls back.
+    #[test]
+    fn panic_detail_is_absent_when_nothing_panicked() {
+        assert_eq!(panic_detail("test result: ok. 1 passed"), None);
     }
 
     /// Diagnostic text is truncated to a few lines so a panicking test does not

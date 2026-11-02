@@ -75,7 +75,8 @@ cargo trace-check list                          # what would run
 Each check runs in its own process, and each one first runs a **positive
 control** that proves secret marking actually reaches compiled code — without
 it, a clean result would mean nothing. Plain `cargo test` keeps working without
-Valgrind: it passes and prints that the checks were *skipped*.
+Valgrind: the checks are `#[ignore]`d, so libtest reports them as `ignored` with
+the reason, never as passing tests.
 
 Secrets are passed **by value** so the optimizer cannot fold past the marked
 storage. Supported: `secret = value` for `[u8; N]` and integer scalars,
@@ -84,8 +85,12 @@ and `String` are rejected at compile time, because marking a `Vec` would mark
 its pointer, length and capacity and none of the heap data.
 
 `#[constant_time(secret = "expected")]` declares a contract on a function. It
-emits the function verbatim — no production behavior change — and the runner
-reports a contract with no covering test as `untested` rather than as verified.
+emits the function verbatim — no production behavior change — plus, under
+`#[cfg(test)]`, an invocation counter and a `<function>_ct` adapter. Tests call
+the adapter, so a contract is reported `covered` only when a test both ran clean
+and **proved it invoked the function**; one that merely names a target fails.
+Contracts are identified by module-qualified path, so two modules may each
+define `verify` without one shadowing the other.
 
 Start from [`examples/consumer-crate`](examples/consumer-crate/README.md), which
 demonstrates clean cases, detected branch and address leaks, and an untested

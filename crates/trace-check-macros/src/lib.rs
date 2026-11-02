@@ -1,9 +1,28 @@
 //! Attribute macros for constant-time contracts and tests.
 //!
-//! Both macros are deliberately thin. `#[ct_test]` wraps a test body in mode
-//! dispatch; `#[constant_time]` emits its function **byte-for-byte unchanged**
-//! and adds test-only metadata. Neither performs analysis — that is the
-//! runner's job — and neither may change production behavior.
+//! Both macros are deliberately thin. Neither performs analysis — that is the
+//! runner's job — and `#[constant_time]` never alters the compiled body of the
+//! function it annotates.
+//!
+//! # Three properties the generated code is responsible for
+//!
+//! **Discovery must not execute ordinary tests.** Metadata is emitted by
+//! *separate* generated tests whose names begin with `__trace_check_`, so the
+//! runner can enumerate with libtest's `--list` and then execute only those.
+//! An earlier design ran every test in "list mode", which executed the
+//! consumer's whole unit-test suite during discovery.
+//!
+//! **An unrun check must not look like a passing test.** Generated tests carry
+//! `#[ignore]`, so plain `cargo test` reports them as `ignored` rather than
+//! `ok`. A developer must not see a green test for a security assertion that
+//! never ran.
+//!
+//! **A contract is only covered if its function was actually invoked.** A
+//! `target` is not a mere label: `#[constant_time]` emits a `#[cfg(test)]`
+//! counter and an `#[inline(never)]` adapter, and `#[ct_test(target = …)]`
+//! fails unless that counter advanced during the analyzed call. The adapter
+//! delegates to the untouched function, so the code being analyzed is the real
+//! one.
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
@@ -11,7 +30,7 @@ use syn::{
     parse::{Parse, ParseStream},
     parse_macro_input,
     punctuated::Punctuated,
-    Expr, ExprLit, FnArg, Ident, ItemFn, Lit, Meta, Pat, Token,
+    Expr, ExprLit, FnArg, Ident, ItemFn, Lit, Meta, Pat, ReturnType, Token, Type,
 };
 
 /// Declares that a function must execute in constant time with respect to the
@@ -22,12 +41,19 @@ use syn::{
 /// pub fn verify_tag(expected: &[u8; 32], supplied: &[u8; 32]) -> bool { … }
 /// ```
 ///
-/// The function is emitted unchanged. A `#[cfg(test)]` metadata test is added
-/// so the contract is discoverable even with no `ct_test` covering it, which is
-/// what makes an untested contract reportable.
+/// Emits three things:
 ///
-/// Parameter names are checked against the signature at compile time, so a typo
-/// is an error rather than a contract that silently covers nothing.
+/// * the function **verbatim** — no wrapper, no instrumentation, so production
+///   behavior is untouched;
+/// * under `#[cfg(test)]`, a call counter and an `#[inline(never)]` adapter
+///   named `<function>_ct` with the same signature, which counts and delegates.
+///   Tests call the adapter so invocation can be proven; the analyzed
+///   function's own compiled code is unchanged;
+/// * under `#[cfg(test)]`, a metadata test declaring the contract, so a
+///   contract with no covering test is still discoverable.
+///
+/// Parameter names are validated against the signature at compile time, so a
+/// typo is an error rather than a contract that silently covers nothing.
 #[proc_macro_attribute]
 pub fn constant_time(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as SecretArgs);
@@ -69,25 +95,56 @@ pub fn constant_time(attr: TokenStream, item: TokenStream) -> TokenStream {
     let name = function.sig.ident.clone();
     let name_literal = name.to_string();
     let secrets = args.secrets.clone();
+    let visibility = function.vis.clone();
+
+    let counter = counter_ident(&name_literal);
+    let adapter = adapter_ident(&name_literal);
     let meta_fn = format_ident!("__trace_check_contract_{}", name);
 
-    // The function is reproduced verbatim: no wrapper, no instrumentation, and
-    // therefore no way for the annotation to alter production behavior.
+    // Rebuild the signature so the adapter can delegate with the same
+    // arguments. Only simple ident patterns reach here; the signature check
+    // above rejects everything else.
+    let (arg_decls, arg_names) = match adapter_arguments(&function) {
+        Ok(parts) => parts,
+        Err(error) => return error.to_compile_error().into(),
+    };
+    let return_type = match &function.sig.output {
+        ReturnType::Default => quote! {},
+        ReturnType::Type(arrow, ty) => quote! { #arrow #ty },
+    };
+
     quote! {
         #function
 
+        /// Counts invocations made through the contract adapter. Test-only.
+        #[cfg(test)]
+        #[allow(non_upper_case_globals)]
+        #visibility static #counter: ::std::sync::atomic::AtomicU64 =
+            ::std::sync::atomic::AtomicU64::new(0);
+
+        /// Contract adapter: counts the call and delegates to the untouched
+        /// function. `#[inline(never)]` keeps it a separate frame so it cannot
+        /// perturb the analysis of the function itself.
+        #[cfg(test)]
+        #[inline(never)]
+        #[allow(non_snake_case)]
+        #visibility fn #adapter( #( #arg_decls ),* ) #return_type {
+            #counter.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+            #name( #( #arg_names ),* )
+        }
+
         #[cfg(test)]
         #[test]
+        #[ignore = "trace-check contract metadata; run `cargo trace-check test`"]
         #[allow(non_snake_case)]
         fn #meta_fn() {
-            if ::trace_check_test::Mode::from_env() == ::trace_check_test::Mode::List {
-                ::trace_check_test::meta::emit_contract(
-                    #name_literal,
-                    &[ #( #secrets ),* ],
-                    file!(),
-                    line!(),
-                );
-            }
+            ::trace_check_test::meta::emit_contract(
+                &::trace_check_test::meta::qualified(module_path!(), #name_literal),
+                #name_literal,
+                &[ #( #secrets ),* ],
+                file!(),
+                line!(),
+            );
         }
     }
     .into()
@@ -100,12 +157,18 @@ pub fn constant_time(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// fn tag_compare_is_constant_time() { … }
 ///
 /// #[ct_test(target = "verify_tag")]
-/// fn covers_the_contract() { … }
+/// fn covers_the_contract() {
+///     // must call the generated adapter `verify_tag_ct`, not `verify_tag`
+/// }
 /// ```
 ///
-/// Expands to an ordinary `#[test]` whose body runs only under the instrumented
-/// runner. Plain `cargo test` prints a skip notice and passes, so a developer
-/// without Valgrind is not blocked — but the notice says the check did not run.
+/// Expands to an `#[ignore]`d `#[test]` whose body runs only under the
+/// instrumented runner, plus a separate metadata test for discovery.
+///
+/// With `target`, the generated code requires the contract's call counter to
+/// advance during the test. Calling the raw function instead of its `_ct`
+/// adapter leaves the counter at zero and fails the test, so a contract cannot
+/// be reported as covered by a test that never exercised it.
 #[proc_macro_attribute]
 pub fn ct_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as TestArgs);
@@ -132,38 +195,180 @@ pub fn ct_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let name_literal = name.to_string();
     let body = function.block.clone();
     let attrs = function.attrs.clone();
-    let target = match &args.target {
-        Some(target) => quote! { Some(#target) },
-        None => quote! { None },
+    let meta_fn = format_ident!("__trace_check_meta_{}", name);
+
+    let (target_meta, before, after) = match &args.target {
+        Some(target) => {
+            // A target may be a path (`authentication::verify`), so the
+            // generated item names are built per segment rather than by
+            // pasting the whole string into one identifier.
+            let Some(parts) = TargetPaths::parse(target) else {
+                return syn::Error::new(
+                    proc_macro2::Span::call_site(),
+                    format!(
+                        "`target = \"{target}\"` is not a function path; expected something \
+                         like \"verify_tag\" or \"module::verify_tag\""
+                    ),
+                )
+                .to_compile_error()
+                .into();
+            };
+            let counter = parts.counter;
+            let adapter = parts.adapter;
+            let target_ident = parts.function;
+            (
+                quote! { Some(#target) },
+                quote! {
+                    // Proves the contract's function and its adapter are in
+                    // scope: a typo in `target` is a compile error, not a
+                    // contract that silently covers nothing.
+                    let _ = &#target_ident;
+                    let _ = &#adapter;
+                    let __trace_check_calls_before =
+                        #counter.load(::std::sync::atomic::Ordering::Relaxed);
+                },
+                quote! {
+                    let __trace_check_calls_after =
+                        #counter.load(::std::sync::atomic::Ordering::Relaxed);
+                    assert!(
+                        __trace_check_calls_after > __trace_check_calls_before,
+                        concat!(
+                            "trace-check: this test declares `target = \"", #target,
+                            "\"` but never invoked it through the contract adapter `",
+                            stringify!(#adapter),
+                            "`. A contract must not be reported as covered by a test that \
+                             did not exercise it. Call `",
+                            stringify!(#adapter),
+                            "(..)` inside `assert_constant_time!`."
+                        )
+                    );
+                    // Tool-controlled evidence that the contract was exercised.
+                    // The bare target name, matching what the metadata record
+                    // declares, so the runner compares like with like.
+                    println!("trace-check-invoked: {}", #target);
+                },
+            )
+        }
+        None => (quote! { None }, quote! {}, quote! {}),
     };
 
     quote! {
         #( #attrs )*
         #[test]
+        #[ignore = "trace-check constant-time check; run `cargo trace-check test`"]
         fn #name() {
-            match ::trace_check_test::Mode::from_env() {
-                ::trace_check_test::Mode::Skip => {
-                    ::trace_check_test::print_skip_notice(
-                        concat!(module_path!(), "::", #name_literal),
-                    );
-                }
-                ::trace_check_test::Mode::List => {
-                    ::trace_check_test::meta::emit_test(
-                        &::trace_check_test::meta::harness_path(module_path!(), #name_literal),
-                        #target,
-                        &[],
-                    );
-                }
-                ::trace_check_test::Mode::Run => {
-                    ::trace_check_test::require_instrumentation(
-                        concat!(module_path!(), "::", #name_literal),
-                    );
-                    #body
-                }
-            }
+            // Reached only under the instrumented runner. Plain `cargo test`
+            // reports this test as `ignored`, never as `ok`.
+            ::trace_check_test::require_run_mode(
+                &::trace_check_test::meta::qualified(module_path!(), #name_literal),
+            );
+            #before
+            #body
+            #after
+            // The runner requires this marker, so it cannot mistake a filtered
+            // or renamed test for an executed one.
+            println!(
+                "trace-check-executed: {}",
+                ::trace_check_test::meta::qualified(module_path!(), #name_literal),
+            );
+        }
+
+        #[cfg(test)]
+        #[test]
+        #[ignore = "trace-check test metadata; run `cargo trace-check test`"]
+        #[allow(non_snake_case)]
+        fn #meta_fn() {
+            ::trace_check_test::meta::emit_test(
+                &::trace_check_test::meta::harness_path(module_path!(), #name_literal),
+                &::trace_check_test::meta::qualified(module_path!(), #name_literal),
+                #target_meta,
+            );
         }
     }
     .into()
+}
+
+/// Name of the generated invocation counter for a contract.
+fn counter_ident(function: &str) -> Ident {
+    format_ident!("__TRACE_CHECK_CALLS_{}", function)
+}
+
+/// Name of the generated contract adapter: `verify_tag` -> `verify_tag_ct`.
+fn adapter_ident(function: &str) -> Ident {
+    format_ident!("{}_ct", function)
+}
+
+/// The three paths a `target` refers to, with any module prefix preserved.
+struct TargetPaths {
+    function: proc_macro2::TokenStream,
+    adapter: proc_macro2::TokenStream,
+    counter: proc_macro2::TokenStream,
+}
+
+impl TargetPaths {
+    /// Splits `module::path::function` into the generated item paths, or
+    /// returns `None` when a segment is not a valid identifier.
+    fn parse(target: &str) -> Option<TargetPaths> {
+        let mut segments: Vec<&str> = target.split("::").map(str::trim).collect();
+        let name = segments.pop()?;
+        if name.is_empty() || !is_identifier(name) {
+            return None;
+        }
+        if segments.iter().any(|segment| !is_identifier(segment)) {
+            return None;
+        }
+        let prefix: Vec<Ident> = segments
+            .iter()
+            .map(|segment| format_ident!("{}", segment))
+            .collect();
+        let function = format_ident!("{}", name);
+        let adapter = adapter_ident(name);
+        let counter = counter_ident(name);
+        let lead = if prefix.is_empty() {
+            quote! {}
+        } else {
+            quote! { #( #prefix :: )* }
+        };
+        Some(TargetPaths {
+            function: quote! { #lead #function },
+            adapter: quote! { #lead #adapter },
+            counter: quote! { #lead #counter },
+        })
+    }
+}
+
+fn is_identifier(text: &str) -> bool {
+    !text.is_empty()
+        && !text.chars().next().is_some_and(|c| c.is_ascii_digit())
+        && text.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// Splits a signature into declarations and argument names for the adapter.
+fn adapter_arguments(
+    function: &ItemFn,
+) -> syn::Result<(Vec<proc_macro2::TokenStream>, Vec<Ident>)> {
+    let mut declarations = Vec::new();
+    let mut names = Vec::new();
+    for argument in &function.sig.inputs {
+        let FnArg::Typed(typed) = argument else {
+            return Err(syn::Error::new_spanned(
+                argument,
+                "`constant_time` supports only free functions in M3, not methods",
+            ));
+        };
+        let Pat::Ident(pattern) = &*typed.pat else {
+            return Err(syn::Error::new_spanned(
+                &typed.pat,
+                "`constant_time` needs plain parameter names so it can generate the contract \
+                 adapter; destructuring patterns are not supported in M3",
+            ));
+        };
+        let ident = pattern.ident.clone();
+        let ty: &Type = &typed.ty;
+        declarations.push(quote! { #ident: #ty });
+        names.push(ident);
+    }
+    Ok((declarations, names))
 }
 
 /// Rejects signatures M3 does not support, so an annotation never claims more
@@ -278,7 +483,3 @@ fn string_value(expr: &Expr) -> syn::Result<String> {
         )),
     }
 }
-
-/// Keeps `Ident` in scope for `format_ident!` without an unused import.
-#[allow(dead_code)]
-fn _ident_marker(_: Option<Ident>) {}

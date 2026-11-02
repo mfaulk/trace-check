@@ -5,16 +5,25 @@
 //!
 //! 1. `cargo test --no-run --message-format=json` reports every test executable
 //!    structurally, so paths are never guessed.
-//! 2. Each executable is run once with `TRACE_CHECK_MODE=list --nocapture`,
-//!    where generated tests print one `trace-check-meta:` line each.
+//! 2. `<exe> --list` **enumerates** the tests without running any of them.
+//! 3. Only the generated `__trace_check_*` metadata tests are then executed.
+//!
+//! Step 2 matters. An earlier version ran every test in a "list mode" that
+//! ordinary `#[test]` functions do not understand, so discovery executed the
+//! consumer's entire unit-test suite: side effects fired, an unrelated failure
+//! blocked discovery, and a hanging test could block it forever. Enumerating
+//! first and executing only our own generated tests fixes that, and the
+//! listing and metadata subprocesses are both bounded by a timeout.
 //!
 //! Contracts are emitted by `#[constant_time]` independently of any test, which
 //! is what makes an *untested* contract discoverable — the case that must never
 //! read as verified.
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -25,13 +34,22 @@ pub const PREFERRED_PROFILE: &str = "memcheck";
 /// Prefix generated tests print their metadata behind.
 const META_PREFIX: &str = "trace-check-meta:";
 
+/// Name prefix of every generated metadata test. Only these are executed
+/// during discovery.
+const GENERATED_PREFIX: &str = "__trace_check_";
+
+/// Bound on the listing and metadata subprocesses, so a pathological test
+/// binary cannot block discovery indefinitely.
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(120);
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TestRecord {
     /// Harness path, which is also what `--exact` accepts.
     pub name: String,
-    /// Contract this test declares it covers, if any.
+    /// Module-qualified identity, for reporting.
+    pub id: String,
+    /// Qualified contract this test declares it covers, if any.
     pub target: Option<String>,
-    pub secrets: Vec<String>,
     /// Executable the test lives in.
     pub executable: String,
     pub executable_sha256: String,
@@ -39,6 +57,9 @@ pub struct TestRecord {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ContractRecord {
+    /// Module-qualified identity. Two modules may each define `verify`, so the
+    /// bare name cannot identify a contract.
+    pub id: String,
     pub function: String,
     pub secrets: Vec<String>,
     pub file: String,
@@ -72,6 +93,15 @@ pub enum DiscoverError {
         line: String,
         reason: String,
     },
+    DuplicateContract {
+        id: String,
+        first: String,
+        second: String,
+    },
+    Timeout {
+        command: String,
+        limit: Duration,
+    },
     Io(String),
 }
 
@@ -99,6 +129,15 @@ impl std::fmt::Display for DiscoverError {
             DiscoverError::BadMeta { line, reason } => {
                 write!(f, "cannot parse discovery line {line:?}: {reason}")
             }
+            DiscoverError::DuplicateContract { id, first, second } => write!(
+                f,
+                "two contracts share the identity {id:?} ({first} and {second}); \
+                 trace-check refuses to guess which one a test covers"
+            ),
+            DiscoverError::Timeout { command, limit } => write!(
+                f,
+                "`{command}` exceeded the {limit:?} discovery timeout and was killed"
+            ),
             DiscoverError::Io(message) => write!(f, "{message}"),
         }
     }
@@ -207,39 +246,52 @@ fn cargo_build(
     Ok(binaries)
 }
 
-/// Runs each binary in `list` mode and collects the records it prints.
+/// Enumerates each binary, then executes only the generated metadata tests.
 ///
-/// Not under Valgrind: listing performs no analysis, so paying Memcheck's
-/// overhead for it would be waste.
+/// Ordinary `#[test]` functions are never executed: they are filtered out by
+/// name after `--list`, so their side effects do not fire, an unrelated failure
+/// cannot block discovery, and a slow or hanging one cannot delay it.
 pub fn discover(binaries: &[PathBuf], profile: &str) -> Result<Discovery, DiscoverError> {
     let mut tests = Vec::new();
     let mut contracts: BTreeMap<String, ContractRecord> = BTreeMap::new();
 
     for binary in binaries {
         let hash = sha256_of(binary)?;
-        let output = Command::new(binary)
-            .arg("--nocapture")
-            // `--test-threads=1` keeps the metadata lines from interleaving.
-            .arg("--test-threads=1")
-            .env("TRACE_CHECK_MODE", "list")
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|e| DiscoverError::Spawn {
-                command: binary.display().to_string(),
-                source: e.to_string(),
-            })?;
-        if !output.status.success() {
-            return Err(DiscoverError::ListFailed {
-                executable: binary.display().to_string(),
-                status: output
-                    .status
-                    .code()
-                    .map_or_else(|| "a signal".to_string(), |c| format!("exit code {c}")),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            });
+
+        // Step 1: enumerate without running anything.
+        let listed = bounded_output(
+            binary,
+            &[
+                "--list".to_string(),
+                "--format=terse".to_string(),
+                // Generated tests are #[ignore]d so plain `cargo test` cannot
+                // report an unrun check as passing; listing must include them.
+                "--include-ignored".to_string(),
+            ],
+            &[],
+        )?;
+        let generated: Vec<String> = listed
+            .lines()
+            .filter_map(parse_listing_line)
+            .filter(|name| is_generated(name))
+            .collect();
+        if generated.is_empty() {
+            continue;
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Step 2: execute only those, one subprocess per binary.
+        // `--exact` is a boolean flag that changes how filters match, not a
+        // repeatable argument: the names go after it as positionals. Repeating
+        // `--exact NAME` pairs silently selected only the first one.
+        let mut args = vec![
+            "--include-ignored".to_string(),
+            "--nocapture".to_string(),
+            "--test-threads=1".to_string(),
+            "--exact".to_string(),
+        ];
+        args.extend(generated.iter().cloned());
+        let stdout = bounded_output(binary, &args, &[])?;
+
         for line in stdout.lines() {
             // `--nocapture` interleaves test output with the harness's own
             // progress lines, so the record is not necessarily at line start.
@@ -255,22 +307,31 @@ pub fn discover(binaries: &[PathBuf], profile: &str) -> Result<Discovery, Discov
             match value["kind"].as_str() {
                 Some("test") => tests.push(TestRecord {
                     name: string_field(&value, "name", line)?,
+                    id: string_field(&value, "id", line)?,
                     target: value["target"].as_str().map(str::to_string),
-                    secrets: string_list(&value, "secrets"),
                     executable: binary.display().to_string(),
                     executable_sha256: hash.clone(),
                 }),
                 Some("contract") => {
-                    let function = string_field(&value, "function", line)?;
-                    contracts.insert(
-                        function.clone(),
-                        ContractRecord {
-                            function,
-                            secrets: string_list(&value, "secrets"),
-                            file: value["file"].as_str().unwrap_or_default().to_string(),
-                            line: value["line"].as_u64().unwrap_or_default() as u32,
-                        },
-                    );
+                    let id = string_field(&value, "id", line)?;
+                    let record = ContractRecord {
+                        function: string_field(&value, "function", line)?,
+                        secrets: string_list(&value, "secrets"),
+                        file: value["file"].as_str().unwrap_or_default().to_string(),
+                        line: value["line"].as_u64().unwrap_or_default() as u32,
+                        id: id.clone(),
+                    };
+                    // Qualified identities should already be unique. If two
+                    // collide, refuse rather than silently dropping one and
+                    // then claiming a test covered "the" contract.
+                    if let Some(existing) = contracts.get(&id) {
+                        return Err(DiscoverError::DuplicateContract {
+                            id,
+                            first: format!("{}:{}", existing.file, existing.line),
+                            second: format!("{}:{}", record.file, record.line),
+                        });
+                    }
+                    contracts.insert(id, record);
                 }
                 other => {
                     return Err(DiscoverError::BadMeta {
@@ -282,12 +343,101 @@ pub fn discover(binaries: &[PathBuf], profile: &str) -> Result<Discovery, Discov
         }
     }
 
-    tests.sort_by(|a, b| a.name.cmp(&b.name));
+    tests.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(Discovery {
         tests,
         contracts: contracts.into_values().collect(),
         profile: profile.to_string(),
     })
+}
+
+/// Whether a test name is one of our generated metadata tests.
+fn is_generated(name: &str) -> bool {
+    name.rsplit("::")
+        .next()
+        .is_some_and(|tail| tail.starts_with(GENERATED_PREFIX))
+}
+
+/// Extracts the test name from one `--format=terse` listing line.
+///
+/// A line is `path::to::test: test`. Splitting on `:` truncates at the first
+/// `::` and loses the module path, so the trailing `: <kind>` is stripped from
+/// the right instead.
+fn parse_listing_line(line: &str) -> Option<String> {
+    let line = line.trim();
+    let (name, kind) = line.rsplit_once(": ")?;
+    // Only test entries; `--list` also reports benchmarks.
+    (kind.trim() == "test").then(|| name.trim().to_string())
+}
+
+/// Runs a short-lived discovery subprocess with a wall-clock bound.
+fn bounded_output(
+    program: &Path,
+    args: &[String],
+    env: &[(String, String)],
+) -> Result<String, DiscoverError> {
+    let rendered = format!("{} {}", program.display(), args.join(" "));
+    let mut child = Command::new(program)
+        .args(args)
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| DiscoverError::Spawn {
+            command: rendered.clone(),
+            source: e.to_string(),
+        })?;
+
+    // Drain stdout on a thread so a full pipe cannot deadlock the wait below.
+    let mut pipe = child.stdout.take();
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(pipe) = pipe.as_mut() {
+            let _ = pipe.read_to_string(&mut text);
+        }
+        text
+    });
+
+    let deadline = Instant::now() + DISCOVERY_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(DiscoverError::Timeout {
+                        command: rendered,
+                        limit: DISCOVERY_TIMEOUT,
+                    });
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => {
+                return Err(DiscoverError::Spawn {
+                    command: rendered,
+                    source: e.to_string(),
+                })
+            }
+        }
+    };
+
+    let stdout = reader.join().unwrap_or_default();
+    let mut stderr = String::new();
+    if let Some(pipe) = child.stderr.as_mut() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    if !status.success() {
+        return Err(DiscoverError::ListFailed {
+            executable: rendered,
+            status: status
+                .code()
+                .map_or_else(|| "a signal".to_string(), |c| format!("exit code {c}")),
+            stderr: stderr.trim().to_string(),
+        });
+    }
+    Ok(stdout)
 }
 
 fn string_field(
@@ -370,6 +520,51 @@ mod tests {
     #[test]
     fn meta_prefix_matches_the_library() {
         assert_eq!(META_PREFIX, trace_check_test_meta_prefix());
+    }
+
+    /// Only generated metadata tests are selected from a listing; ordinary
+    /// tests are never executed during discovery.
+    #[test]
+    fn only_generated_tests_are_selected_from_a_listing() {
+        let listing = "\
+tests::ordinary_unit_test: test
+tests::__trace_check_meta_my_check: test
+__trace_check_contract_verify_tag: test
+tests::another_ordinary_test: test
+";
+        let generated: Vec<String> = listing
+            .lines()
+            .filter_map(parse_listing_line)
+            .filter(|name| is_generated(name))
+            .collect();
+        assert_eq!(
+            generated,
+            vec![
+                "tests::__trace_check_meta_my_check",
+                "__trace_check_contract_verify_tag"
+            ]
+        );
+        assert!(
+            !generated.iter().any(|name| name.contains("ordinary")),
+            "an ordinary test must never be executed during discovery"
+        );
+    }
+
+    /// A listing line keeps its full module path. Splitting on the first `:`
+    /// would truncate `tests::foo` to `tests` and discover nothing.
+    #[test]
+    fn listing_lines_keep_their_module_path() {
+        assert_eq!(
+            parse_listing_line("tests::inner::my_test: test").as_deref(),
+            Some("tests::inner::my_test")
+        );
+        assert_eq!(
+            parse_listing_line("bare_test: test").as_deref(),
+            Some("bare_test")
+        );
+        // Benchmarks and malformed lines are ignored.
+        assert_eq!(parse_listing_line("something: bench"), None);
+        assert_eq!(parse_listing_line(""), None);
     }
 
     /// A record is found even when the harness has prefixed the line with its

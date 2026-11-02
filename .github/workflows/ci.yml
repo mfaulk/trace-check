@@ -103,6 +103,19 @@ jobs:
           python3 "$GITHUB_WORKSPACE/ci/verify-m3-consumer.py" \
             "$GITHUB_WORKSPACE/m3-consumer.json"
 
+      # Regression coverage for the reviewed discovery and coverage defects.
+      # The hazard crate is outside the workspace because its ordinary unit
+      # test fails by design.
+      - name: Discovery does not execute ordinary tests
+        run: |
+          rm -f /tmp/trace-check-discovery-hazard-sentinel
+          cargo run --locked --release -p cargo-trace-check -- list \
+            --manifest-path examples/discovery-hazard/Cargo.toml
+          if [ -f /tmp/trace-check-discovery-hazard-sentinel ]; then
+            echo "discovery executed an ordinary unit test"
+            exit 1
+          fi
+
       - name: An untested contract fails the run
         working-directory: examples/consumer-crate
         run: |

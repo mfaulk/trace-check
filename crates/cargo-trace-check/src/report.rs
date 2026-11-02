@@ -1,8 +1,21 @@
 //! Aggregation, contract coverage, and the text and JSON reports.
 //!
 //! Coverage is the part that stops an annotation from implying verification it
-//! does not have. A `#[constant_time]` function with no `ct_test` is reported
-//! as `untested` and fails the run; it is never counted as passing.
+//! does not have.
+//!
+//! A contract is `covered` only when a test ran clean **and proved it invoked
+//! the contract's function**. A test that merely names a target in a string is
+//! `claimed-not-invoked`, which fails the run: otherwise this would pass,
+//!
+//! ```ignore
+//! #[ct_test(target = "vulnerable")]
+//! fn purported_test() {
+//!     assert_constant_time!(secret = 42u8, call = |_key| 0u8);  // never calls it
+//! }
+//! ```
+//!
+//! reporting a vulnerable function as a covered contract. The generated test
+//! checks an invocation counter, so this is proven per run rather than assumed.
 
 use serde::Serialize;
 
@@ -31,8 +44,11 @@ const LIMITATIONS: [&str; 5] = [
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Coverage {
-    /// At least one test ran and observed no leak.
+    /// A test ran clean **and** proved it invoked the contract's function.
     Covered,
+    /// A test named this contract but did not invoke its function. Never a
+    /// pass: the claim is unsupported.
+    ClaimedNotInvoked,
     /// A test detected a violation of this contract.
     Violated,
     /// Tests ran but could not produce a trustworthy answer.
@@ -47,6 +63,7 @@ impl Coverage {
     pub fn as_str(self) -> &'static str {
         match self {
             Coverage::Covered => "covered",
+            Coverage::ClaimedNotInvoked => "claimed-not-invoked",
             Coverage::Violated => "violated",
             Coverage::Inconclusive => "inconclusive",
             Coverage::Untested => "untested",
@@ -62,6 +79,9 @@ impl Coverage {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ContractReport {
+    /// Module-qualified identity, unique across modules and crates.
+    pub id: String,
+    /// Bare name, for display.
     pub function: String,
     pub secrets: Vec<String>,
     pub file: String,
@@ -149,7 +169,7 @@ pub fn build(
         if !contract.coverage.is_satisfied() && !excused {
             blocking.push(format!(
                 "contract `{}` is {}",
-                contract.function,
+                contract.id,
                 contract.coverage.as_str()
             ));
         }
@@ -181,6 +201,61 @@ pub fn build(
     }
 }
 
+/// Whether a test's declared target names this contract.
+///
+/// Accepts the bare function name or any suffix of the qualified identity, so
+/// `target = "verify"` matches `my_crate::auth::verify`. Ambiguity is rejected
+/// before this point, in [`resolve_targets`].
+fn targets(target: Option<&str>, contract: &ContractRecord) -> bool {
+    let Some(target) = target else { return false };
+    // Either the full identity, or a suffix of it ending at a path boundary,
+    // so `verify` matches `my_crate::auth::verify` but `rify` does not.
+    contract
+        .id
+        .strip_suffix(target)
+        .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with("::"))
+}
+
+/// Rejects tests whose declared target names no contract, or more than one.
+///
+/// Both are errors rather than silent mismatches: an unknown target means the
+/// test claims coverage of nothing, and an ambiguous one means trace-check
+/// would have to guess which `verify` was meant.
+pub fn resolve_targets(
+    tests: &[crate::discover::TestRecord],
+    contracts: &[ContractRecord],
+) -> Result<(), String> {
+    for test in tests {
+        let Some(target) = test.target.as_deref() else {
+            continue;
+        };
+        let matches: Vec<&ContractRecord> = contracts
+            .iter()
+            .filter(|contract| targets(Some(target), contract))
+            .collect();
+        match matches.len() {
+            1 => {}
+            0 => {
+                return Err(format!(
+                    "test `{}` declares `target = \"{target}\"` but no `#[constant_time]` \
+                     contract with that name was discovered",
+                    test.id
+                ))
+            }
+            _ => {
+                let names: Vec<&str> = matches.iter().map(|c| c.id.as_str()).collect();
+                return Err(format!(
+                    "test `{}` declares `target = \"{target}\"`, which is ambiguous between \
+                     {}; use a longer path to disambiguate",
+                    test.id,
+                    names.join(" and ")
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Maps each declared contract to its coverage state.
 fn coverage(
     contracts: &[ContractRecord],
@@ -190,20 +265,29 @@ fn coverage(
     contracts
         .iter()
         .map(|contract| {
+            // A test names its target by bare name; contracts are keyed by
+            // module-qualified identity. `targets` resolves one to the other
+            // and has already rejected an ambiguous name, so a test can never
+            // be credited to the wrong `verify`.
             let executed: Vec<&TestOutcome> = outcomes
                 .iter()
-                .filter(|outcome| outcome.target.as_deref() == Some(contract.function.as_str()))
+                .filter(|outcome| targets(outcome.target.as_deref(), contract))
                 .collect();
             let declared = discovered
                 .iter()
-                .any(|test| test.target.as_deref() == Some(contract.function.as_str()));
+                .any(|test| targets(test.target.as_deref(), contract));
 
             let coverage = if executed.iter().any(|o| o.outcome == Outcome::LeakDetected) {
                 Coverage::Violated
             } else if executed.iter().any(|o| o.outcome == Outcome::Inconclusive) {
                 Coverage::Inconclusive
-            } else if !executed.is_empty() {
+            } else if executed.iter().any(|o| o.invoked_target) {
+                // Clean *and* proven to have exercised the function.
                 Coverage::Covered
+            } else if !executed.is_empty() {
+                // A test named this contract but never invoked it, so the
+                // clean result says nothing about this function.
+                Coverage::ClaimedNotInvoked
             } else if declared {
                 // A test exists but did not run, e.g. it was filtered out.
                 Coverage::NotExecuted
@@ -212,6 +296,7 @@ fn coverage(
             };
 
             ContractReport {
+                id: contract.id.clone(),
                 function: contract.function.clone(),
                 secrets: contract.secrets.clone(),
                 file: contract.file.clone(),
@@ -302,7 +387,7 @@ impl Report {
                 };
                 line!(
                     "  {mark} {:<42} {}",
-                    contract.function,
+                    contract.id,
                     contract.coverage.as_str()
                 );
                 if !contract.coverage.is_satisfied() {
@@ -413,6 +498,7 @@ mod tests {
             executable_sha256: "abc123".to_string(),
             outcome,
             calibration: Calibration::Confirmed,
+            invoked_target: true,
             message: "m".to_string(),
             findings: Vec::new(),
             other_diagnostics: Vec::new(),
@@ -422,8 +508,8 @@ mod tests {
     fn record(name: &str, target: Option<&str>) -> TestRecord {
         TestRecord {
             name: name.to_string(),
+            id: format!("c::{name}"),
             target: target.map(str::to_string),
-            secrets: vec![],
             executable: "/tmp/t".to_string(),
             executable_sha256: "abc123".to_string(),
         }
@@ -431,6 +517,7 @@ mod tests {
 
     fn contract(function: &str) -> ContractRecord {
         ContractRecord {
+            id: format!("c::{function}"),
             function: function.to_string(),
             secrets: vec!["expected".to_string()],
             file: "src/lib.rs".to_string(),
@@ -543,6 +630,117 @@ mod tests {
         let report = build(&d, 0, vec![], provenance(), false);
         assert_eq!(report.contracts[0].coverage, Coverage::NotExecuted);
         assert!(!report.summary.ok);
+    }
+
+    /// A target naming no discovered contract is rejected before anything
+    /// runs, so a test cannot silently claim coverage of nothing.
+    #[test]
+    fn an_unknown_target_is_rejected() {
+        let tests = vec![record("m::t", Some("ghost"))];
+        let error = resolve_targets(&tests, &[contract("verify")])
+            .expect_err("an unknown target must be rejected");
+        assert!(error.contains("no `#[constant_time]` contract"), "{error}");
+        assert!(error.contains("ghost"), "{error}");
+    }
+
+    /// An ambiguous bare target is rejected rather than credited to whichever
+    /// contract happened to be found first.
+    #[test]
+    fn an_ambiguous_target_is_rejected() {
+        let tests = vec![record("m::t", Some("verify"))];
+        let contracts = vec![
+            ContractRecord {
+                id: "c::authentication::verify".to_string(),
+                function: "verify".to_string(),
+                secrets: vec!["key".to_string()],
+                file: "a.rs".to_string(),
+                line: 1,
+            },
+            ContractRecord {
+                id: "c::encryption::verify".to_string(),
+                function: "verify".to_string(),
+                secrets: vec!["key".to_string()],
+                file: "b.rs".to_string(),
+                line: 2,
+            },
+        ];
+        let error = resolve_targets(&tests, &contracts).expect_err("ambiguity must be rejected");
+        assert!(error.contains("ambiguous"), "{error}");
+        assert!(
+            error.contains("authentication") && error.contains("encryption"),
+            "{error}"
+        );
+    }
+
+    /// A qualified target disambiguates between same-named contracts.
+    #[test]
+    fn a_qualified_target_disambiguates() {
+        let tests = vec![record("m::t", Some("authentication::verify"))];
+        let contracts = vec![
+            ContractRecord {
+                id: "c::authentication::verify".to_string(),
+                function: "verify".to_string(),
+                secrets: vec![],
+                file: "a.rs".to_string(),
+                line: 1,
+            },
+            ContractRecord {
+                id: "c::encryption::verify".to_string(),
+                function: "verify".to_string(),
+                secrets: vec![],
+                file: "b.rs".to_string(),
+                line: 2,
+            },
+        ];
+        assert!(resolve_targets(&tests, &contracts).is_ok());
+        assert!(targets(Some("authentication::verify"), &contracts[0]));
+        assert!(!targets(Some("authentication::verify"), &contracts[1]));
+    }
+
+    /// A target must match a whole path segment, so `rify` does not match
+    /// `verify`.
+    #[test]
+    fn a_target_matches_whole_segments_only() {
+        let contract = ContractRecord {
+            id: "c::auth::verify".to_string(),
+            function: "verify".to_string(),
+            secrets: vec![],
+            file: "a.rs".to_string(),
+            line: 1,
+        };
+        assert!(targets(Some("verify"), &contract));
+        assert!(targets(Some("auth::verify"), &contract));
+        assert!(targets(Some("c::auth::verify"), &contract));
+        assert!(!targets(Some("rify"), &contract));
+        assert!(!targets(Some("other"), &contract));
+        assert!(!targets(None, &contract));
+    }
+
+    /// A contract is covered only when a test both ran clean and proved it
+    /// invoked the function. A clean test that merely named the target is
+    /// `claimed-not-invoked`, which blocks the run.
+    #[test]
+    fn coverage_requires_a_verified_invocation() {
+        let d = discovery(
+            vec![record("m::t", Some("verify"))],
+            vec![contract("verify")],
+        );
+
+        let mut claimed = outcome("m::t", Some("verify"), Outcome::NoLeakObserved);
+        claimed.invoked_target = false;
+        let unsupported = build(&d, 1, vec![claimed], provenance(), false);
+        assert_eq!(
+            unsupported.contracts[0].coverage,
+            Coverage::ClaimedNotInvoked
+        );
+        assert!(!unsupported.summary.ok);
+        assert_eq!(unsupported.exit_code(), EXIT_INCOMPLETE);
+
+        let mut verified = outcome("m::t", Some("verify"), Outcome::NoLeakObserved);
+        verified.invoked_target = true;
+        let supported = build(&d, 1, vec![verified], provenance(), false);
+        assert_eq!(supported.contracts[0].coverage, Coverage::Covered);
+        assert!(supported.summary.ok);
     }
 
     /// A narrowed run is not failed by the contracts whose tests the filter
