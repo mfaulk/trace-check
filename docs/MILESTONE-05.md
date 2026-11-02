@@ -596,19 +596,49 @@ nothing; an error says no analysis happened.
 
 ### Validation order
 
-Everything decidable from the command line and the configuration is checked
-**before** the container backend is prepared: the manifest exists, the
-configuration parses and validates, and every selected contract has a
-`[verify."…"]` section. The first revision prepared the backend first, so on a
-machine without the analyzer image a misspelled contract name reported a
-missing image rather than the typo — and the CLI test covering the typo failed
-in the CI job that has no image. Argument validation must not depend on a
-heavyweight backend, and `a_selection_error_is_reported_without_any_backend`
-asserts it with an emptied `PATH`.
+The analyzer is prepared **lazily**, immediately before the first query it is
+needed for. Everything else is checked first, in the order it becomes
+decidable:
 
-Role validation is the one check that cannot move: it needs the descriptor,
-which needs the library compiled. It therefore runs after the backend is
-located, which is also where a missing analyzer is cheapest to report.
+| Stage | Needs | Example failure |
+| --- | --- | --- |
+| manifest, configuration, selection | nothing but the filesystem | a misspelled contract name |
+| annotation, roles, signature | the library compiled | a contract with no `#[constant_time]`; a secret the configuration tried to make public |
+| compiled symbol | the artifact linked | inlined away, removed, or ambiguous |
+| exploration | **the analyzer** | a missing image |
+
+This took two passes, and the second miss is instructive. The first revision
+prepared the backend up front, so a misspelled contract name reported "cannot
+obtain the analyzer image"; moving the *selection* check ahead of it fixed that
+case and left two more behind. A contract that is configured but carries no
+annotation also reported a missing image, because reaching that diagnosis needs
+the library compiled and compilation still came after the backend check. **A
+problem with the contract must be reported as a problem with the contract**, so
+the backend moved to the end instead.
+
+The cost is that a developer without the analyzer waits for one probe and one
+harness build before being told to install it. That is the right trade: being
+told the truth about the contract matters more than being told about the
+backend sooner.
+
+#### Why the first local reproduction was not one
+
+Setting `TRACE_CHECK_CONTAINER_RUNTIME=docker` on a machine where docker holds
+no image looked like a faithful stand-in for CI, and was not: the library entry
+point takes an explicit runtime and never reads the environment, so podman
+still served the image and the ordering was never exercised. The variable only
+made the *gated* tests skip. That is exactly why these two cases passed locally
+and failed in CI.
+
+The tests now make the backend absent by construction — they name a runtime
+that cannot exist — so they exercise the ordering on any machine.
+`contract_errors_survive_an_unreachable_analyzer` requires the contract problem
+to win; `an_unreachable_analyzer_is_reported_when_it_is_the_problem` requires a
+*sound* contract in the same environment to fail on the analyzer, which keeps
+the first from passing vacuously. Restoring eager preparation makes the first
+fail, which was checked rather than assumed. Every contract-level error test
+additionally calls `assert_not_a_backend_error`, so the whole class fails
+loudly if this regresses again.
 
 ## Examples
 
@@ -804,11 +834,12 @@ it.
 
 Five findings from review of the first revision, in the order they were fixed:
 
-1. **A missing analyzer masked a configuration error.** The backend was
-   prepared before the selection was validated, so a misspelled contract name
-   reported "cannot obtain the analyzer image" on any machine without it — and
-   the CLI test covering the typo failed in the CI job that has none. See
-   [Validation order](#validation-order).
+1. **A missing analyzer masked contract errors.** Fixed in two passes: the
+   first moved selection validation ahead of the backend, and CI caught two
+   further cases that needed the library compiled before they could be
+   diagnosed. The analyzer is now prepared lazily, at the point of first use.
+   See [Validation order](#validation-order), including why the original local
+   reproduction was not one.
 2. **Generated files went to a predictable path under `/tmp`.** Replaced with
    an atomically created private directory, plus `--artifact-dir` for keeping
    the evidence bundle. See [Where generated files live](#where-generated-files-live).
@@ -865,6 +896,7 @@ restriction that never reached the script.
 | a partial exploration is not a verdict | `exceeding_the_depth_bound_is_inconclusive` |
 | a narrow model does not read like a broad one | `a_narrow_observation_model_is_named_as_such` |
 | a selection error is not masked by a missing backend | `a_selection_error_is_reported_without_any_backend`, with an emptied `PATH` |
+| no contract error is masked by a missing backend | `contract_errors_survive_an_unreachable_analyzer` and its companion, plus `assert_not_a_backend_error` in every contract-level error test |
 | generated files are not written through a planted path | `an_ephemeral_workspace_is_private_and_removed`, `a_kept_workspace_never_reuses_an_existing_entry`, `a_contract_directory_is_not_reused` |
 | a multi-contract report names no shared artifact | `a_multi_contract_report_claims_no_shared_artifact` |
 | a `bool`'s analyzed domain is Rust's valid values | `a_public_bool_is_restricted_in_the_generated_script`, which checks the script the analyzer was given |

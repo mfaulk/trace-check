@@ -184,12 +184,24 @@ use library_report::{LibraryReport, Verified};
 ///
 /// # Order of operations
 ///
-/// Everything decidable from the configuration and the selection is checked
-/// **before** the analyzer backend is prepared. An earlier revision prepared
-/// the container backend first, so on a machine without the analyzer image a
-/// misspelled contract name reported a missing image rather than the typo —
-/// and a CLI argument-validation test depended on a container runtime it had no
-/// business needing.
+/// The analyzer backend is prepared **lazily**, immediately before the first
+/// query it is needed for. Everything else is checked first, in the order it
+/// becomes decidable: the selection from the configuration alone, then each
+/// contract's annotation, parameter roles, signature and compiled symbol.
+///
+/// This ordering is the whole point. An earlier revision prepared the container
+/// backend up front, so on a machine without the analyzer image a misspelled
+/// contract name reported a missing image rather than the typo. Moving the
+/// selection check ahead of it fixed that case and left two more behind: a
+/// contract that is *configured* but carries no `#[constant_time]` annotation
+/// also reported a missing image, because reaching that diagnosis needs the
+/// library compiled and compilation came after the backend check. A problem
+/// with the contract must be reported as a problem with the contract.
+///
+/// The cost is that a developer without the analyzer waits for one probe and
+/// one harness build before being told to install it. That is the right trade:
+/// being told the truth about the contract matters more than being told about
+/// the backend sooner.
 pub fn run_contract_verification(
     library: &Library,
     config: &VerifyConfig,
@@ -199,9 +211,7 @@ pub fn run_contract_verification(
 ) -> Result<LibraryReport, HarnessError> {
     config.require_configured(contracts)?;
 
-    let mut verifier = symbolic::Verifier::prepare_with(runtime)?;
-    verifier.check_image()?;
-
+    let mut verifier: Option<symbolic::Verifier> = None;
     let mut entries = Vec::new();
     for contract_id in contracts {
         let settings = config
@@ -220,6 +230,16 @@ pub fn run_contract_verification(
         let symbol: ResolvedSymbol = harness::resolve_symbol(&artifact.path, contract_id)?;
 
         let case = harness::verification_case(&contract, &symbol, &generated, settings);
+
+        // Prepared here, not earlier: everything above is a question about the
+        // contract and the library, and a missing analyzer must not answer any
+        // of them.
+        if verifier.is_none() {
+            let mut prepared = symbolic::Verifier::prepare_with(runtime)?;
+            prepared.check_image()?;
+            verifier = Some(prepared);
+        }
+        let verifier = verifier.as_ref().expect("prepared just above");
         let result = verifier.verify(&case, &artifact.path, &artifact.sha256)?;
 
         entries.push(Verified {
@@ -233,6 +253,10 @@ pub fn run_contract_verification(
         });
     }
 
+    // A non-empty selection always reaches the analyzer, because
+    // `require_configured` rejects an empty one and any earlier failure
+    // returns.
+    let verifier = verifier.expect("a verified contract implies a prepared analyzer");
     Ok(library_report::build(
         entries,
         verifier.identity(),
