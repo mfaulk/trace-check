@@ -10,6 +10,13 @@ cargo trace-check verify --case table-lookup    # one
 cargo trace-check verify --format json
 ```
 
+These are the **hand-written** targets. They are kept because they isolate
+analyzer behavior from Cargo linkage: when a contract verification goes wrong,
+the question "is the analyzer fine and the linkage broken, or the other way
+round?" is answered here. To verify a function in a real library, see
+[examples/crypto-library](../crypto-library/) and
+`cargo trace-check verify --contract` — same engine, different artifact source.
+
 ## Why these targets look the way they do
 
 Inputs are `#[no_mangle] pub static mut` globals because BINSEC declares the

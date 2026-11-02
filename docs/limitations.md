@@ -37,6 +37,23 @@ the **declared** observation classes, no secret assignment changes what those
 classes observe, in **this one** compiled artifact, in a function the analyzer
 reported reaching.
 
+When the target is a contract in a real library (`verify --contract`), the
+*function* is the library's own, compiled from the single definition in its
+source — but three differences separate the analyzed executable from a
+production build, and none of them is glossed:
+
+* the target is called through a laundered function pointer, so the verified
+  instance is an **out-of-line copy**. Without that, rustc's cross-crate
+  inlining of small functions dissolves the target and leaves no symbol to
+  attribute anything to; with it, a production caller that inlines the function
+  gets code the run did not analyze,
+* the surroundings are a freestanding `no_std` executable whose inputs are
+  named globals,
+* the build uses no LTO, `panic = "abort"` and static relocation.
+
+Every contract report records all three, and records that no production binary
+was analyzed.
+
 Everything outside those words is unestablished. In particular it does **not**
 rule out:
 
@@ -159,13 +176,21 @@ verification in M4; the rest remains out of scope for the project as a whole:
 * instrumentation of arbitrary crates or full protocol integrations,
 * general-purpose constant-time certification.
 
-Out of scope for the symbolic backend (Milestone 4), by instruction: no custom
-symbolic execution engine, no custom SMT solver, no heap modeling or dynamic
-allocation, no concurrency, no unbounded loops or recursion, no automatic
-verification of arbitrary crates, no automatic verification of every
-`#[constant_time]` annotation, and no proof certification. Connecting M3
-contracts to the symbolic backend is deferred until the native verification
-model has proven reliable.
+Out of scope for the symbolic backend (Milestones 4 and 5), by instruction: no
+custom symbolic execution engine, no custom SMT solver, no heap modeling or
+dynamic allocation, no concurrency, no unbounded loops or recursion, no
+automatic verification of arbitrary crates, no automatic verification of every
+`#[constant_time]` annotation, and no proof certification.
+
+M5 connected M3's contracts to that backend, within a deliberately narrow
+subset of Rust signatures: `u8`/`u16`/`u32`/`u64`, `[u8; N]` and `&[u8; N]`
+with a **literal** `N`, and `bool` for a public parameter; scalar or `bool`
+returns. Slices, `Vec`, `String`, structs, references to structs, generics,
+trait methods, `async` and methods are all refused with an actionable error. So
+is `&[u8; TAG_LEN]`: a proc macro sees the token, not its value, and a guessed
+width marked into the analysis would make a verified result meaningless. A
+library that needs `std` cannot be linked into the freestanding artifact at
+all.
 
 ## Reading the fixture's expectations
 
