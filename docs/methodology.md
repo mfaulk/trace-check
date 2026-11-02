@@ -267,6 +267,10 @@ above, so its methodology lives with it:
 [docs/MILESTONE-04.md](MILESTONE-04.md) states the relational noninterference
 property, the threat model, what the fail-closed classifier requires before it
 will report `VERIFIED_BOUNDED`, and the bounds every such claim is scoped to.
+[docs/MILESTONE-05.md](MILESTONE-05.md) covers the second artifact source —
+generating a harness around a function in a real Cargo library, so the code
+analyzed is compiled from the developer's single definition of it — and the
+artifact boundary that creates.
 The short version: instead of running inputs someone chose, it asks a solver
 whether *any* secret assignment in a declared domain changes the executed path
 or an effective address, and reports `INCONCLUSIVE` whenever the search cannot

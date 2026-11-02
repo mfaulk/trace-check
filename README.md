@@ -18,7 +18,8 @@ the formal noninterference property, and the roadmap.
 | M2 | Native secret-dependency analysis (Valgrind Memcheck) | complete |
 | M3 | Rust developer API — annotations, assertions, CI | complete |
 | M4 | Bounded relational verification (BINSEC symbolic execution) | complete, experimental |
-| M5 | Hardware-oriented validation — statistical timing | future |
+| M5 | Verifying the real functions in a Cargo library | complete, experimental |
+| M6 | Hardware-oriented validation — statistical timing | future |
 
 `trace-check` turns that idea into reproducible analysis, from four directions:
 
@@ -27,7 +28,11 @@ the formal noninterference property, and the roadmap.
   secret assignment in a declared domain changes the executed path or an
   effective address. When the search completes without finding one, the result
   is `VERIFIED_BOUNDED`: a claim quantified over the whole declared domain
-  rather than over the inputs someone happened to test.
+  rather than over the inputs someone happened to test. The target can be a
+  **function in your own library**: `verify --contract` generates a harness
+  around the real function, so the same `#[constant_time]` annotation drives
+  both the dynamic checks and the symbolic search, and you maintain one
+  implementation rather than two.
 
 * **Native secret-dependency analysis** (`native`) — mark a secret's shadow
   state as undefined, run under Valgrind Memcheck, and let it report wherever a
@@ -45,7 +50,8 @@ the formal noninterference property, and the roadmap.
 
 ```sh
 cargo trace-check test                           # your own crate's checks (M3)
-cargo trace-check verify                         # bounded symbolic search (M4)
+cargo trace-check verify --contract my_crate::verify_tag   # your real function (M5)
+cargo trace-check verify                         # bundled standalone cases (M4)
 cargo run -p trace-check -- native               # native, under Memcheck
 cargo run -p trace-check -- screen mac-compare   # static, no execution
 cargo run -p trace-check -- demo mac-compare     # dynamic WASM tracing
@@ -191,13 +197,14 @@ Result:
   LEAK_DETECTED
 ```
 
-| Leak | M1 differential tracing | M1 static screen | M2 native Memcheck | M4 symbolic |
+| Leak | M1 differential tracing | M1 static screen | M2 native Memcheck | M4/M5 symbolic |
 | --- | --- | --- | --- | --- |
 | secret-dependent branch | detected | flagged structurally | detected, with source location | detected, with address |
 | secret-dependent address | **invisible** | flagged structurally | **detected** | **detected** |
 | quantified over all inputs | no | yes | no (executed paths only) | yes, over a declared domain |
 | analyzes native code | no (WASM) | no (WASM) | yes | yes |
 | needs concrete secrets | yes | no | yes | **no** |
+| analyzes your library's own function | yes | yes | yes | yes, since M5 |
 
 M2 and M3 still miss a leak that sits on a path no test takes:
 
@@ -210,7 +217,10 @@ fn conditional_lookup(table: &[u8; 256], secret: u8, public_mode: u8) -> u8 {
 
 A test exercising only `public_mode == 0` reports `NO_LEAK_OBSERVED` and is not
 wrong — that path really is constant time. M4 searches the public domain and
-finds the other one. That case is bundled as `conditional-lookup`.
+finds the other one. That case is bundled as `conditional-lookup`, and
+`examples/crypto-library`'s `substitute_mode` is the same asymmetry in a real
+library: its M3 dynamic check passes while
+`verify --contract crypto::lookup::substitute_mode` finds the leak.
 
 ## The example and its result
 
@@ -323,7 +333,101 @@ Requires **Valgrind** on Linux x86-64 (`apt-get install valgrind` or
 `dnf install valgrind valgrind-devel`). Ubuntu's `valgrind` package also ships
 the client-request headers the instrumentation shim needs at build time.
 
-### `verify` — bounded relational verification (experimental)
+### `verify --contract` — verifying the real functions in your library
+
+```sh
+cargo trace-check verify --contract crypto::tag::verify_tag \
+  --manifest-path crypto/Cargo.toml
+cargo trace-check verify --all-contracts --manifest-path crypto/Cargo.toml
+cargo trace-check verify --all-contracts --format json
+```
+
+This is the form that analyzes **your** code. You keep one implementation,
+annotated as M3 already requires:
+
+```rust
+#[constant_time(secret = "expected")]
+pub fn verify_tag(expected: &[u8; 16], supplied: &[u8; 16]) -> bool {
+    expected.ct_eq(supplied).unwrap_u8() == 1
+}
+```
+
+and add a `trace-check.toml` beside your `Cargo.toml` for the bounds and the
+observation model, which cannot be inferred from an annotation:
+
+```toml
+schema_version = 1
+
+[verify."crypto::tag::verify_tag"]
+max_depth = 8000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "VERIFIED_BOUNDED"
+```
+
+The configuration never restates which parameters are secret. Roles come from
+the annotation, and a configuration that tries to assign one is **rejected**
+rather than honored — a second description of the contract is exactly the drift
+this avoids. Public parameters are symbolic and held equal between the paired
+executions by default; nothing is silently fixed to a convenient value.
+
+`trace-check` then reads the contract descriptor the annotation emitted,
+generates a freestanding `no_std` harness around your real function, links your
+library into it through Cargo, resolves the contract to exactly one compiled
+symbol, and hands the artifact to the same analyzer M4 uses:
+
+```text
+Verifying crypto::tag::verify_tag
+
+Library:
+  Package:        crypto-library 0.1.0
+  Contract:       crypto::tag::verify_tag  (/…/crypto/src/tag.rs:18)
+  Cargo features: (default)
+  Lockfile:       sha256 9819fe81…
+
+Compilation:
+  rustc:          rustc 1.97.0 (2d8144b78 2026-07-07)
+  Target:         x86_64-unknown-linux-gnu
+  Profile:        release: opt-level=3, debug=true, lto=off, codegen-units=1
+  Panic strategy: abort
+
+Analyzed function:
+  Resolved symbol: _RNvNtCshFxKWjWxWCA_6crypto3tag10verify_tag
+  Address:         0x201520
+  Target reached:  yes, at 0x201520 from tc_verify_entry (analyzer-reported)
+  Call shape:      laundered function pointer (out-of-line instance)
+
+Verification executable:
+  Harness sha256:    6be0682e…
+  Artifact sha256:   bbdee307…
+  Production binary: not analyzed: …
+
+Input domain:
+  expected   secret  &[u8; 16]    128 bits, all symbolic
+  supplied   public  &[u8; 16]    128 bits, symbolic and held equal
+
+Result: VERIFIED_BOUNDED
+```
+
+**What this is and is not.** The *function* analyzed is compiled from the single
+definition in your library — change its body and the verdict changes, which is
+the project's standing regression for this claim. Its *surroundings* are not
+production: the harness is freestanding, its inputs are globals, the build uses
+no LTO, and the target is called through a laundered function pointer so
+cross-crate inlining cannot dissolve it. That last one is a deliberate trade:
+without it a small library function leaves no symbol at all and nothing can be
+attributed to it, but it means the verified instance is an out-of-line copy. The
+report states all of this, and never claims a production binary was analyzed.
+
+Supported signatures are deliberately narrow: `u8`/`u16`/`u32`/`u64`,
+`[u8; N]` and `&[u8; N]` with a **literal** `N`, and `bool` for a public
+parameter; return types are scalars or `bool`. Anything else is an actionable
+error naming the parameter and its type — including `&[u8; TAG_LEN]`, because a
+proc macro sees the token `TAG_LEN`, not its value, and a guessed width marked
+into the analysis would make a verified result meaningless. See
+[docs/MILESTONE-05.md](docs/MILESTONE-05.md) and
+[examples/crypto-library/README.md](examples/crypto-library/README.md).
+
+### `verify` — bounded relational verification of bundled cases (experimental)
 
 ```sh
 cargo trace-check verify                        # every bundled case
@@ -332,6 +436,11 @@ cargo trace-check verify --format json
 cargo trace-check verify --cases path/to/cases.json
 cargo trace-check verify --container-runtime docker
 ```
+
+These are M4's hand-written standalone targets, kept because they isolate
+analyzer behavior from Cargo linkage. Both forms share one engine: the
+classification, witness extraction and fail-closed rules below apply to
+`--contract` runs identically.
 
 Builds `examples/symbolic/src/targets.rs` as an optimized freestanding
 `x86_64` ELF, then runs BINSEC's relational symbolic execution (`-checkct`) over
@@ -510,6 +619,10 @@ crates/trace-check/
   src/native_report.rs           native text and JSON reporting
   src/symbolic.rs                BINSEC relational verification backend
   src/symbolic_report.rs         symbolic text and JSON reporting
+  src/contract.rs                contract descriptors and trace-check.toml
+  src/harness.rs                 generating and linking a verification harness
+                                 around a real Cargo library function
+  src/library_report.rs          contract verification text and JSON reporting
 crates/trace-check-secret/       secret marking for Memcheck (C shim)
 crates/trace-check-test/         developer API: assert_constant_time!, ct_test
 crates/trace-check-macros/       the ct_test and constant_time attributes
@@ -523,11 +636,17 @@ examples/table-lookup/           the secret-indexed address-leak example
 examples/native-cases.json       native case manifest with expectations
 examples/consumer-crate/         using trace-check as a dependency (M3)
 examples/symbolic/               freestanding targets + cases.json for `verify`
+examples/crypto-library/         an ordinary no_std library whose real functions
+                                 are both dynamically tested and symbolically
+                                 verified, plus its trace-check.toml (M5)
+examples/external-library/       the same workflow for a crate outside this
+                                 workspace, with its own lockfile (M5)
 examples/legacy-branch-demo/     original proof of concept, kept for context
 docs/                            milestone plan, methodology, limitations
 ci/verify-m3-consumer.py         asserts the M3 consumer report, not its exit code
 ci/verify-m4-symbolic.py         asserts the M4 symbolic report, not its exit code
-.github/workflows/ci.yml         pinned Linux CI (M1-M3 job + M4 analyzer job)
+ci/verify-m5-library.py          asserts the M5 contract report, not its exit code
+.github/workflows/ci.yml         pinned Linux CI (M1-M3 job + M4/M5 analyzer job)
 ```
 
 ## Development
