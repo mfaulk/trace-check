@@ -1,0 +1,175 @@
+{
+  "schema_version": 1,
+  "description": "Bounded relational verification cases. Each declares its expected outcome, so a compiler change that invalidates one surfaces as an unmet expectation rather than being absorbed. Expectations are never used to decide the outcome.",
+  "target_source": "src/targets.rs",
+  "cases": [
+    {
+      "description": "secret-indexed load: the secret selects a memory address",
+      "assumptions": [],
+      "features": [
+        "memory-access",
+        "control-flow"
+      ],
+      "rationale": "the instruction sequence is identical for every secret, so only an address-aware analysis can see this; M1's instruction-path comparison cannot",
+      "solver_timeout_secs": 30,
+      "wall_timeout_secs": 900,
+      "secret_globals": [
+        "TC_SECRET"
+      ],
+      "public_globals": [
+        "TC_TABLE",
+        "TC_PUBLIC"
+      ],
+      "halt_symbol": "tc_halt",
+      "max_depth": 2000,
+      "id": "table-lookup",
+      "function": "secret_lookup",
+      "entry_symbol": "tc_harness_table_lookup",
+      "expected_outcome": "LEAK_DETECTED"
+    },
+    {
+      "description": "secret-dependent loop trip count: a branch that survives optimization",
+      "assumptions": [],
+      "features": [
+        "control-flow",
+        "memory-access"
+      ],
+      "rationale": "a secret-dependent `if` returning constants is if-converted into arithmetic, but a loop's backward conditional jump cannot be",
+      "solver_timeout_secs": 30,
+      "wall_timeout_secs": 900,
+      "secret_globals": [
+        "TC_SECRET"
+      ],
+      "public_globals": [
+        "TC_TABLE",
+        "TC_PUBLIC"
+      ],
+      "halt_symbol": "tc_halt",
+      "max_depth": 2000,
+      "id": "trip-count",
+      "function": "secret_trip_count",
+      "entry_symbol": "tc_harness_trip_count",
+      "expected_outcome": "LEAK_DETECTED"
+    },
+    {
+      "description": "constant-time full-table scan with mask selection",
+      "assumptions": [],
+      "features": [
+        "memory-access",
+        "control-flow"
+      ],
+      "rationale": "reads every entry and selects without a secret-dependent branch or address; exploration completes, so the bounded property is established over the declared domain",
+      "solver_timeout_secs": 30,
+      "wall_timeout_secs": 900,
+      "secret_globals": [
+        "TC_SECRET"
+      ],
+      "public_globals": [
+        "TC_TABLE",
+        "TC_PUBLIC"
+      ],
+      "halt_symbol": "tc_halt",
+      "max_depth": 2000,
+      "id": "masked-scan",
+      "function": "masked_scan",
+      "entry_symbol": "tc_harness_masked_scan",
+      "expected_outcome": "VERIFIED_BOUNDED"
+    },
+    {
+      "description": "branches on a public input only, with the secret used in arithmetic",
+      "assumptions": [],
+      "features": [
+        "control-flow",
+        "memory-access"
+      ],
+      "rationale": "both compared executions share the public input, so public-dependent branching is not a leak; this pins that down rather than assuming it",
+      "solver_timeout_secs": 30,
+      "wall_timeout_secs": 900,
+      "secret_globals": [
+        "TC_SECRET"
+      ],
+      "public_globals": [
+        "TC_TABLE",
+        "TC_PUBLIC"
+      ],
+      "halt_symbol": "tc_halt",
+      "max_depth": 2000,
+      "id": "public-branch",
+      "function": "public_branch",
+      "entry_symbol": "tc_harness_public_branch",
+      "expected_outcome": "VERIFIED_BOUNDED"
+    },
+    {
+      "description": "a leak reachable only under one public mode",
+      "assumptions": [],
+      "features": [
+        "memory-access",
+        "control-flow"
+      ],
+      "rationale": "the milestone's key demonstration: a dynamic test exercising only public==0 observes nothing, because that path is the masked scan. Finding this needs a search over the public domain, not a chosen input",
+      "solver_timeout_secs": 30,
+      "wall_timeout_secs": 900,
+      "secret_globals": [
+        "TC_SECRET"
+      ],
+      "public_globals": [
+        "TC_TABLE",
+        "TC_PUBLIC"
+      ],
+      "halt_symbol": "tc_halt",
+      "max_depth": 2000,
+      "id": "conditional-lookup",
+      "function": "conditional_lookup",
+      "entry_symbol": "tc_harness_conditional_lookup",
+      "expected_outcome": "LEAK_DETECTED"
+    },
+    {
+      "description": "educational: a source-level secret branch the compiler removed",
+      "assumptions": [],
+      "features": [
+        "control-flow",
+        "memory-access"
+      ],
+      "rationale": "at -O this compiles to shr plus sub with zero conditional jumps, so the honest verdict is that the compiled code has no secret-dependent control flow. Declared VERIFIED_BOUNDED rather than manufacturing a leak -- the fourth instance of compiler branch-erasure recorded in this project",
+      "solver_timeout_secs": 30,
+      "wall_timeout_secs": 900,
+      "secret_globals": [
+        "TC_SECRET"
+      ],
+      "public_globals": [
+        "TC_TABLE",
+        "TC_PUBLIC"
+      ],
+      "halt_symbol": "tc_halt",
+      "max_depth": 2000,
+      "id": "erased-branch",
+      "function": "erased_branch",
+      "entry_symbol": "tc_harness_erased_branch",
+      "expected_outcome": "VERIFIED_BOUNDED"
+    },
+    {
+      "description": "deliberately exceeds a small exploration bound",
+      "assumptions": [],
+      "features": [
+        "control-flow",
+        "memory-access"
+      ],
+      "rationale": "a public-bounded loop against max_depth 40 leaves paths unexplored; the analyzer reports unknown and total paths exceed completed ones, so a clean verdict must not be issued",
+      "solver_timeout_secs": 30,
+      "wall_timeout_secs": 900,
+      "secret_globals": [
+        "TC_SECRET"
+      ],
+      "public_globals": [
+        "TC_TABLE",
+        "TC_PUBLIC"
+      ],
+      "halt_symbol": "tc_halt",
+      "max_depth": 40,
+      "id": "depth-bounded",
+      "function": "public_loop",
+      "entry_symbol": "tc_harness_public_loop",
+      "expected_outcome": "INCONCLUSIVE"
+    }
+  ]
+}
