@@ -308,35 +308,63 @@ from the report entirely. Both now appear with distinct identities. A test's
 `target` may be a bare name or any path suffix; an **ambiguous** name is a hard
 error rather than a guess, and an unknown one is rejected before anything runs.
 
-### Coverage requires proof of invocation
+### The adapter owns the secret, so a contract claim means something
 
-`target` is not a label. Without evidence, this would have passed:
+`target` is not a label. Three escapes had to be closed, each of which produced
+`covered` and exit 0 for a function whose contract was never actually tested.
+
+**1. The function was never called.** A test could name a target and simply not
+invoke it.
+
+**2. The function was called outside the analyzed region.** It could be invoked
+with public inputs, with an unrelated assertion marking a secret that never
+reached it.
+
+**3. The marked secret reached the wrong parameter.** With
+`#[constant_time(secret = "index")] fn lookup(index, ignored, table)`, a test
+could mark a value and pass it to `ignored` while `index` stayed public.
+
+All three are closed by making `#[constant_time]` emit, **under `#[cfg(test)]`
+only**, an invocation counter and an *analysis adapter* `<function>_ct`:
 
 ```rust
-#[constant_time(secret = "key")]
-fn vulnerable(key: u8) -> u8 { if key == 0 { 0 } else { 1 } }
-
-#[ct_test(target = "vulnerable")]
-fn purported_test() {
-    assert_constant_time!(secret = 42u8, call = |_key| 0u8);   // never calls it
+#[inline(never)]
+pub fn lookup_ct(index: u8, ignored: u8, table: &[u8; 256]) -> u8 {
+    COUNTER.fetch_add(1, Relaxed);
+    contract_begin("crate::lookup");          // instrumentation check + control
+    let index = launder(index);               // defeats constant propagation
+    let guard = mark(&index);                 // marks the DECLARED parameter
+    let result = lookup(index, ignored, table);
+    drop(guard);
+    finish(result)
 }
 ```
 
-The test marks a secret, calibration confirms, no findings appear, and the
-contract would have been reported `covered` with the command exiting 0 — for a
-function that was never executed.
+A declared secret of type `&T` becomes an owned `T` in the adapter's signature,
+and the adapter passes `&owned` through. So:
 
-So `#[constant_time]` additionally emits, **under `#[cfg(test)]` only**:
+* the function cannot be invoked without marking its declared secret — escape 2
+  is unexpressible;
+* the marked value cannot land anywhere but the declared slot, because the
+  generated signature binds it — escape 3 is unexpressible;
+* `#[ct_test(target = …)]` still checks the counter, so escape 1 fails loudly.
 
-* an invocation counter, and
-* an `#[inline(never)]` adapter `<function>_ct` with the same signature, which
-  increments the counter and delegates to the untouched function.
+The adapter is a separate `#[inline(never)]` frame delegating to the untouched
+function, so **the code being analyzed is unchanged** — important, because this
+project's recurring lesson is that the compiled artifact is what matters.
 
-Tests call the adapter. `#[ct_test(target = …)]` snapshots the counter, and
-fails with a message naming the adapter if it did not advance. The adapter is a
-separate frame delegating to the original, so **the code being analyzed is
-unchanged** — important, because this project's recurring lesson is that the
-compiled artifact is what matters.
+`launder` is load-bearing: `#[inline(never)]` stops inlining but not
+interprocedural constant propagation, which would otherwise let the optimizer
+pass an immediate and never read the marked storage.
+
+A declared secret must be ownable. `&[u8]` is a compile error pointing at
+`&[u8; N]` or at using `assert_constant_time!(secret_bytes = …)` without a
+contract.
+
+The binding is pinned by a test pair in `examples/discovery-hazard`: two
+contracts share a body that indexes by its first parameter, one declaring that
+parameter secret (`violated`) and one declaring the unused second parameter
+secret (`covered`). Marking by position would make both verdicts identical.
 
 Coverage states are therefore:
 
@@ -429,12 +457,13 @@ listed; `async` functions; multi-threaded tests.
   corrupt a definedness analysis, but this does mean `cargo trace-check test`
   is not a substitute for running Memcheck normally.
 * **Calibration proves marking works, not that the secret reached the function
-  under test.** A test that marks the right data but never passes it to the
-  function would calibrate successfully and observe no leak. The by-value API
-  removes the most common cause (constant folding past the marked storage) and
-  contract coverage mitigates the rest, but neither eliminates it. If a check
-  reports `NO_LEAK_OBSERVED` for code you believe is vulnerable, write the
-  vulnerable variant as a test first and confirm the tool detects it.
+  under test.** For a `#[constant_time]` contract this is now closed: the
+  adapter marks the declared parameter itself. For a bare
+  `assert_constant_time!` with no contract it remains open — the closure is free
+  to ignore the reference it is handed. If such a check reports
+  `NO_LEAK_OBSERVED` for code you believe is vulnerable, write the vulnerable
+  variant as a test first and confirm the tool detects it, or declare a
+  contract so the binding is enforced.
 * **Attribution is heuristic**, inherited from M2: stack-frame name matching
   within a bounded window.
 
@@ -524,9 +553,21 @@ the regression test asserts the sentinel stays absent and `list` still exits 0.
 
 **A contract could be reported covered without its function ever running.** The
 reviewer's counterexample reproduced exactly. Fixed with the `#[cfg(test)]`
-counter and `_ct` adapter described above; the claiming test now fails with a
-message naming the adapter, and the contract reports `inconclusive` rather than
-`covered`.
+counter and `_ct` adapter; the claiming test now fails with a message naming the
+adapter, and the contract reports `inconclusive` rather than `covered`.
+
+Re-review found two further escapes in the same model, both reproduced before
+fixing: a contract invoked **outside** the analyzed region, and a marked secret
+routed to the **wrong parameter**. Both reported `covered` with exit 0 for a
+function vulnerable in its declared secret. Fixed by moving marking into the
+adapter, which binds it to the declared slot — see
+[the adapter section](#the-adapter-owns-the-secret-so-a-contract-claim-means-something).
+
+**Discovery could deadlock on stderr.** `bounded_output` drained stdout
+concurrently but deferred stderr until the child exited, so a child writing past
+the pipe capacity to stderr blocked while the parent waited — turning a fine
+discovery into a timeout. Both pipes are now drained concurrently, with a
+combined output cap the function's name had always implied.
 
 **Same-named contracts overwrote each other.** Two modules each defining
 `verify` left one contract in the report. Identities are now module-qualified,

@@ -31,14 +31,13 @@ use trace_check_test::{assert_constant_time, ct_test};
 fn verify_tag_is_constant_time() {
     let supplied = [0u8; 32];
 
-    // `verify_tag_ct` is the adapter `#[constant_time]` generates. It counts
-    // the call and delegates to the untouched `verify_tag`, which is how the
-    // runner proves this test actually exercised the contract rather than
-    // merely naming it. Calling `verify_tag` directly fails the test.
-    let accepted = assert_constant_time!(
-        secret = secret_tag(),
-        call = |expected| verify_tag_ct(expected, &supplied),
-    );
+    // `verify_tag_ct` is the analysis adapter `#[constant_time]` generates. It
+    // takes the declared secret by value, marks it, runs the positive control,
+    // and calls the untouched `verify_tag` with that value in its declared
+    // slot. There is no way to invoke the contract without marking its secret,
+    // or to mark something else — which is what makes the coverage claim mean
+    // something. Calling `verify_tag` directly fails the test.
+    let accepted = verify_tag_ct(secret_tag(), &supplied);
 
     // The macro evaluates to the call's return value, so ordinary functional
     // assertions still work alongside the security check.

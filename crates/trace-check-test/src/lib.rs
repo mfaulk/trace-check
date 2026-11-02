@@ -44,9 +44,11 @@ pub use trace_check_secret::RunMode;
 pub mod calibration;
 pub mod meta;
 
-mod mark;
+// Named `marking` rather than `mark` so it cannot shadow the `mark` function
+// in path resolution.
+mod marking;
 
-pub use mark::{MarkSecret, SecretGuard};
+pub use marking::{MarkSecret, SecretGuard};
 
 /// Environment variable selecting the execution mode of a generated test.
 pub const MODE_ENV: &str = "TRACE_CHECK_MODE";
@@ -111,6 +113,34 @@ pub fn require_instrumentation(test: &str) {
 pub fn begin(test: &str) {
     require_instrumentation(test);
     calibration::run();
+}
+
+/// Starts the analyzed region inside a generated contract adapter.
+///
+/// Separate from [`begin`] only so the panic message can name the contract
+/// rather than a file and line.
+pub fn contract_begin(contract: &str) {
+    require_instrumentation(contract);
+    calibration::run();
+}
+
+/// Marks one secret for the lifetime of the returned guard.
+///
+/// Generic over `?Sized` rather than taking `&dyn MarkSecret`: a `&[u8]` is
+/// already a fat pointer, so it cannot be coerced into a trait object.
+pub fn mark<T: MarkSecret + ?Sized>(value: &T) -> SecretGuard<'_> {
+    value.mark()
+}
+
+/// Returns `value` through an optimization barrier.
+///
+/// Load-bearing inside a contract adapter. `#[inline(never)]` stops the
+/// adapter from being inlined, but it does not stop interprocedural constant
+/// propagation from specializing it for a constant argument — and if the
+/// optimizer knows the secret's value it will use an immediate and never read
+/// the marked storage, producing a clean result for vulnerable code.
+pub fn launder<T>(value: T) -> T {
+    std::hint::black_box(value)
 }
 
 /// Ends an analyzed region by declassifying the produced value.

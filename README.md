@@ -86,9 +86,12 @@ its pointer, length and capacity and none of the heap data.
 
 `#[constant_time(secret = "expected")]` declares a contract on a function. It
 emits the function verbatim — no production behavior change — plus, under
-`#[cfg(test)]`, an invocation counter and a `<function>_ct` adapter. Tests call
-the adapter, so a contract is reported `covered` only when a test both ran clean
-and **proved it invoked the function**; one that merely names a target fails.
+`#[cfg(test)]`, an invocation counter and a `<function>_ct` **analysis adapter**
+that takes the declared secret by value, marks it, and calls the untouched
+function with it in its declared slot. Tests call the adapter, so a contract is
+`covered` only when a test ran clean *and* provably exercised the function with
+its declared secret marked — a test cannot invoke the contract with public
+inputs, nor route the marked value to a different parameter.
 Contracts are identified by module-qualified path, so two modules may each
 define `verify` without one shadowing the other.
 
