@@ -23,6 +23,15 @@
 //! fails unless that counter advanced during the analyzed call. The adapter
 //! delegates to the untouched function, so the code being analyzed is the real
 //! one.
+//!
+//! **Symbolic verification needs the contract in a non-test build.** The
+//! adapter, the counter and the metadata test are M3's dynamic-coverage
+//! machinery and stay `#[cfg(test)]`. The *descriptor* — identity, parameter
+//! roles, representations and widths, read straight off the signature — is
+//! emitted unconditionally as `#[doc(hidden)]` string constants, because a
+//! verification harness links the ordinary library build. A `&'static str`
+//! const is not codegen'd unless something reads it, so a production build is
+//! unchanged.
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
@@ -122,6 +131,10 @@ pub fn constant_time(attr: TokenStream, item: TokenStream) -> TokenStream {
     let counter = counter_ident(&name_literal);
     let adapter = adapter_ident(&name_literal);
     let meta_fn = format_ident!("__trace_check_contract_{}", name);
+    let descriptor_const = descriptor_ident(&name_literal);
+    let module_const = module_ident(&name_literal);
+    let site_const = site_ident(&name_literal);
+    let descriptor = describe_contract(&function, &args.secrets);
 
     let adapter_parts = match adapter_signature(&function, &args.secrets) {
         Ok(parts) => parts,
@@ -140,6 +153,25 @@ pub fn constant_time(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     quote! {
         #function
+
+        /// Module this contract was declared in, so a verifier can qualify its
+        /// identity the same way the reports do. Not test-only: a verification
+        /// harness links the ordinary library build.
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        #visibility const #module_const: &str = module_path!();
+
+        /// Where the contract is declared, so a report names the developer's
+        /// own source rather than a generated harness.
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        #visibility const #site_const: &str = concat!(file!(), ":", line!());
+
+        /// Machine-readable contract descriptor, derived from this function's
+        /// own signature at expansion time so it cannot drift from it.
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        #visibility const #descriptor_const: &str = #descriptor;
 
         /// Counts invocations made through the contract adapter. Test-only.
         #[cfg(test)]
@@ -334,6 +366,167 @@ fn counter_ident(function: &str) -> Ident {
 /// Name of the generated contract adapter: `verify_tag` -> `verify_tag_ct`.
 fn adapter_ident(function: &str) -> Ident {
     format_ident!("{}_ct", function)
+}
+
+/// Name of the generated contract descriptor constant.
+fn descriptor_ident(function: &str) -> Ident {
+    format_ident!("__TRACE_CHECK_CONTRACT_{}", function)
+}
+
+/// Name of the generated module-path constant.
+fn module_ident(function: &str) -> Ident {
+    format_ident!("__TRACE_CHECK_MODULE_{}", function)
+}
+
+/// Name of the generated declaration-site constant.
+fn site_ident(function: &str) -> Ident {
+    format_ident!("__TRACE_CHECK_SITE_{}", function)
+}
+
+/// Schema version of the emitted descriptor. A verifier that does not
+/// understand it refuses rather than guessing at the fields.
+const DESCRIPTOR_SCHEMA_VERSION: u32 = 1;
+
+/// Builds the JSON descriptor for a contract from its parsed signature.
+///
+/// Emitted for every annotated function, including ones whose parameters the
+/// symbolic backend cannot represent: an unsupported parameter is recorded as
+/// `repr: "unsupported"` with its rendered Rust type, and the *verifier*
+/// refuses the run. Rejecting it here instead would stop an existing M3
+/// contract from compiling, which M5 is not entitled to do.
+fn describe_contract(function: &ItemFn, secrets: &[String]) -> String {
+    let mut parameters = Vec::new();
+    for (position, argument) in function.sig.inputs.iter().enumerate() {
+        let FnArg::Typed(typed) = argument else {
+            continue;
+        };
+        let name = match &*typed.pat {
+            Pat::Ident(pattern) => pattern.ident.to_string(),
+            _ => continue,
+        };
+        let role = if secrets.contains(&name) {
+            "secret"
+        } else {
+            "public"
+        };
+        let mut fields = vec![
+            format!("\"name\":\"{}\"", json_escape(&name)),
+            format!("\"position\":{position}"),
+            format!("\"role\":\"{role}\""),
+        ];
+        fields.extend(describe_type(&typed.ty));
+        parameters.push(format!("{{{}}}", fields.join(",")));
+    }
+
+    let returns = match &function.sig.output {
+        ReturnType::Default => "{\"repr\":\"unit\"}".to_string(),
+        ReturnType::Type(_, ty) => format!("{{{}}}", describe_type(ty).join(",")),
+    };
+
+    format!(
+        "{{\"schema_version\":{DESCRIPTOR_SCHEMA_VERSION},\"function\":\"{}\",\
+         \"parameters\":[{}],\"returns\":{returns}}}",
+        json_escape(&function.sig.ident.to_string()),
+        parameters.join(","),
+    )
+}
+
+/// Classifies one type into the representation the symbolic backend uses, as
+/// JSON object fields.
+///
+/// Array lengths must be literal. A proc macro sees the token `TAG_LEN`, not
+/// `32`, and a guessed width would be marked into the analysis as fact — so an
+/// unresolvable length is `unsupported` and the verifier says why.
+fn describe_type(ty: &Type) -> Vec<String> {
+    let rust_type = format!("\"rust_type\":\"{}\"", json_escape(&render_type(ty)));
+    let mut fields = match ty {
+        Type::Path(path) => match path.path.get_ident().map(Ident::to_string).as_deref() {
+            Some(name @ ("u8" | "u16" | "u32" | "u64" | "bool")) => {
+                vec![format!("\"repr\":\"{name}\"")]
+            }
+            _ => vec!["\"repr\":\"unsupported\"".to_string()],
+        },
+        Type::Array(array) => match byte_array_length(array) {
+            Some(length) => vec![
+                "\"repr\":\"byte-array\"".to_string(),
+                format!("\"length\":{length}"),
+            ],
+            None => vec!["\"repr\":\"unsupported\"".to_string()],
+        },
+        Type::Reference(reference) if reference.mutability.is_none() => match &*reference.elem {
+            Type::Array(array) => match byte_array_length(array) {
+                Some(length) => vec![
+                    "\"repr\":\"ref-byte-array\"".to_string(),
+                    format!("\"length\":{length}"),
+                ],
+                None => vec!["\"repr\":\"unsupported\"".to_string()],
+            },
+            _ => vec!["\"repr\":\"unsupported\"".to_string()],
+        },
+        _ => vec!["\"repr\":\"unsupported\"".to_string()],
+    };
+    fields.push(rust_type);
+    fields
+}
+
+/// The literal length of a `[u8; N]`, or `None` for any other array.
+fn byte_array_length(array: &syn::TypeArray) -> Option<u64> {
+    let Type::Path(element) = &*array.elem else {
+        return None;
+    };
+    if !element.path.is_ident("u8") {
+        return None;
+    }
+    match &array.len {
+        Expr::Lit(ExprLit {
+            lit: Lit::Int(value),
+            ..
+        }) => value.base10_parse().ok(),
+        _ => None,
+    }
+}
+
+/// Renders a type for human-readable errors, with `quote`'s token spacing
+/// tidied so `& [u8 ; 16]` reads as `&[u8; 16]`.
+fn render_type(ty: &Type) -> String {
+    let tokens = quote! { #ty }.to_string();
+    let mut out = String::with_capacity(tokens.len());
+    for character in tokens.chars() {
+        match character {
+            ' ' => {
+                if !matches!(
+                    out.chars().next_back(),
+                    None | Some('&' | '[' | '(' | '<' | ' ')
+                ) {
+                    out.push(' ');
+                }
+            }
+            ';' | ',' | ']' | ')' | '>' | '<' => {
+                while out.ends_with(' ') {
+                    out.pop();
+                }
+                out.push(character);
+            }
+            other => out.push(other),
+        }
+    }
+    out.trim().to_string()
+}
+
+/// Escapes a string for the emitted JSON. The inputs are identifiers and
+/// rendered types, so the surface is small, but it is escaped rather than
+/// trusted.
+fn json_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The three paths a `target` refers to, with any module prefix preserved.
@@ -596,5 +789,144 @@ fn string_value(expr: &Expr) -> syn::Result<String> {
             other,
             "expected a string literal naming a parameter",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use syn::parse_quote;
+
+    /// A supported signature is described with each parameter's role, position,
+    /// representation and width, read off the declaration itself.
+    #[test]
+    fn a_supported_signature_is_described_fully() {
+        let function: ItemFn = parse_quote! {
+            pub fn verify_tag(expected: &[u8; 16], supplied: &[u8; 16]) -> bool { true }
+        };
+        let descriptor = describe_contract(&function, &["expected".to_string()]);
+        assert!(descriptor.contains("\"schema_version\":1"), "{descriptor}");
+        assert!(
+            descriptor.contains("\"function\":\"verify_tag\""),
+            "{descriptor}"
+        );
+        assert!(
+            descriptor.contains(
+                "{\"name\":\"expected\",\"position\":0,\"role\":\"secret\",\
+                 \"repr\":\"ref-byte-array\",\"length\":16,\"rust_type\":\"&[u8; 16]\"}"
+            ),
+            "{descriptor}"
+        );
+        assert!(
+            descriptor.contains("\"name\":\"supplied\",\"position\":1,\"role\":\"public\""),
+            "{descriptor}"
+        );
+        assert!(
+            descriptor.contains("\"returns\":{\"repr\":\"bool\""),
+            "{descriptor}"
+        );
+    }
+
+    /// Scalars carry their width through the representation name.
+    #[test]
+    fn scalar_parameters_keep_their_width() {
+        let function: ItemFn = parse_quote! {
+            pub fn reduce(value: u32, modulus: u64) -> u32 { value }
+        };
+        let descriptor = describe_contract(&function, &["value".to_string()]);
+        assert!(
+            descriptor.contains("\"role\":\"secret\",\"repr\":\"u32\""),
+            "{descriptor}"
+        );
+        assert!(
+            descriptor.contains("\"role\":\"public\",\"repr\":\"u64\""),
+            "{descriptor}"
+        );
+    }
+
+    /// An owned byte array is described by value, distinct from a reference.
+    #[test]
+    fn an_owned_byte_array_is_distinguished_from_a_reference() {
+        let function: ItemFn = parse_quote! {
+            pub fn f(key: [u8; 32]) -> u8 { key[0] }
+        };
+        let descriptor = describe_contract(&function, &["key".to_string()]);
+        assert!(
+            descriptor.contains("\"repr\":\"byte-array\",\"length\":32"),
+            "{descriptor}"
+        );
+    }
+
+    /// A shape the backend cannot represent is recorded as unsupported with its
+    /// rendered type, so the verifier can refuse and name it. Rejecting it in
+    /// the macro would stop an existing M3 contract from compiling.
+    #[test]
+    fn an_unsupported_shape_is_recorded_rather_than_rejected() {
+        let function: ItemFn = parse_quote! {
+            pub fn f(table: &[u8; TAG_LEN], other: &str) -> bool { true }
+        };
+        let descriptor = describe_contract(&function, &["table".to_string()]);
+        assert!(
+            descriptor.contains("\"repr\":\"unsupported\",\"rust_type\":\"&[u8; TAG_LEN]\""),
+            "{descriptor}"
+        );
+        assert!(
+            descriptor.contains("\"repr\":\"unsupported\",\"rust_type\":\"&str\""),
+            "{descriptor}"
+        );
+    }
+
+    /// A non-literal array length is never guessed at: a proc macro sees the
+    /// token, not the value, and a wrong width would be marked into the
+    /// analysis as fact.
+    #[test]
+    fn a_named_array_length_is_not_guessed() {
+        let array: syn::TypeArray = parse_quote! { [u8; TAG_LEN] };
+        assert_eq!(byte_array_length(&array), None);
+        let literal: syn::TypeArray = parse_quote! { [u8; 16] };
+        assert_eq!(byte_array_length(&literal), Some(16));
+        let wrong_element: syn::TypeArray = parse_quote! { [u16; 16] };
+        assert_eq!(byte_array_length(&wrong_element), None);
+    }
+
+    /// A function with no return value is described, not skipped.
+    #[test]
+    fn a_unit_return_is_described() {
+        let function: ItemFn = parse_quote! { pub fn f(secret: u8) {} };
+        let descriptor = describe_contract(&function, &["secret".to_string()]);
+        assert!(
+            descriptor.contains("\"returns\":{\"repr\":\"unit\"}"),
+            "{descriptor}"
+        );
+    }
+
+    /// The emitted descriptor is valid JSON with escaped strings.
+    #[test]
+    fn the_descriptor_is_well_formed_json() {
+        assert_eq!(json_escape("a\"b\\c"), "a\\\"b\\\\c");
+        let function: ItemFn = parse_quote! {
+            pub fn f(secret: &[u8; 8], mode: u8) -> u8 { mode }
+        };
+        let descriptor = describe_contract(&function, &["secret".to_string()]);
+        // Balanced and quote-consistent: a hand-built JSON string has to be
+        // checked, not assumed.
+        assert_eq!(
+            descriptor.chars().filter(|c| *c == '{').count(),
+            descriptor.chars().filter(|c| *c == '}').count(),
+            "{descriptor}"
+        );
+        assert!(
+            descriptor.chars().filter(|c| *c == '"').count() % 2 == 0,
+            "{descriptor}"
+        );
+    }
+
+    /// Rendered types read the way a developer wrote them.
+    #[test]
+    fn rendered_types_are_readable() {
+        assert_eq!(render_type(&parse_quote! { &[u8; 16] }), "&[u8; 16]");
+        assert_eq!(render_type(&parse_quote! { [u8; 16] }), "[u8; 16]");
+        assert_eq!(render_type(&parse_quote! { Vec<u8> }), "Vec<u8>");
+        assert_eq!(render_type(&parse_quote! { &[u8] }), "&[u8]");
     }
 }
