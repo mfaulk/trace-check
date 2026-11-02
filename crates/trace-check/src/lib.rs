@@ -16,6 +16,11 @@
 //! share only the outcome vocabulary and provenance in [`security`] — their
 //! evidence is of different kinds and is reported separately.
 //!
+//! The symbolic backend has two artifact sources. M4's compiles one
+//! hand-written `no_std` file; M5's [`harness`] generates a `no_std` harness
+//! package around a developer's real Cargo library, so the function analyzed is
+//! the one they ship. Both feed the same engine.
+//!
 //! A third backend reasons *symbolically*: [`symbolic`] drives BINSEC's
 //! relational symbolic execution over an optimized native artifact, searching
 //! for a secret assignment that leaks rather than sampling chosen inputs. When
@@ -25,7 +30,10 @@
 
 pub mod census;
 pub mod compare;
+pub mod contract;
 pub mod experiment;
+pub mod harness;
+pub mod library_report;
 pub mod memcheck;
 pub mod native;
 pub mod native_report;
@@ -160,4 +168,82 @@ pub fn run_symbolic(
         verifier.provenance(&artifact, &hash),
         selected.len(),
     ))
+}
+
+use contract::{ContractError, VerifyConfig};
+use harness::{Artifact, Harness, HarnessError, Library, ResolvedSymbol};
+use library_report::{LibraryReport, Verified};
+
+/// Verifies declared contracts against the real functions in a Cargo library.
+///
+/// One artifact per contract, deliberately. A shared artifact would need one
+/// entry symbol per contract, and anything `_start` does not reach is dropped
+/// as dead code — a multi-entry harness silently lost two entry symbols during
+/// the feasibility spike. Per-contract packages make that unrepresentable, and
+/// let each report name the exact executable its result describes.
+pub fn run_contract_verification(
+    library: &Library,
+    config: &VerifyConfig,
+    contracts: &[String],
+    work_root: &Path,
+    runtime: Option<&str>,
+) -> Result<LibraryReport, HarnessError> {
+    let mut verifier = symbolic::Verifier::prepare_with(runtime)?;
+    verifier.check_image()?;
+
+    let mut entries = Vec::new();
+    let mut provenance = None;
+    for contract_id in contracts {
+        let settings =
+            config
+                .settings(contract_id)
+                .ok_or_else(|| ContractError::NotConfigured {
+                    contract: contract_id.clone(),
+                    available: config.contracts().iter().map(|c| c.to_string()).collect(),
+                })?;
+        // A generated package per contract, sharing one target directory.
+        // Per-contract target directories rebuilt `core`, `subtle` and the
+        // library itself for every contract and left hundreds of megabytes
+        // behind; sharing is safe because each generated package has its own
+        // name, so their binaries do not collide.
+        let work_dir = work_root.join("contracts").join(sanitize(contract_id));
+        let target_dir = work_root.join("target");
+        for directory in [&work_dir, &target_dir] {
+            std::fs::create_dir_all(directory)
+                .map_err(|e| HarnessError::Io(format!("{}: {e}", directory.display())))?;
+        }
+
+        let contract = harness::probe_contract(library, contract_id, &work_dir, &target_dir)?;
+        // Checked after the descriptor is known, so the message can name the
+        // declared secrets rather than guess at them.
+        settings.validate_inputs(contract_id, &contract.descriptor)?;
+
+        let generated: Harness = harness::generate(library, &contract)?;
+        let artifact: Artifact =
+            harness::build(library, &generated, contract_id, &work_dir, &target_dir)?;
+        let symbol: ResolvedSymbol = harness::resolve_symbol(&artifact.path, contract_id)?;
+
+        let case = harness::verification_case(&contract, &symbol, &generated, settings);
+        let result = verifier.verify(&case, &artifact.path, &artifact.sha256)?;
+        provenance = Some(verifier.provenance(&artifact.path, &artifact.sha256));
+
+        entries.push(Verified {
+            contract,
+            case,
+            library: library.clone(),
+            symbol,
+            harness: generated,
+            artifact,
+            result,
+        });
+    }
+
+    let provenance = provenance.unwrap_or_else(|| verifier.provenance(Path::new("<none>"), ""));
+    Ok(library_report::build(entries, provenance, contracts.len()))
+}
+
+/// A contract identity as a directory name. Identities are Rust paths, already
+/// validated by `harness::split_contract`, so this only replaces separators.
+fn sanitize(contract: &str) -> String {
+    contract.replace("::", "-")
 }
