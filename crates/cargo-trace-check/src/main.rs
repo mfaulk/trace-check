@@ -77,6 +77,10 @@ enum Command {
         format: Format,
         #[arg(long)]
         workspace_root: Option<PathBuf>,
+        /// Container runtime to run the analyzer in. Defaults to whichever of
+        /// podman or docker holds the pinned image.
+        #[arg(long, value_parser = ["podman", "docker"])]
+        container_runtime: Option<String>,
     },
     /// List the discovered checks and contracts without running them.
     List {
@@ -151,11 +155,13 @@ fn execute(cli: Cli) -> Result<u8, String> {
             cases,
             format,
             workspace_root,
+            container_runtime,
         } => verify(
             case.as_deref(),
             cases.as_deref(),
             format,
             workspace_root.as_deref(),
+            container_runtime.as_deref(),
         ),
     }
 }
@@ -238,6 +244,7 @@ fn verify(
     cases_override: Option<&Path>,
     format: Format,
     workspace_root_override: Option<&Path>,
+    container_runtime: Option<&str>,
 ) -> Result<u8, String> {
     let root = resolve_workspace_root(workspace_root_override)?;
     let cases_path = cases_override
@@ -273,8 +280,14 @@ fn verify(
     // not its path, is what a report is pinned to.
     let out_dir =
         std::env::temp_dir().join(format!("trace-check-symbolic-build-{}", std::process::id()));
-    let report = trace_check::run_symbolic(&case_file, &case_dir, &selected, &out_dir)
-        .map_err(|e| e.to_string())?;
+    let report = trace_check::run_symbolic(
+        &case_file,
+        &case_dir,
+        &selected,
+        &out_dir,
+        container_runtime,
+    )
+    .map_err(|e| e.to_string())?;
 
     match format {
         Format::Text => print!("{}", report.to_text()),
