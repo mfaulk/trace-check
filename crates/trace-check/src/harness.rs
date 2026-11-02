@@ -135,11 +135,7 @@ impl Workspace {
     /// root nothing can pre-exist, so an `AlreadyExists` here means two
     /// contracts collided on a name and is reported rather than written into.
     fn contract_dir(&self, contract: &str) -> Result<PathBuf, HarnessError> {
-        let contracts = self.root().join("contracts");
-        if !contracts.exists() {
-            std::fs::create_dir(&contracts)
-                .map_err(|e| HarnessError::Io(format!("{}: {e}", contracts.display())))?;
-        }
+        let contracts = share(&self.root().join("contracts"))?;
         let directory = contracts.join(package_suffix(contract));
         std::fs::create_dir(&directory)
             .map_err(|e| HarnessError::Io(format!("{}: {e}", directory.display())))?;
@@ -154,17 +150,29 @@ impl Workspace {
     /// megabytes behind. Each generated package is named after its contract, so
     /// their binaries do not collide.
     fn target_dir(&self) -> Result<PathBuf, HarnessError> {
-        let directory = self.root().join("target");
-        if !directory.exists() {
-            std::fs::create_dir(&directory)
-                .map_err(|e| HarnessError::Io(format!("{}: {e}", directory.display())))?;
-        }
-        Ok(directory)
+        share(&self.root().join("target"))
     }
 
     /// The two directories one contract's build needs.
     pub fn directories_for(&self, contract: &str) -> Result<(PathBuf, PathBuf), HarnessError> {
         Ok((self.contract_dir(contract)?, self.target_dir()?))
+    }
+}
+
+/// Creates a directory shared by every contract in a run, tolerating one that
+/// a previous contract already made.
+///
+/// `create_dir` and then forgive `AlreadyExists`, rather than `exists()` and
+/// then create: the check-then-act form is a race, and inside an atomically
+/// created private root the only thing it can race with is this tool itself.
+/// The per-contract directory below deliberately does **not** forgive it — an
+/// existing one there means two contracts collided on a name, which must be
+/// reported rather than written into.
+fn share(directory: &Path) -> Result<PathBuf, HarnessError> {
+    match std::fs::create_dir(directory) {
+        Ok(()) => Ok(directory.to_path_buf()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(directory.to_path_buf()),
+        Err(e) => Err(HarnessError::Io(format!("{}: {e}", directory.display()))),
     }
 }
 
