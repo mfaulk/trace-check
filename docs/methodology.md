@@ -259,3 +259,15 @@ formal end.
 One boundary applies to all of it here: WASM is a convenient, stable IR, but it
 is not what runs on hardware. A clean WASM screen says nothing about a native
 build — the same argument as the `early_exit` erasure, one level up.
+
+## Bounded relational verification
+
+The symbolic backend (`verify`) answers a different question from everything
+above, so its methodology lives with it:
+[docs/MILESTONE-04.md](MILESTONE-04.md) states the relational noninterference
+property, the threat model, what the fail-closed classifier requires before it
+will report `VERIFIED_BOUNDED`, and the bounds every such claim is scoped to.
+The short version: instead of running inputs someone chose, it asks a solver
+whether *any* secret assignment in a declared domain changes the executed path
+or an effective address, and reports `INCONCLUSIVE` whenever the search cannot
+be shown to have finished.

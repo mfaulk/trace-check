@@ -17,10 +17,17 @@ the formal noninterference property, and the roadmap.
 | M1 | Differential execution tracing (WASM, WABT) | complete |
 | M2 | Native secret-dependency analysis (Valgrind Memcheck) | complete |
 | M3 | Rust developer API — annotations, assertions, CI | complete |
-| M4 | Symbolic verification — no concrete vectors | future |
+| M4 | Bounded relational verification (BINSEC symbolic execution) | complete, experimental |
 | M5 | Hardware-oriented validation — statistical timing | future |
 
-`trace-check` turns that idea into reproducible analysis, from three directions:
+`trace-check` turns that idea into reproducible analysis, from four directions:
+
+* **Bounded relational verification** (`verify`, experimental) — compile an
+  optimized native target and ask a relational symbolic executor whether *any*
+  secret assignment in a declared domain changes the executed path or an
+  effective address. When the search completes without finding one, the result
+  is `VERIFIED_BOUNDED`: a claim quantified over the whole declared domain
+  rather than over the inputs someone happened to test.
 
 * **Native secret-dependency analysis** (`native`) — mark a secret's shadow
   state as undefined, run under Valgrind Memcheck, and let it report wherever a
@@ -38,6 +45,7 @@ the formal noninterference property, and the roadmap.
 
 ```sh
 cargo trace-check test                           # your own crate's checks (M3)
+cargo trace-check verify                         # bounded symbolic search (M4)
 cargo run -p trace-check -- native               # native, under Memcheck
 cargo run -p trace-check -- screen mac-compare   # static, no execution
 cargo run -p trace-check -- demo mac-compare     # dynamic WASM tracing
@@ -126,6 +134,19 @@ Results are reported as one of three outcomes:
 | `NO_DIFFERENCE_OBSERVED` | Paths matched **for the tested inputs**. Not proof of constant-time security. |
 | `INCONCLUSIVE` | Capture, parsing, nondeterminism, or a confounded decision prevented a trustworthy answer. |
 
+The native backends add `LEAK_DETECTED`, and the symbolic backend adds
+`VERIFIED_BOUNDED`. The two clean results are deliberately different words:
+
+| Outcome | Produced by | Claim |
+| --- | --- | --- |
+| `NO_LEAK_OBSERVED` | `native`, `test` | Nothing was seen on the paths these inputs took. Says nothing about any other input. |
+| `VERIFIED_BOUNDED` | `verify` | No secret assignment **in the declared domain** changes the path or an address, for this artifact, under the modeled observations. |
+
+Neither is a proof of constant-time security in general: `VERIFIED_BOUNDED` is
+scoped to a declared input domain, an exploration bound, one compiled artifact,
+and a model that excludes cache, speculation, operand latency, and every other
+hardware effect.
+
 The static screen reports per-function findings instead, of three kinds:
 `secret_dependent_branch`, `secret_dependent_address` (an identical
 instruction path whose memory access pattern still varies), and
@@ -135,7 +156,7 @@ as informational, not a leak: it is branchless, which is the point.
 See [docs/limitations.md](docs/limitations.md) for the full boundary, and
 [docs/methodology.md](docs/methodology.md) for the threat model and procedure.
 
-## Why three backends: the gap each one closes
+## Why four backends: the gap each one closes
 
 ```rust
 fn lookup(secret: u8, table: &[u8; 256]) -> u8 {
@@ -170,12 +191,26 @@ Result:
   LEAK_DETECTED
 ```
 
-| Leak | M1 differential tracing | M1 static screen | M2 native Memcheck |
-| --- | --- | --- | --- |
-| secret-dependent branch | detected | flagged structurally | detected, with source location |
-| secret-dependent address | **invisible** | flagged structurally | **detected** |
-| quantified over all inputs | no | yes | no (executed paths only) |
-| analyzes native code | no (WASM) | no (WASM) | yes |
+| Leak | M1 differential tracing | M1 static screen | M2 native Memcheck | M4 symbolic |
+| --- | --- | --- | --- | --- |
+| secret-dependent branch | detected | flagged structurally | detected, with source location | detected, with address |
+| secret-dependent address | **invisible** | flagged structurally | **detected** | **detected** |
+| quantified over all inputs | no | yes | no (executed paths only) | yes, over a declared domain |
+| analyzes native code | no (WASM) | no (WASM) | yes | yes |
+| needs concrete secrets | yes | no | yes | **no** |
+
+M2 and M3 still miss a leak that sits on a path no test takes:
+
+```rust
+fn conditional_lookup(table: &[u8; 256], secret: u8, public_mode: u8) -> u8 {
+    if public_mode == 0 { constant_time_scan(table, secret) }
+    else                { table[secret as usize] }
+}
+```
+
+A test exercising only `public_mode == 0` reports `NO_LEAK_OBSERVED` and is not
+wrong — that path really is constant time. M4 searches the public domain and
+finds the other one. That case is bundled as `conditional-lookup`.
 
 ## The example and its result
 
@@ -227,6 +262,21 @@ Observed event counts for `early_exit_opaque`, by mismatch position:
   Pass `--allow-wabt-version-mismatch` to run against another version; results
   are then not comparable to recorded ones.
 
+* **Valgrind 3.28.0 or newer** plus its client-request headers, for `native`
+  and `cargo trace-check test`. On Debian/Ubuntu: `apt-get install valgrind`.
+
+* **A container runtime and the pinned analyzer image**, for `verify` only.
+  The analyzer is pinned by **digest**, not tag, so the solver linked inside it
+  is pinned with it:
+
+  ```sh
+  podman pull docker.io/binsec/binsec@sha256:19a0ff4b0278906bd6f00a5752cab19e8cad7153715cecf32d4f885826f62967
+  ```
+
+  Docker works too. `verify` refuses to run if the runtime or the image is
+  missing, rather than skipping and reporting success. Nothing else needs it:
+  a developer without a container runtime can still run every other command.
+
 ## Commands
 
 ### `native` — secret-dependency analysis of native code
@@ -269,6 +319,56 @@ surfaces as an unmet expectation.
 Requires **Valgrind** on Linux x86-64 (`apt-get install valgrind` or
 `dnf install valgrind valgrind-devel`). Ubuntu's `valgrind` package also ships
 the client-request headers the instrumentation shim needs at build time.
+
+### `verify` — bounded relational verification (experimental)
+
+```sh
+cargo trace-check verify                        # every bundled case
+cargo trace-check verify --case table-lookup    # one case
+cargo trace-check verify --format json
+cargo trace-check verify --cases path/to/cases.json
+```
+
+Builds `examples/symbolic/src/targets.rs` as an optimized freestanding
+`x86_64` ELF, then runs BINSEC's relational symbolic execution (`-checkct`) over
+it. Each case declares which globals are secret, which are public, where
+analysis starts and halts, any `assume` constraints on the input domain, and
+the outcome it expects.
+
+```text
+Case: conditional-lookup
+  a leak reachable only under one public mode
+
+Result:
+  LEAK_DETECTED
+  1 divergence site(s): 0 secret-dependent branch(es), 1 secret-dependent memory access(es)
+
+Divergence:
+  Secret-dependent memory access at 0x2016b3
+    secret_lookup (targets.rs:47)
+    inlined through: core::ptr::read_volatile::<u8> (mod.rs:2107) <- secret_lookup (targets.rs:47)
+
+Witness:
+  concrete inputs: unavailable_from_analyzer
+
+Analysis:
+  paths 2 of 2 explored, 0 pending
+  checks: 3 / 3 control flow, 33 / 34 memory access
+  unknown solver answers 0, depth bound 2000, max depth reached 105
+  exploration complete: true
+```
+
+Classification is **fail-closed**. A clean verdict becomes
+`VERIFIED_BOUNDED` only if exploration also demonstrably completed, no solver
+query returned `unknown`, and a non-zero number of relational obligations were
+actually discharged; otherwise it is `INCONCLUSIVE`. The analyzer reports the
+leaking instruction but not its satisfying model, so no concrete witness values
+are available — the report says so rather than inventing a pair.
+
+This is the one backend whose result is a statement about *all* secrets in a
+domain. It is also the narrowest in scope: see
+[docs/MILESTONE-04.md](docs/MILESTONE-04.md) and
+[examples/symbolic/README.md](examples/symbolic/README.md).
 
 ### `screen` — static screening and the regression gate
 
@@ -350,9 +450,9 @@ modeled secret, and are git-ignored except for the compact fixtures under
 
 | Code | Meaning |
 | --- | --- |
-| `0` | `demo`: every declared expectation reproduced. `screen`: every declaration held and the census did not drift. `compare`: `NO_DIFFERENCE_OBSERVED`. |
-| `1` | `demo`: an expectation was not reproduced. `screen`: a finding, an unmet declaration, or baseline drift. `compare`: `DIFFERENCE_DETECTED`. |
-| `2` | Error or `INCONCLUSIVE`: missing backend, build failure, timeout, trap, unparseable trace. |
+| `0` | `demo`: every declared expectation reproduced. `screen`: every declaration held and the census did not drift. `compare`: `NO_DIFFERENCE_OBSERVED`. `verify`: every selected case met its declared expectation. |
+| `1` | `demo`: an expectation was not reproduced. `screen`: a finding, an unmet declaration, or baseline drift. `compare`: `DIFFERENCE_DETECTED`. `verify`: a violation was found where none was expected. |
+| `2` | Error or `INCONCLUSIVE`: missing backend, build failure, timeout, trap, unparseable trace, missing symbol, invalid case file. |
 
 A missing tool, a trap, a timeout, an oversized capture, an unknown export, a
 truncated trace, or a wrong authentication decision is always an explicit
@@ -379,10 +479,13 @@ crates/trace-check/
   src/memcheck.rs                Valgrind XML parsing and classification
   src/native.rs                  native build + bounded Memcheck execution
   src/native_report.rs           native text and JSON reporting
+  src/symbolic.rs                BINSEC relational verification backend
+  src/symbolic_report.rs         symbolic text and JSON reporting
 crates/trace-check-secret/       secret marking for Memcheck (C shim)
 crates/trace-check-test/         developer API: assert_constant_time!, ct_test
 crates/trace-check-macros/       the ct_test and constant_time attributes
-crates/cargo-trace-check/        the `cargo trace-check test` subcommand
+crates/cargo-trace-check/        the `cargo trace-check test` and `verify`
+                                 subcommands
   tests/integration.rs           fixture and end-to-end tests
   tests/fixtures/                compact captured traces
 examples/mac-compare/            the example, its cases.json, screen.json
@@ -390,9 +493,12 @@ examples/mac-compare/            the example, its cases.json, screen.json
 examples/table-lookup/           the secret-indexed address-leak example
 examples/native-cases.json       native case manifest with expectations
 examples/consumer-crate/         using trace-check as a dependency (M3)
+examples/symbolic/               freestanding targets + cases.json for `verify`
 examples/legacy-branch-demo/     original proof of concept, kept for context
 docs/                            milestone plan, methodology, limitations
-.github/workflows/ci.yml         pinned Linux CI
+ci/verify-m3-consumer.py         asserts the M3 consumer report, not its exit code
+ci/verify-m4-symbolic.py         asserts the M4 symbolic report, not its exit code
+.github/workflows/ci.yml         pinned Linux CI (M1-M3 job + M4 analyzer job)
 ```
 
 ## Development

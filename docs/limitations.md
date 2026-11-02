@@ -27,6 +27,38 @@ Specifically, it does **not** rule out:
 * cache, branch-predictor, prefetcher, or speculative-execution effects,
 * anything about the native code a different compilation would produce.
 
+## `VERIFIED_BOUNDED` is the strongest result here, and still not a proof
+
+The symbolic backend (`verify`) is the only one whose clean result quantifies
+over inputs rather than sampling them. When it reports `VERIFIED_BOUNDED` it
+has established: for the **declared** secret and public globals, within the
+**declared** `assume` constraints and the exploration depth bound, no secret
+assignment changes the executed instruction path or any effective memory
+address, in **this one** compiled artifact.
+
+Everything outside those words is unestablished. In particular it does **not**
+rule out:
+
+* a leak outside the declared input domain, or beyond the depth bound — a case
+  that stops early is `INCONCLUSIVE`, never verified,
+* secret-dependent **instruction latency**; BINSEC has experimental
+  multiplication and division checks and they are deliberately off,
+* cache, branch-predictor, prefetcher, or speculative-execution effects,
+* anything about a different build. The artifact's SHA-256, the `rustc`
+  version, and the exact flags are recorded because a recompilation
+  invalidates the result,
+* anything about the *surroundings* of the function. The analyzed artifact is a
+  freestanding `no_std` harness whose inputs are globals; the function under
+  test is ordinary optimized Rust, but its calling context is not.
+
+A differing execution path is also not a measured timing signal. The solver
+proves that two executions diverge; nothing in this project measures what that
+divergence costs on real hardware. That is Milestone 5.
+
+Finally, the analyzer localizes a leak without exposing the satisfying model,
+so there is no concrete pair of secrets to replay. The report records
+`unavailable_from_analyzer` rather than manufacturing a witness.
+
 ## `DIFFERENCE_DETECTED` does not quantify a vulnerability
 
 An observed path difference is evidence of secret-dependent program behavior. It
@@ -94,15 +126,26 @@ to go inspect the artifact.
 
 ## Scope boundaries by construction
 
-Out of scope for Milestone 1, by design rather than by omission:
+Out of scope for the WASM backend (Milestone 1), by design rather than by
+omission. Native instrumentation arrived in M2 and bounded symbolic
+verification in M4; the rest remains out of scope for the project as a whole:
 
-* native instrumentation (Valgrind) and hardware-level measurement,
-* memory-address and cache-line analysis *as an observed trace* — Tier 1 flags
-  secret-dependent addresses structurally, but nothing measures them,
+* native instrumentation and hardware-level measurement — *M2 added Valgrind
+  Memcheck; hardware measurement is still absent*,
+* memory-address analysis — *M2 and M4 both detect secret-dependent addresses;
+  cache-line behavior is still unmodeled*,
 * statistical timing measurement,
 * secret-taint analysis or automatic discovery of which inputs are secret,
 * instrumentation of arbitrary crates or full protocol integrations,
 * general-purpose constant-time certification.
+
+Out of scope for the symbolic backend (Milestone 4), by instruction: no custom
+symbolic execution engine, no custom SMT solver, no heap modeling or dynamic
+allocation, no concurrency, no unbounded loops or recursion, no automatic
+verification of arbitrary crates, no automatic verification of every
+`#[constant_time]` annotation, and no proof certification. Connecting M3
+contracts to the symbolic backend is deferred until the native verification
+model has proven reliable.
 
 ## Reading the fixture's expectations
 
