@@ -273,20 +273,41 @@ impl MemcheckError {
     }
 }
 
-/// Matches a demangled frame name against a plain function name. Frames appear
-/// as `crate::module::function` or with generic suffixes, so compare the path
-/// tail rather than requiring equality.
+/// Matches a demangled frame name against a function a target names.
+///
+/// A `#[ct_test(target = …)]` names either a bare function (`verify_tag`) or a
+/// module-qualified path (`tag::verify_tag`). A frame's demangled name may be
+/// equally qualified (`crypto::tag::verify_tag`) or, for a function the linker
+/// kept local, just the bare name — both occur in one artifact. Matching
+/// therefore compares the **common path suffix**: the two agree on every
+/// segment they both have, ending with the function name.
+///
+/// Requiring the target's whole path to appear in the frame left every
+/// qualified target unattributable against a bare frame name, which turned a
+/// detected leak inside the declared function into `INCONCLUSIVE` — a missed
+/// detection, the worse of the two errors.
+///
+/// A bare frame name carries no module information, so it cannot distinguish
+/// two same-named functions in different modules. That gap is closed earlier,
+/// not here: `resolve_targets` refuses a run in which a target's bare name
+/// matches more than one declared contract.
 fn frame_names_function(frame: &str, function: &str) -> bool {
-    let without_generics = frame
-        .split(['<', '('])
-        .next()
-        .unwrap_or(frame)
-        .trim_end_matches("::");
-    without_generics
-        .rsplit("::")
-        .next()
-        .is_some_and(|tail| tail == function)
-        || without_generics == function
+    let segments = |name: &str| -> Vec<String> {
+        name.split(['<', '('])
+            .next()
+            .unwrap_or(name)
+            .trim_end_matches("::")
+            .split("::")
+            .map(|segment| segment.trim().to_string())
+            .collect()
+    };
+    let frame = segments(frame);
+    let wanted = segments(function);
+    if frame.iter().chain(&wanted).any(String::is_empty) {
+        return false;
+    }
+    let common = frame.len().min(wanted.len());
+    common > 0 && frame[frame.len() - common..] == wanted[wanted.len() - common..]
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -698,6 +719,45 @@ mod tests {
         assert_eq!(error.auxiliary_stacks.len(), 1);
         assert_eq!(error.auxiliary_stacks[0].frames.len(), 2);
         assert_eq!(error.origin_frames().len(), 2);
+    }
+
+    /// A module-qualified target is attributed to a frame whose path ends with
+    /// it, and only to such a frame. Comparing final segments alone made every
+    /// `target = "module::function"` unattributable.
+    #[test]
+    fn a_module_qualified_target_matches_its_own_frame_only() {
+        assert!(frame_names_function(
+            "crypto::tag::verify_tag",
+            "tag::verify_tag"
+        ));
+        assert!(frame_names_function(
+            "crypto::tag::verify_tag",
+            "verify_tag"
+        ));
+        assert!(frame_names_function(
+            "crypto::tag::verify_tag",
+            "crypto::tag::verify_tag"
+        ));
+        assert!(
+            !frame_names_function("crypto::other::verify_tag", "tag::verify_tag"),
+            "a same-named function in another module must not be credited"
+        );
+        // A frame the linker kept local carries only the bare name, and a
+        // qualified target still has to be attributable to it.
+        assert!(frame_names_function(
+            "verify_tag_volatile_early_exit",
+            "tag::verify_tag_volatile_early_exit"
+        ));
+        assert!(
+            !frame_names_function("crypto::tag::verify_tag_early_exit", "tag::verify_tag"),
+            "a prefix of a longer name is not the function"
+        );
+        // Generic and argument suffixes are stripped before comparison.
+        assert!(frame_names_function(
+            "crypto::tag::verify_tag::<u8>",
+            "tag::verify_tag"
+        ));
+        assert!(!frame_names_function("verify_tag", ""));
     }
 
     /// Attribution ignores the origin stack. The origin names where the secret
