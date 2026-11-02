@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dev-dependencies]
 serde_json = "1.0"
+tempfile = "3"
 
 [dependencies]
 trace-check = { path = "../trace-check" }
