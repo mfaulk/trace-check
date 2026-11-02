@@ -1,0 +1,17 @@
+[package]
+name = "external-library"
+description = "A library outside the trace-check workspace, verified through the published CLI"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Excluded from the workspace on purpose: the point of this example is that
+# `cargo trace-check verify` works for a crate trace-check knows nothing about,
+# with its own lockfile and its own dependency resolution.
+[workspace]
+
+[dependencies]
+# Only the proc-macro crate, which is compiled for the host and contributes
+# nothing to the target binary. That is what lets a `no_std` library carry the
+# annotation without pulling `std` into its verification artifact.
+trace-check-macros = { path = "../../crates/trace-check-macros" }

@@ -1,0 +1,88 @@
+# Symbolic verification settings for this library's declared contracts.
+#
+# What is NOT here: which parameters are secret. That comes from
+# `#[constant_time(secret = …)]` on the function itself, and a configuration
+# that tried to assign a role would be rejected — a second description of the
+# contract is exactly the drift this design avoids. Public parameters are
+# symbolic and held equal between the paired executions by default; nothing is
+# silently fixed to a convenient value.
+#
+# `expected_outcome` is a regression fixture, never an input to the decision.
+# A compiler change that invalidates one surfaces as an unmet expectation
+# rather than being absorbed.
+schema_version = 1
+description = "Bounded relational verification of this library's real functions."
+
+[verify."crypto::tag::verify_tag"]
+description = "constant-time tag comparison via subtle::ConstantTimeEq"
+rationale = "folds all 16 bytes with no early exit; the compiler vectorizes it to pcmpeqb/pmovmskb, which is branchless and address-independent"
+max_depth = 8000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "VERIFIED_BOUNDED"
+
+# Restating the default. The only accepted value; see the note above.
+[verify."crypto::tag::verify_tag".inputs]
+supplied = "public-symbolic"
+
+[verify."crypto::tag::verify_tag_early_exit"]
+description = "educational: the naive early exit, which the compiler erased"
+rationale = "written with a per-byte branch, vectorized at opt-level 3 into the same branchless sequence as verify_tag. Declared VERIFIED_BOUNDED rather than manufacturing a leak -- the compiled code genuinely has none. Note that the M3 dynamic backend DOES report a branch here, because its build is a different artifact"
+max_depth = 8000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "VERIFIED_BOUNDED"
+
+[verify."crypto::tag::verify_tag_volatile_early_exit"]
+description = "vulnerable: an early exit the optimizer cannot vectorize"
+rationale = "the volatile read keeps the per-byte branch, so the number of comparisons performed depends on the secret"
+max_depth = 8000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "LEAK_DETECTED"
+
+[verify."crypto::lookup::substitute"]
+description = "constant-time substitution: full-table scan with mask selection"
+rationale = "reads every entry at a secret-independent address and selects without branching"
+max_depth = 8000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "VERIFIED_BOUNDED"
+
+[verify."crypto::lookup::substitute_indexed"]
+description = "vulnerable: the secret selects a load address"
+rationale = "the instruction sequence is identical for every secret, so only an address-aware analysis can see this; M1's instruction-path comparison cannot"
+max_depth = 8000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "LEAK_DETECTED"
+
+[verify."crypto::lookup::substitute_mode"]
+description = "the milestone's key demonstration: a leak behind a public mode"
+rationale = "the M3 dynamic test for this contract passes `mode = 0` and observes nothing, because that path is the full scan. Finding the other path needs a search over the public domain rather than a chosen input"
+max_depth = 8000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "LEAK_DETECTED"
+
+[verify."crypto::controls::tail_byte_probe"]
+description = "per-byte control: only the final byte of the secret reaches an address"
+rationale = "a harness that declared only the pointer secret, or only the leading byte, or the wrong width reports this as secure. It is the test that proves the array marking is complete rather than nominal"
+max_depth = 8000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "LEAK_DETECTED"
+
+[verify."crypto::controls::public_branch"]
+description = "negative control: branches on a public input only"
+rationale = "both compared executions share their public inputs, so public-dependent branching is not a leak. A finding here would be wrong in the direction that makes the tool useless"
+max_depth = 8000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "VERIFIED_BOUNDED"
+
+[verify."crypto::reduce::reduce_once"]
+description = "conditional subtraction over a 32-bit secret, written with a branch"
+rationale = "recorded from the artifact rather than from the source: whether the compiled code keeps the branch is a question about the build"
+max_depth = 8000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "VERIFIED_BOUNDED"
+
+[verify."crypto::reduce::reduce_once_masked"]
+description = "the same reduction with the subtraction selected by a mask"
+rationale = "no branch to erase and no secret-dependent address; the borrow is broadcast to a full-width mask"
+max_depth = 8000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "VERIFIED_BOUNDED"

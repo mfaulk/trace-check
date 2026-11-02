@@ -1,0 +1,27 @@
+[package]
+name = "crypto-library"
+description = "An ordinary no_std Rust library whose real functions are both dynamically tested and symbolically verified"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The crate name is what a contract identity is qualified by, so the contracts
+# below read `crypto::tag::verify_tag`.
+[lib]
+name = "crypto"
+path = "src/lib.rs"
+
+[dependencies]
+# A proc-macro crate is compiled for the host and contributes nothing to the
+# target binary, so the annotation can be used by a `no_std` library without
+# pulling `std` into its verification artifact. `trace-check-test`, which the
+# generated `#[cfg(test)]` adapter calls into, is a dev-dependency for exactly
+# that reason.
+trace-check-macros = { path = "../../crates/trace-check-macros" }
+# `default-features = false` keeps `subtle` `no_std`, which the freestanding
+# verification artifact requires.
+subtle = { version = "2.6", default-features = false }
+
+[dev-dependencies]
+trace-check-test = { path = "../../crates/trace-check-test" }

@@ -8,6 +8,7 @@ members = [
     "examples/mac-compare",
     "examples/table-lookup",
     "examples/consumer-crate",
+    "examples/crypto-library",
     "examples/legacy-branch-demo",
 ]
 resolver = "2"

@@ -365,3 +365,234 @@ fn a_case_without_a_declared_observation_model_is_refused() {
         run.stderr
     );
 }
+
+// ---------------------------------------------------------------------------
+// M5: verifying declared contracts in a real library
+// ---------------------------------------------------------------------------
+
+/// Runs the CLI without `--workspace-root`, which contract verification does
+/// not use: it locates the library through `--manifest-path` instead.
+fn verify_contracts(args: &[&str]) -> Run {
+    let output = Command::new(cli())
+        .arg("verify")
+        .args(args)
+        .output()
+        .expect("the CLI runs");
+    Run {
+        code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+fn crypto_manifest() -> String {
+    workspace_root()
+        .join("examples/crypto-library/Cargo.toml")
+        .display()
+        .to_string()
+}
+
+/// `--contract` verifies a declared contract in a real library and reports the
+/// whole chain from the developer's source to the analyzed executable.
+#[test]
+fn verifying_a_library_contract_reports_the_whole_chain() {
+    if !analyzer_available() {
+        return;
+    }
+    let run = verify_contracts(&[
+        "--contract",
+        "crypto::tag::verify_tag",
+        "--manifest-path",
+        &crypto_manifest(),
+    ]);
+    assert_eq!(run.code, 0, "stderr:\n{}", run.stderr);
+    for expected in [
+        "Verifying crypto::tag::verify_tag",
+        "Package:        crypto-library",
+        "tag.rs:",
+        "Resolved symbol:",
+        "Target reached:  yes",
+        "expected   secret  &[u8; 16]",
+        "supplied   public  &[u8; 16]",
+        "Result: VERIFIED_BOUNDED",
+        "Production binary: not analyzed",
+    ] {
+        assert!(
+            run.stdout.contains(expected),
+            "missing {expected:?} in:\n{}",
+            run.stdout
+        );
+    }
+}
+
+/// A vulnerable library function is detected and localized to the developer's
+/// own source line.
+#[test]
+fn a_vulnerable_library_contract_is_detected() {
+    if !analyzer_available() {
+        return;
+    }
+    let run = verify_contracts(&[
+        "--contract",
+        "crypto::lookup::substitute_indexed",
+        "--manifest-path",
+        &crypto_manifest(),
+    ]);
+    // The contract declares LEAK_DETECTED, so reproducing it is a pass.
+    assert_eq!(run.code, 0, "stderr:\n{}", run.stderr);
+    assert!(run.stdout.contains("LEAK_DETECTED"), "{}", run.stdout);
+    assert!(
+        run.stdout.contains("Secret-dependent memory access"),
+        "{}",
+        run.stdout
+    );
+    assert!(run.stdout.contains("lookup.rs"), "{}", run.stdout);
+}
+
+/// `--all-contracts` verifies everything the configuration declares, in one
+/// run, and the JSON report carries each contract's own artifact.
+#[test]
+fn all_contracts_verify_and_emit_json() {
+    if !analyzer_available() {
+        return;
+    }
+    let run = verify_contracts(&[
+        "--all-contracts",
+        "--manifest-path",
+        &crypto_manifest(),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(run.code, 0, "stderr:\n{}", run.stderr);
+    let report: serde_json::Value = serde_json::from_str(&run.stdout).expect("valid JSON");
+    let contracts = report["contracts"].as_array().expect("contracts");
+    assert!(contracts.len() >= 8, "only {} contracts", contracts.len());
+    assert_eq!(report["summary"]["expectations_reproduced"], true);
+    for entry in contracts {
+        assert!(entry["symbol"]["reached"].as_bool().unwrap_or(false));
+        assert_eq!(entry["artifact"]["sha256"].as_str().unwrap().len(), 64);
+        assert!(entry["artifact"]["production_artifact"]
+            .as_str()
+            .unwrap()
+            .contains("not analyzed"));
+    }
+}
+
+/// The CLI works for a library outside the trace-check workspace: its own
+/// manifest, its own lockfile, and no knowledge of this repository's layout.
+#[test]
+fn the_cli_verifies_a_library_outside_the_workspace() {
+    if !analyzer_available() {
+        return;
+    }
+    let manifest = workspace_root()
+        .join("examples/external-library/Cargo.toml")
+        .display()
+        .to_string();
+    let run = verify_contracts(&["--all-contracts", "--manifest-path", &manifest]);
+    assert_eq!(run.code, 0, "stderr:\n{}", run.stderr);
+    assert!(
+        run.stdout.contains("Verifying external_library::select"),
+        "{}",
+        run.stdout
+    );
+    assert!(run.stdout.contains("VERIFIED_BOUNDED"), "{}", run.stdout);
+    assert!(run.stdout.contains("LEAK_DETECTED"), "{}", run.stdout);
+    assert!(run
+        .stdout
+        .contains("Every declared expectation was reproduced."));
+}
+
+/// A contract name that is not configured is refused with the list of
+/// configured ones, rather than analyzed with invented bounds. The
+/// *configured-but-undeclared* case — where the library has no such annotation
+/// — is covered in `trace-check`'s `tests/library.rs`, which can build a
+/// configuration for a name the library does not define.
+#[test]
+fn an_unknown_contract_name_lists_the_configured_ones() {
+    let run = verify_contracts(&[
+        "--contract",
+        "crypto::tag::no_such_function",
+        "--manifest-path",
+        &crypto_manifest(),
+    ]);
+    assert_eq!(run.code, 2, "stdout:\n{}", run.stdout);
+    assert!(
+        run.stderr
+            .contains("no [verify.\"crypto::tag::no_such_function\"] section"),
+        "stderr:\n{}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("crypto::tag::verify_tag"),
+        "the message must list what is configured: {}",
+        run.stderr
+    );
+    assert!(!run.stdout.contains("VERIFIED_BOUNDED"));
+}
+
+/// A contract with no configuration is refused before anything is analyzed: a
+/// depth bound and an observation model cannot be inferred from an annotation.
+#[test]
+fn an_unconfigured_contract_fails_before_analysis() {
+    let run = verify_contracts(&[
+        "--contract",
+        "crypto::tag::verify_tag",
+        "--manifest-path",
+        &crypto_manifest(),
+        "--config",
+        &workspace_root()
+            .join("examples/crypto-library/does-not-exist.toml")
+            .display()
+            .to_string(),
+    ]);
+    assert_eq!(run.code, 2);
+    assert!(
+        run.stderr.contains("does not exist"),
+        "stderr:\n{}",
+        run.stderr
+    );
+}
+
+/// `--contract` and `--case` select different artifact sources and cannot be
+/// combined; clap rejects the combination rather than silently preferring one.
+#[test]
+fn contract_and_case_selection_are_mutually_exclusive() {
+    let run = verify_contracts(&[
+        "--contract",
+        "crypto::tag::verify_tag",
+        "--case",
+        "masked-scan",
+    ]);
+    assert_ne!(run.code, 0);
+    assert!(
+        run.stderr.contains("cannot be used with"),
+        "stderr:\n{}",
+        run.stderr
+    );
+}
+
+/// Library-selection flags are refused on an M4 run rather than accepted with
+/// no effect.
+#[test]
+fn library_flags_without_a_contract_are_refused() {
+    let run = verify_contracts(&["--manifest-path", &crypto_manifest()]);
+    assert_eq!(run.code, 2);
+    assert!(
+        run.stderr.contains("--all-contracts"),
+        "stderr:\n{}",
+        run.stderr
+    );
+}
+
+/// M4's standalone cases keep working beside contract verification: the two
+/// artifact sources share one engine and neither displaces the other.
+#[test]
+fn the_standalone_cases_still_work() {
+    if !analyzer_available() {
+        return;
+    }
+    let run = verify(&["--case", "masked-scan"]);
+    assert_eq!(run.code, 0, "stderr:\n{}", run.stderr);
+    assert!(run.stdout.contains("Case: masked-scan"), "{}", run.stdout);
+}
