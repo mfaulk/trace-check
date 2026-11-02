@@ -66,6 +66,121 @@ pub const RUSTFLAGS: [&str; 8] = [
     "link-arg=-static",
 ];
 
+/// Where generated packages, their Cargo output and the analyzed artifacts
+/// live for one run.
+///
+/// Created atomically with a random name, never at a predictable path. A
+/// verification run writes a Cargo manifest, a `.cargo/config.toml`, a Rust
+/// source file and a linked executable; with a guessable directory name, a
+/// pre-existing directory or a symlink planted by another user on a shared
+/// machine would be followed by those writes, and stale files from an earlier
+/// invocation could be picked up by a later one. The same hazard was closed in
+/// the dynamic backends; it is closed the same way here.
+pub enum Workspace {
+    /// A private directory removed when the run ends. The default: a result is
+    /// pinned to its artifact's **hash**, not to a path.
+    Ephemeral(tempfile::TempDir),
+    /// A fresh directory inside a caller-named one, kept after the run so the
+    /// evidence bundle can be inspected. The caller owns the parent; the run
+    /// directory inside it is still created atomically and never reused.
+    Kept(PathBuf),
+}
+
+impl Workspace {
+    /// A private directory, removed when this value is dropped.
+    pub fn ephemeral() -> Result<Workspace, HarnessError> {
+        let directory = tempfile::Builder::new()
+            .prefix("trace-check-verify-")
+            .tempdir()
+            .map_err(|e| {
+                HarnessError::Io(format!("cannot create a private work directory: {e}"))
+            })?;
+        restrict(directory.path())?;
+        Ok(Workspace::Ephemeral(directory))
+    }
+
+    /// A kept directory beneath `parent`, which is created if it does not
+    /// exist.
+    ///
+    /// The run directory itself is created with a random name through
+    /// `tempfile`, so two runs never share one and nothing pre-existing is
+    /// written through — even though the caller named the parent.
+    pub fn kept_in(parent: &Path) -> Result<Workspace, HarnessError> {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| HarnessError::Io(format!("{}: {e}", parent.display())))?;
+        let run = tempfile::Builder::new()
+            .prefix("run-")
+            .tempdir_in(parent)
+            .map_err(|e| HarnessError::Io(format!("{}: {e}", parent.display())))?;
+        restrict(run.path())?;
+        Ok(Workspace::Kept(run.keep()))
+    }
+
+    pub fn root(&self) -> &Path {
+        match self {
+            Workspace::Ephemeral(directory) => directory.path(),
+            Workspace::Kept(path) => path,
+        }
+    }
+
+    /// Whether the directory survives the run, which a report states so a
+    /// recorded artifact path is not read as still existing.
+    pub fn is_kept(&self) -> bool {
+        matches!(self, Workspace::Kept(_))
+    }
+
+    /// A fresh directory for one contract's generated packages.
+    ///
+    /// `create_dir`, not `create_dir_all`: inside an atomically created private
+    /// root nothing can pre-exist, so an `AlreadyExists` here means two
+    /// contracts collided on a name and is reported rather than written into.
+    fn contract_dir(&self, contract: &str) -> Result<PathBuf, HarnessError> {
+        let contracts = self.root().join("contracts");
+        if !contracts.exists() {
+            std::fs::create_dir(&contracts)
+                .map_err(|e| HarnessError::Io(format!("{}: {e}", contracts.display())))?;
+        }
+        let directory = contracts.join(package_suffix(contract));
+        std::fs::create_dir(&directory)
+            .map_err(|e| HarnessError::Io(format!("{}: {e}", directory.display())))?;
+        Ok(directory)
+    }
+
+    /// The Cargo target directory shared by every generated package in this
+    /// run.
+    ///
+    /// Shared on purpose: per-contract target directories rebuilt `core`, the
+    /// library and its dependencies for every contract and left hundreds of
+    /// megabytes behind. Each generated package is named after its contract, so
+    /// their binaries do not collide.
+    fn target_dir(&self) -> Result<PathBuf, HarnessError> {
+        let directory = self.root().join("target");
+        if !directory.exists() {
+            std::fs::create_dir(&directory)
+                .map_err(|e| HarnessError::Io(format!("{}: {e}", directory.display())))?;
+        }
+        Ok(directory)
+    }
+
+    /// The two directories one contract's build needs.
+    pub fn directories_for(&self, contract: &str) -> Result<(PathBuf, PathBuf), HarnessError> {
+        Ok((self.contract_dir(contract)?, self.target_dir()?))
+    }
+}
+
+/// Makes a directory private to this user.
+///
+/// `tempfile` picks an unpredictable name and creates it atomically, which is
+/// what defeats a planted directory or symlink — but it leaves the mode to the
+/// umask, so a default `022` yields a world-readable `0755`. The analyzer
+/// mounts its own staging directory, not this one, so nothing here needs to be
+/// readable by another user.
+fn restrict(directory: &Path) -> Result<(), HarnessError> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| HarnessError::Io(format!("{}: {e}", directory.display())))
+}
+
 /// The library a contract is verified from.
 #[derive(Debug, Clone, Serialize)]
 pub struct Library {
@@ -387,6 +502,10 @@ pub struct SymbolicInput {
     pub bits: u64,
     /// How the value reaches the function.
     pub passing: &'static str,
+    /// A domain restriction the generator had to add for this input to model
+    /// Rust's valid values, if any. Reported, never silent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
 }
 
 /// A generated harness: its source, its symbolic inputs, and the lattice the
@@ -398,6 +517,10 @@ pub struct Harness {
     pub inputs: Vec<SymbolicInput>,
     pub secret_globals: Vec<String>,
     pub public_globals: Vec<String>,
+    /// `assume` constraints the generator added so the analyzed domain matches
+    /// Rust's valid values. Kept apart from the developer's own assumptions,
+    /// which a report reproduces verbatim.
+    pub generated_assumptions: Vec<String>,
 }
 
 /// Generates the harness for one contract.
@@ -434,10 +557,18 @@ pub fn generate(library: &Library, contract: &Contract) -> Result<Harness, Harne
                     detail: format!("parameter `{}` has no symbolic width", parameter.name),
                 })
             })?;
+        // A symbolic byte is a machine byte; Rust's `bool` has exactly two
+        // valid ones. Without this the analyzer would explore states the
+        // compiled program can never be in, and the reported input domain would
+        // not be the one that was searched.
+        let domain = match parameter.repr {
+            Repr::Bool => Some(format!("{global} <= 1")),
+            _ => None,
+        };
         inputs.push(SymbolicInput {
             parameter: parameter.name.clone(),
             role: parameter.role,
-            global,
+            global: global.clone(),
             repr: parameter.repr.describe(),
             bits,
             passing: if parameter.repr.passed_by_reference() {
@@ -445,11 +576,16 @@ pub fn generate(library: &Library, contract: &Contract) -> Result<Harness, Harne
             } else {
                 "by value"
             },
+            domain,
         });
     }
 
     let source = render_source(library, contract, &inputs)?;
     let source_sha256 = format!("{:x}", Sha256::digest(source.as_bytes()));
+    let generated_assumptions: Vec<String> = inputs
+        .iter()
+        .filter_map(|input| input.domain.clone())
+        .collect();
     let secret_globals = inputs
         .iter()
         .filter(|input| input.role == Role::Secret)
@@ -466,6 +602,7 @@ pub fn generate(library: &Library, contract: &Contract) -> Result<Harness, Harne
         inputs,
         secret_globals,
         public_globals,
+        generated_assumptions,
     })
 }
 
@@ -525,8 +662,18 @@ fn render_source(
             Repr::Bool => "false".to_string(),
             _ => "0".to_string(),
         };
+        // A `bool` global is read as a `bool`, which has two valid byte values.
+        // The analyzer is told so through a generated `assume`; without it the
+        // search would cover bytes this program can never hold.
+        let note = match &input.domain {
+            Some(domain) => format!(
+                "///\n/// Restricted to Rust's valid values by the generated \
+             constraint `{domain}`.\n"
+            ),
+            None => String::new(),
+        };
         out.push_str(&format!(
-            "/// `{}`, declared {} by the contract.\n\
+            "/// `{}`, declared {} by the contract.\n{note}\
              #[no_mangle]\npub static mut {}: {storage} = {initializer};\n\n",
             parameter.name,
             input.role.as_str(),
@@ -863,6 +1010,15 @@ pub fn verification_case(
     harness: &Harness,
     settings: &ContractSettings,
 ) -> VerificationCase {
+    // Generated restrictions first, so the analyzer never sees a state the
+    // compiled program cannot be in, and the developer's own assumptions are
+    // still carried through unchanged.
+    let assumptions: Vec<String> = harness
+        .generated_assumptions
+        .iter()
+        .chain(&settings.assumptions)
+        .cloned()
+        .collect();
     VerificationCase {
         id: contract.id.clone(),
         description: settings.description.clone(),
@@ -871,7 +1027,7 @@ pub fn verification_case(
         halt_symbol: HALT_SYMBOL.to_string(),
         secret_globals: harness.secret_globals.clone(),
         public_globals: harness.public_globals.clone(),
-        assumptions: settings.assumptions.clone(),
+        assumptions,
         features: settings.checks.clone(),
         max_depth: settings.max_depth,
         solver_timeout_secs: settings.solver_timeout_secs,
@@ -991,6 +1147,20 @@ mod tests {
             lib_name: "crypto".into(),
             manifest_path: "/w/examples/crypto-library/Cargo.toml".into(),
             features: Vec::new(),
+        }
+    }
+
+    fn settings() -> ContractSettings {
+        ContractSettings {
+            description: "d".into(),
+            rationale: "r".into(),
+            max_depth: 4000,
+            solver_timeout_secs: 30,
+            wall_timeout_secs: 900,
+            checks: vec![CheckFeature::ControlFlow, CheckFeature::MemoryAccess],
+            assumptions: Vec::new(),
+            expected_outcome: "VERIFIED_BOUNDED".into(),
+            inputs: Default::default(),
         }
     }
 
@@ -1229,6 +1399,141 @@ mod tests {
         assert_eq!(case.public_globals, vec!["TC_PUBLIC_SUPPLIED"]);
         assert_eq!(case.assumptions, vec!["TC_PUBLIC_SUPPLIED < 4"]);
         assert_eq!(case.max_depth, 4000);
+    }
+
+    /// A public `bool` gets a generated domain restriction, because a symbolic
+    /// byte has 256 values and Rust's `bool` has two. Other representations get
+    /// none, so the restriction is not noise.
+    #[test]
+    fn a_public_bool_is_restricted_to_rusts_valid_values() {
+        let json = r#"{"schema_version":1,"function":"mix_when","parameters":[{"name":"secret","position":0,"role":"secret","repr":"u32","rust_type":"u32"},{"name":"enabled","position":1,"role":"public","repr":"bool","rust_type":"bool"}],"returns":{"repr":"u32","rust_type":"u32"}}"#;
+        let contract = contract(json, "crypto::controls", "mix_when");
+        let harness = generate(&library(), &contract).unwrap();
+        assert_eq!(
+            harness.generated_assumptions,
+            vec!["TC_PUBLIC_ENABLED <= 1"]
+        );
+        let bool_input = harness
+            .inputs
+            .iter()
+            .find(|input| input.parameter == "enabled")
+            .expect("the bool input");
+        assert_eq!(bool_input.domain.as_deref(), Some("TC_PUBLIC_ENABLED <= 1"));
+        // The scalar secret needs no restriction: every byte pattern is a valid
+        // u32.
+        assert!(harness.inputs[0].domain.is_none());
+        // And the generated source says why the constraint exists.
+        assert!(
+            harness.source.contains("Restricted to Rust's valid values"),
+            "{}",
+            harness.source
+        );
+    }
+
+    /// Generated restrictions reach the analyzer ahead of the developer's own
+    /// assumptions, and the developer's are carried through unchanged.
+    #[test]
+    fn generated_restrictions_reach_the_case_before_declared_ones() {
+        let json = r#"{"schema_version":1,"function":"mix_when","parameters":[{"name":"secret","position":0,"role":"secret","repr":"u32","rust_type":"u32"},{"name":"enabled","position":1,"role":"public","repr":"bool","rust_type":"bool"}],"returns":{"repr":"u32","rust_type":"u32"}}"#;
+        let contract = contract(json, "crypto::controls", "mix_when");
+        let harness = generate(&library(), &contract).unwrap();
+        let symbol = ResolvedSymbol {
+            contract: contract.id.clone(),
+            mangled: "_RNvCs1_6crypto8controls8mix_when".to_string(),
+            address: "0x201290".to_string(),
+        };
+        let mut settings = settings();
+        settings.assumptions = vec!["TC_SECRET_SECRET < 1024".to_string()];
+        let case = verification_case(&contract, &symbol, &harness, &settings);
+        assert_eq!(
+            case.assumptions,
+            vec!["TC_PUBLIC_ENABLED <= 1", "TC_SECRET_SECRET < 1024"]
+        );
+    }
+
+    /// An ephemeral workspace is created atomically at a name nothing can have
+    /// pre-arranged, and removed when the run ends.
+    ///
+    /// The predictable `/tmp/trace-check-contract-verify-<pid>` this replaced
+    /// could be pre-created or symlinked by another user on a shared machine,
+    /// and the run writes a manifest, a source file and a linked executable
+    /// into it.
+    #[test]
+    fn an_ephemeral_workspace_is_private_and_removed() {
+        let path = {
+            let workspace = Workspace::ephemeral().expect("created");
+            let root = workspace.root().to_path_buf();
+            assert!(root.is_dir());
+            assert!(!workspace.is_kept());
+            // Private to this user.
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&root)
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700, "work directory must not be shared");
+            root
+        };
+        assert!(!path.exists(), "the workspace must not outlive the run");
+    }
+
+    /// A kept workspace puts each run in its own freshly created directory
+    /// inside the caller's, so nothing pre-existing there is reused or written
+    /// through -- including a planted symlink -- and two runs never collide.
+    #[test]
+    fn a_kept_workspace_never_reuses_an_existing_entry() {
+        let parent = tempfile::tempdir().expect("temp dir");
+        // Stale contents and a symlink pointing somewhere a run must not write.
+        let elsewhere = parent.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("decoy target");
+        std::os::unix::fs::symlink(&elsewhere, parent.path().join("run-decoy"))
+            .expect("plant a symlink");
+        std::fs::write(parent.path().join("stale.txt"), "old").expect("stale file");
+
+        let first = Workspace::kept_in(parent.path()).expect("created");
+        let second = Workspace::kept_in(parent.path()).expect("created");
+        assert!(first.is_kept() && second.is_kept());
+        assert_ne!(first.root(), second.root());
+        for workspace in [&first, &second] {
+            assert!(workspace.root().starts_with(parent.path()));
+            assert_ne!(workspace.root(), parent.path());
+            assert_ne!(
+                workspace.root(),
+                parent.path().join("run-decoy"),
+                "a planted entry must never be chosen as the run directory"
+            );
+            // Fresh: a run directory starts empty.
+            assert_eq!(
+                std::fs::read_dir(workspace.root())
+                    .expect("readable")
+                    .count(),
+                0
+            );
+        }
+        // The decoy was left alone.
+        assert!(std::fs::read_dir(&elsewhere).expect("readable").count() == 0);
+        assert!(parent.path().join("stale.txt").exists());
+    }
+
+    /// A contract directory is created atomically, so a name collision is
+    /// reported rather than written into.
+    #[test]
+    fn a_contract_directory_is_not_reused() {
+        let workspace = Workspace::ephemeral().expect("created");
+        let (first, target) = workspace
+            .directories_for("crypto::tag::verify_tag")
+            .expect("created");
+        assert!(first.is_dir() && target.is_dir());
+        let error = workspace
+            .directories_for("crypto::tag::verify_tag")
+            .expect_err("a second use of one contract id must be refused");
+        assert!(error.to_string().contains("verify_tag"), "{error}");
+        // A different contract is fine, and shares the target directory.
+        let (other, same_target) = workspace
+            .directories_for("crypto::tag::other")
+            .expect("created");
+        assert_ne!(first, other);
+        assert_eq!(target, same_target);
     }
 
     /// `nm` output parses to addresses and names, including demangled names

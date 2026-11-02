@@ -12,13 +12,24 @@
 //! emits duplicate JSON keys that most parsers silently resolve to the last
 //! occurrence; nesting makes the collision impossible instead of testing for
 //! it.
+//!
+//! # Report-level provenance says who analyzed, never what
+//!
+//! A run builds one executable per contract, so there is no single artifact a
+//! report can describe. [`LibraryReport::analyzer`] therefore carries only the
+//! analyzer, its solver, the container runtime and the platform; the artifact
+//! hash, the build flags, the lockfile fingerprint and the resolved symbol are
+//! per contract. An earlier revision put M4's `SymbolicProvenance` at report
+//! level, which advertised the **last** contract's executable — and M4's
+//! direct-`rustc` build flags, which M5 does not use — as though they described
+//! the whole run.
 
 use serde::Serialize;
 
 use crate::contract::Contract;
 use crate::harness::{Harness, Library, ResolvedSymbol, SymbolicInput};
 use crate::security::{Evidence, Expectation, Outcome};
-use crate::symbolic::{CaseResult, SymbolicProvenance, VerificationCase};
+use crate::symbolic::{AnalyzerIdentity, CaseResult, VerificationCase};
 use crate::symbolic_report::Summary;
 
 pub const REPORT_SCHEMA_VERSION: u32 = 1;
@@ -75,6 +86,10 @@ pub struct ArtifactProvenance {
     pub sha256: String,
     /// Fingerprint of the harness's resolved dependency graph.
     pub lockfile_sha256: String,
+    /// Whether [`ArtifactProvenance::path`] still exists after the run. The
+    /// default workspace is a private directory that is removed, so the hash
+    /// is the durable identity and a reader is told which they have.
+    pub path_retained: bool,
     pub production_artifact: &'static str,
 }
 
@@ -111,8 +126,13 @@ pub struct ContractReport {
     pub artifact: ArtifactProvenance,
     /// Roles and widths as transferred from the annotation into the analysis.
     pub inputs: Vec<SymbolicInput>,
-    /// `assume` constraints restricting the input domain, verbatim.
+    /// The developer's own `assume` constraints, verbatim.
     pub input_domain: Vec<String>,
+    /// Restrictions the generator had to add for the analyzed domain to match
+    /// Rust's valid values — a `bool` parameter is one byte with two valid
+    /// values, and a symbolic byte has 256. Listed separately so the
+    /// developer's own constraints stay verbatim.
+    pub generated_domain: Vec<String>,
     pub max_depth: u32,
     pub solver_timeout_secs: u32,
     pub evidence: Evidence,
@@ -125,7 +145,9 @@ pub struct ContractReport {
 pub struct LibraryReport {
     pub schema_version: u32,
     pub backend: &'static str,
-    pub provenance: SymbolicProvenance,
+    /// Who did the analyzing. Carries no artifact identity: a run builds one
+    /// executable per contract, and those live on each contract.
+    pub analyzer: AnalyzerIdentity,
     pub selected: usize,
     pub executed: usize,
     pub contracts: Vec<ContractReport>,
@@ -146,8 +168,9 @@ pub struct Verified {
 
 pub fn build(
     entries: Vec<Verified>,
-    provenance: SymbolicProvenance,
+    analyzer: AnalyzerIdentity,
     selected: usize,
+    path_retained: bool,
 ) -> LibraryReport {
     let contracts: Vec<ContractReport> = entries
         .into_iter()
@@ -163,7 +186,7 @@ pub fn build(
                 rationale: entry.case.rationale.clone(),
                 library: entry.library,
                 compilation: Compilation {
-                    rustc: provenance.rustc_version.clone(),
+                    rustc: analyzer.rustc_version.clone(),
                     target: crate::symbolic::SUPPORTED_TARGET.to_string(),
                     profile: crate::harness::PROFILE.to_string(),
                     panic: crate::harness::PANIC_STRATEGY.to_string(),
@@ -189,10 +212,18 @@ pub fn build(
                     path: entry.artifact.path.display().to_string(),
                     sha256: entry.artifact.sha256.clone(),
                     lockfile_sha256: entry.artifact.lockfile_sha256.clone(),
+                    path_retained,
                     production_artifact: PRODUCTION_ARTIFACT,
                 },
+                generated_domain: entry.harness.generated_assumptions.clone(),
                 inputs: entry.harness.inputs.clone(),
-                input_domain: entry.case.assumptions.clone(),
+                input_domain: entry
+                    .case
+                    .assumptions
+                    .iter()
+                    .filter(|assumption| !entry.harness.generated_assumptions.contains(assumption))
+                    .cloned()
+                    .collect(),
                 max_depth: entry.case.max_depth,
                 solver_timeout_secs: entry.case.solver_timeout_secs,
                 evidence: Evidence::BoundedRelationalSymbolic,
@@ -222,7 +253,7 @@ pub fn build(
     LibraryReport {
         schema_version: REPORT_SCHEMA_VERSION,
         backend: BACKEND,
-        provenance,
+        analyzer,
         selected,
         executed: contracts.len(),
         summary: Summary {
@@ -263,12 +294,14 @@ impl LibraryReport {
         }
 
         line!("Backend:  {}", self.backend);
-        line!("Analyzer: {}", self.provenance.analyzer);
-        if let Some(build) = &self.provenance.analyzer_build {
+        line!("Analyzer: {}", self.analyzer.analyzer);
+        if let Some(build) = &self.analyzer.analyzer_build {
             line!("Build:    {build}");
         }
-        line!("Image:    {}", self.provenance.analyzer_image);
-        line!("Solver:   {}", self.provenance.solver);
+        line!("Image:    {}", self.analyzer.analyzer_image);
+        line!("Solver:   {}", self.analyzer.solver);
+        line!("Runtime:  {}", self.analyzer.container_tool);
+        // Deliberately no artifact here: there is one per contract below.
 
         for entry in &self.contracts {
             let mark = if entry.expectation.met {
@@ -331,6 +364,18 @@ impl LibraryReport {
             line!("Verification executable:");
             line!("  Harness sha256:    {}", entry.harness.sha256);
             line!("  Artifact sha256:   {}", entry.artifact.sha256);
+            // Whether the recorded path still exists. The default workspace is
+            // a private directory that is removed, so the hash is the durable
+            // identity and a reader is told which they have.
+            line!(
+                "  Artifact path:     {} ({})",
+                entry.artifact.path,
+                if entry.artifact.path_retained {
+                    "retained"
+                } else {
+                    "removed after the run; the hash is the durable identity"
+                }
+            );
             line!(
                 "  Production binary: {}",
                 entry.artifact.production_artifact
@@ -352,7 +397,13 @@ impl LibraryReport {
                 );
             }
             if !entry.input_domain.is_empty() {
-                line!("  assumed: {}", entry.input_domain.join(" and "));
+                line!("  assumed:   {}", entry.input_domain.join(" and "));
+            }
+            if !entry.generated_domain.is_empty() {
+                line!(
+                    "  generated: {}  (so the analyzed domain is Rust's valid values)",
+                    entry.generated_domain.join(" and ")
+                );
             }
             line!("");
             line!("Observation model:");
@@ -482,8 +533,8 @@ mod tests {
 
     const VERIFY_TAG: &str = r#"{"schema_version":1,"function":"verify_tag","parameters":[{"name":"expected","position":0,"role":"secret","repr":"ref-byte-array","length":16,"rust_type":"&[u8; 16]"},{"name":"supplied","position":1,"role":"public","repr":"ref-byte-array","length":16,"rust_type":"&[u8; 16]"}],"returns":{"repr":"bool","rust_type":"bool"}}"#;
 
-    fn provenance() -> SymbolicProvenance {
-        SymbolicProvenance {
+    fn analyzer() -> AnalyzerIdentity {
+        AnalyzerIdentity {
             rustc_version: "rustc 1.97.0".into(),
             analyzer: crate::symbolic::ANALYZER_NAME.into(),
             analyzer_build: Some("Binsec version dfe4739".into()),
@@ -491,9 +542,6 @@ mod tests {
             solver: crate::symbolic::ANALYZER_SOLVER.into(),
             container_tool: "podman".into(),
             target: crate::symbolic::SUPPORTED_TARGET.into(),
-            build_flags: crate::harness::RUSTFLAGS.join(" "),
-            artifact_path: "/tmp/tc-verify-harness".into(),
-            artifact_sha256: "7d41".into(),
         }
     }
 
@@ -598,8 +646,9 @@ mod tests {
                 "VERIFIED_BOUNDED",
                 vec![],
             )],
-            provenance(),
+            analyzer(),
             1,
+            false,
         );
         assert_eq!(report.exit_code(), 0);
         assert_eq!(report.summary.verified_bounded, 1);
@@ -615,14 +664,16 @@ mod tests {
                 "VERIFIED_BOUNDED",
                 vec![divergence()],
             )],
-            provenance(),
+            analyzer(),
             1,
+            false,
         );
         assert_eq!(leaked.exit_code(), 1);
         let inconclusive = build(
             vec![verified(Outcome::Inconclusive, "VERIFIED_BOUNDED", vec![])],
-            provenance(),
+            analyzer(),
             1,
+            false,
         );
         assert_eq!(inconclusive.exit_code(), 2);
     }
@@ -630,7 +681,7 @@ mod tests {
     /// Verifying nothing is not a pass.
     #[test]
     fn verifying_nothing_is_not_a_pass() {
-        let report = build(vec![], provenance(), 0);
+        let report = build(vec![], analyzer(), 0, false);
         assert_eq!(report.exit_code(), 2);
         assert!(!report.summary.expectations_reproduced);
     }
@@ -646,8 +697,9 @@ mod tests {
                 "VERIFIED_BOUNDED",
                 vec![],
             )],
-            provenance(),
+            analyzer(),
             1,
+            false,
         );
         let text = report.to_text();
         for expected in [
@@ -678,8 +730,9 @@ mod tests {
                 "VERIFIED_BOUNDED",
                 vec![],
             )],
-            provenance(),
+            analyzer(),
             1,
+            false,
         );
         let text = report.to_text();
         assert!(text.contains("Production binary: not analyzed"), "{text}");
@@ -694,7 +747,7 @@ mod tests {
         let mut entry = verified(Outcome::Inconclusive, "VERIFIED_BOUNDED", vec![]);
         entry.result.target.reached = false;
         entry.result.target.address = None;
-        let report = build(vec![entry], provenance(), 1);
+        let report = build(vec![entry], analyzer(), 1, false);
         let text = report.to_text();
         assert!(text.contains("Target reached:  NO"), "{text}");
         assert!(text.contains("nothing here is attributed to it"), "{text}");
@@ -711,8 +764,9 @@ mod tests {
                 "VERIFIED_BOUNDED",
                 vec![],
             )],
-            provenance(),
+            analyzer(),
             1,
+            false,
         );
         let value: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
         assert_eq!(value["schema_version"], REPORT_SCHEMA_VERSION);
@@ -754,8 +808,9 @@ mod tests {
                 "VERIFIED_BOUNDED",
                 vec![],
             )],
-            provenance(),
+            analyzer(),
             1,
+            false,
         );
         let text = serde_json::to_string(&report.contracts[0]).expect("serializable");
         let keys: Keys = serde_json::from_str(&text).expect("an object");
@@ -796,6 +851,148 @@ mod tests {
         }
     }
 
+    /// A report covering two contracts must not advertise either executable as
+    /// the artifact for both.
+    ///
+    /// Report-level provenance used to be M4's `SymbolicProvenance`, which
+    /// carries an artifact path, its hash and direct-`rustc` build flags. In a
+    /// multi-contract run it described the **last** contract's executable and a
+    /// set of flags M5 does not use, while reading as though it described the
+    /// whole report.
+    #[test]
+    fn a_multi_contract_report_claims_no_shared_artifact() {
+        let mut second = verified(Outcome::VerifiedBounded, "VERIFIED_BOUNDED", vec![]);
+        second.contract.id = "crypto::lookup::substitute".into();
+        second.contract.module = "crypto::lookup".into();
+        second.contract.function = "substitute".into();
+        second.artifact.sha256 = "b19e".into();
+        second.artifact.path = PathBuf::from("/tmp/tc-verify-substitute");
+        second.result.case = second.contract.id.clone();
+
+        let report = build(
+            vec![
+                verified(Outcome::VerifiedBounded, "VERIFIED_BOUNDED", vec![]),
+                second,
+            ],
+            analyzer(),
+            2,
+            false,
+        );
+        assert_eq!(report.contracts.len(), 2);
+        // Distinct artifacts, each named on its own contract.
+        assert_ne!(
+            report.contracts[0].artifact.sha256,
+            report.contracts[1].artifact.sha256
+        );
+
+        // The report level carries the analyzer and nothing that identifies an
+        // artifact. Checked over the serialized form so a future field cannot
+        // reintroduce one unnoticed.
+        let value: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+        let shared = value["analyzer"].as_object().expect("an object");
+        for forbidden in ["artifact_path", "artifact_sha256", "build_flags"] {
+            assert!(
+                !shared.contains_key(forbidden),
+                "report-level provenance must not carry {forbidden}: {shared:?}"
+            );
+        }
+        assert!(value.get("provenance").is_none(), "{value}");
+        assert_eq!(shared["container_tool"], "podman");
+        assert!(shared["analyzer_image"]
+            .as_str()
+            .unwrap()
+            .contains("@sha256:"));
+
+        // And the text report names no artifact before the per-contract
+        // sections begin. (The analyzer *image* digest is there, and is a
+        // property of the analyzer, not of anything it analyzed.)
+        let text = report.to_text();
+        let header = text.split("Verifying ").next().expect("a header");
+        for forbidden in ["Artifact sha256", "Harness sha256", "Artifact path"] {
+            assert!(!header.contains(forbidden), "{header}");
+        }
+    }
+
+    /// Compilation provenance describes the build M5 actually performs, not
+    /// M4's direct-`rustc` invocation.
+    #[test]
+    fn compilation_provenance_describes_the_cargo_build() {
+        let report = build(
+            vec![verified(
+                Outcome::VerifiedBounded,
+                "VERIFIED_BOUNDED",
+                vec![],
+            )],
+            analyzer(),
+            1,
+            false,
+        );
+        let compilation = &report.contracts[0].compilation;
+        assert!(!compilation.lto);
+        assert_eq!(compilation.panic, "abort");
+        assert!(compilation.profile.contains("lto=off"), "{compilation:?}");
+        assert!(
+            compilation.rustflags.contains("link-arg=-nostdlib"),
+            "{compilation:?}"
+        );
+    }
+
+    /// An artifact in the default workspace does not outlive the run, and the
+    /// report says so rather than leaving a dangling path to be trusted.
+    #[test]
+    fn a_removed_artifact_path_is_marked_as_such() {
+        let ephemeral = build(
+            vec![verified(
+                Outcome::VerifiedBounded,
+                "VERIFIED_BOUNDED",
+                vec![],
+            )],
+            analyzer(),
+            1,
+            false,
+        );
+        assert!(!ephemeral.contracts[0].artifact.path_retained);
+        assert!(
+            ephemeral.to_text().contains("removed after the run"),
+            "{}",
+            ephemeral.to_text()
+        );
+        let kept = build(
+            vec![verified(
+                Outcome::VerifiedBounded,
+                "VERIFIED_BOUNDED",
+                vec![],
+            )],
+            analyzer(),
+            1,
+            true,
+        );
+        assert!(kept.contracts[0].artifact.path_retained);
+        assert!(kept.to_text().contains("(retained)"), "{}", kept.to_text());
+    }
+
+    /// A generated domain restriction is reported apart from the developer's
+    /// own assumptions, which stay verbatim.
+    #[test]
+    fn a_generated_domain_restriction_is_reported_separately() {
+        let mut entry = verified(Outcome::VerifiedBounded, "VERIFIED_BOUNDED", vec![]);
+        entry.harness.generated_assumptions = vec!["TC_PUBLIC_ENABLED <= 1".into()];
+        entry.case.assumptions = vec![
+            "TC_PUBLIC_ENABLED <= 1".into(),
+            "TC_SECRET_EXPECTED < 1024".into(),
+        ];
+        let report = build(vec![entry], analyzer(), 1, false);
+        let contract = &report.contracts[0];
+        assert_eq!(contract.generated_domain, vec!["TC_PUBLIC_ENABLED <= 1"]);
+        assert_eq!(contract.input_domain, vec!["TC_SECRET_EXPECTED < 1024"]);
+        let text = report.to_text();
+        assert!(
+            text.contains("assumed:   TC_SECRET_EXPECTED < 1024"),
+            "{text}"
+        );
+        assert!(text.contains("generated: TC_PUBLIC_ENABLED <= 1"), "{text}");
+    }
+
     /// A secret input is described as fully symbolic and a public one as held
     /// equal, which is the property that makes a relational result meaningful.
     #[test]
@@ -806,8 +1003,9 @@ mod tests {
                 "VERIFIED_BOUNDED",
                 vec![],
             )],
-            provenance(),
+            analyzer(),
             1,
+            false,
         );
         let inputs = &report.contracts[0].inputs;
         assert_eq!(inputs[0].role, Role::Secret);

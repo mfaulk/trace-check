@@ -519,6 +519,27 @@ pub struct CaseResult {
     pub script: String,
 }
 
+/// Who did the analyzing, with no claim about *what* was analyzed.
+///
+/// Split out from [`SymbolicProvenance`] because a run can analyze more than
+/// one artifact. The analyzer, its solver and the platform are shared by every
+/// result in a report; an artifact path, its hash and the flags that built it
+/// are not, and a report-level field carrying one artifact's identity invites a
+/// reader to associate it with all of them.
+#[derive(Debug, Clone, Serialize)]
+pub struct AnalyzerIdentity {
+    pub rustc_version: String,
+    pub analyzer: String,
+    /// What the analyzer binary reports about itself. Absent if it could not be
+    /// queried, which is recorded rather than guessed at.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analyzer_build: Option<String>,
+    pub analyzer_image: String,
+    pub solver: String,
+    pub container_tool: String,
+    pub target: String,
+}
+
 /// Toolchain and artifact provenance for a symbolic run.
 #[derive(Debug, Clone, Serialize)]
 pub struct SymbolicProvenance {
@@ -947,6 +968,20 @@ impl Verifier {
             exploration,
             script,
         })
+    }
+
+    /// The analyzer's identity, without an artifact. Use this where a report
+    /// covers several artifacts.
+    pub fn identity(&self) -> AnalyzerIdentity {
+        AnalyzerIdentity {
+            rustc_version: self.rustc_version.clone(),
+            analyzer: ANALYZER_NAME.to_string(),
+            analyzer_build: self.analyzer_build.clone(),
+            analyzer_image: ANALYZER_IMAGE.to_string(),
+            solver: ANALYZER_SOLVER.to_string(),
+            container_tool: self.container_tool.clone(),
+            target: SUPPORTED_TARGET.to_string(),
+        }
     }
 
     pub fn provenance(&self, artifact: &Path, artifact_sha256: &str) -> SymbolicProvenance {

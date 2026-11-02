@@ -72,17 +72,29 @@ def main(path: str) -> int:
             f"{report.get('selected')} selected but {report.get('executed')} executed"
         )
 
-    provenance = report.get("provenance", {})
-    image = provenance.get("analyzer_image", "")
+    # Report-level provenance says who analyzed, never what: a run builds one
+    # executable per contract, so a shared artifact field here would invite a
+    # reader to associate the last contract's binary with all of them.
+    analyzer = report.get("analyzer", {})
+    if "provenance" in report:
+        failures.append(
+            "report-level `provenance` is back; artifact identity belongs on each contract"
+        )
+    for forbidden in ("artifact_sha256", "artifact_path", "build_flags"):
+        if forbidden in analyzer:
+            failures.append(f"report-level analyzer provenance carries {forbidden}")
+    image = analyzer.get("analyzer_image", "")
     if "@sha256:" not in image:
         failures.append(f"analyzer image is not digest-pinned: {image!r}")
     pinned = os.environ.get("ANALYZER_IMAGE")
     if pinned and image != pinned:
         failures.append(f"analyzer image {image!r} is not the pinned {pinned!r}")
+    if not analyzer.get("solver"):
+        failures.append("no solver recorded")
     expected_runtime = os.environ.get("EXPECTED_CONTAINER_RUNTIME")
-    if expected_runtime and provenance.get("container_tool") != expected_runtime:
+    if expected_runtime and analyzer.get("container_tool") != expected_runtime:
         failures.append(
-            f"analyzer ran under {provenance.get('container_tool')!r}, expected "
+            f"analyzer ran under {analyzer.get('container_tool')!r}, expected "
             f"{expected_runtime!r}"
         )
 
@@ -135,6 +147,10 @@ def main(path: str) -> int:
             failures.append(
                 f"{name}: the report must state that no production binary was analyzed"
             )
+        # Whether the recorded path still exists has to be stated, so a reader
+        # does not trust a path the default private workspace removed.
+        if not isinstance(artifact.get("path_retained"), bool):
+            failures.append(f"{name}: does not say whether the artifact path was retained")
         artifacts.setdefault(artifact.get("sha256"), []).append(contract)
         harness = entry.get("harness", {})
         if len(harness.get("sha256", "")) != 64:
@@ -160,6 +176,27 @@ def main(path: str) -> int:
                     )
         if not any(item.get("role") == "secret" for item in entry.get("inputs", [])):
             failures.append(f"{name}: no secret input, so there is no relational property")
+
+        # A representation whose machine bytes are wider than its valid values
+        # must carry a generated domain restriction, and the restriction must
+        # have reached the analyzer. `bool` is the only such shape supported.
+        generated = entry.get("generated_domain", [])
+        needs_restriction = [
+            item for item in entry.get("inputs", []) if item.get("repr") == "bool"
+        ]
+        for item in needs_restriction:
+            restriction = item.get("domain")
+            if not restriction:
+                failures.append(
+                    f"{name}: `{item['parameter']}` is a bool with no domain restriction, so "
+                    f"the analyzed domain is wider than Rust's valid values"
+                )
+            elif restriction not in generated:
+                failures.append(f"{name}: {restriction!r} is not listed in generated_domain")
+            elif f"assume {restriction}" not in analysis.get("script", ""):
+                failures.append(f"{name}: {restriction!r} never reached the analyzer script")
+        if not needs_restriction and generated:
+            failures.append(f"{name}: unexplained generated restriction {generated}")
 
         if outcome == "VERIFIED_BOUNDED":
             exploration = analysis.get("exploration", {})

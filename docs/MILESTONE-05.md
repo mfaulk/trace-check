@@ -389,7 +389,7 @@ Deliberately small for the first version.
 | `u8`, `u16`, `u32`, `u64` | supported | fixed-width symbolic global |
 | `&[u8; N]`, literal `N` | supported | `N` symbolic bytes; the pointer is public and stable |
 | `[u8; N]` by value, literal `N` | supported | `N` symbolic bytes passed by value |
-| `bool` | supported as a **public** parameter only | one symbolic byte, constrained to 0/1 |
+| `bool` | supported as a **public** parameter only | one symbolic byte, with a *generated* `<= 1` constraint — see [Modeling Rust's valid values](#modeling-rusts-valid-values) |
 | several secret parameters | supported | independent symbolic objects |
 | `&[u8]` | deferred | needs a pointer/length model |
 | `Vec<u8>`, `String` | deferred | needs heap and ownership modeling |
@@ -426,6 +426,60 @@ A configuration file that could promote or demote a secret would be a second
 description of the contract, which is the drift the milestone forbids. Public
 parameters are symbolic and **held equal** between the paired executions by
 default; nothing is silently fixed to zero.
+
+### Modeling Rust's valid values
+
+BINSEC reasons about machine bytes; Rust's types do not all use every byte
+pattern. `bool` is the case that matters here: one byte, two valid values. An
+unconstrained symbolic byte would let the analyzer reason about 256, so the
+reported input domain would not be the domain that was searched — and
+`read_volatile::<bool>` on an invalid byte is undefined behavior the compiled
+program can never actually perform.
+
+The generator therefore emits a domain restriction per such input and the
+report names it, separately from the developer's own assumptions so those stay
+verbatim:
+
+```text
+  enabled    public  bool         8 bits, symbolic and held equal
+  generated: TC_PUBLIC_ENABLED <= 1  (so the analyzed domain is Rust's valid values)
+```
+
+Generated restrictions are placed ahead of declared ones in the script, so the
+analyzer never sees a state the program cannot be in. `ci/verify-m5-library.py`
+requires every `bool` input to carry one, requires it to appear in
+`generated_domain`, and requires it to appear as an `assume` in the script the
+analyzer was actually given — three independent places, because the field
+alone could be decorative.
+
+Every other supported representation uses all of its bytes, so no restriction
+is emitted and an unexplained one is a validator failure.
+
+## Where generated files live
+
+A verification run writes a Cargo manifest, a `.cargo/config.toml`, a Rust
+source file and a linked executable. The first revision put them under
+`/tmp/trace-check-contract-verify-<pid>`, which is guessable: on a shared
+machine another user can pre-create that directory or plant a symlink there and
+have those writes follow it, and stale files from an earlier run can be picked
+up by a later one. The same class of problem was closed in the dynamic
+backends; it is closed the same way here.
+
+| | |
+| --- | --- |
+| **Default** | a private directory created atomically by `tempfile` and chmod'ed `0700`, removed when the run ends. A result is pinned to its artifact's **hash**, so nothing is lost. |
+| `--artifact-dir DIR` | a freshly created, randomly named run directory *inside* `DIR`. The caller owns `DIR`; the run directory is still created atomically, so nothing pre-existing there is reused or written through, and two runs never collide. |
+
+Per-contract subdirectories use `create_dir`, not `create_dir_all`: inside an
+atomically created private root nothing can pre-exist, so an `AlreadyExists`
+means two contracts collided on a name and is reported rather than written
+into.
+
+Because the default workspace does not survive the run, every report states
+whether the artifact path it records still exists — `path_retained` — so a
+reader is never invited to trust a dangling path. M4's `verify` build directory
+was derived from the process id in the same way and is now created the same
+way.
 
 ## Generated harnesses
 
@@ -502,8 +556,20 @@ Added to M4's fields:
 | `compilation.profile`, `.flags`, `.panic`, `.lto` | the build this result describes |
 | `symbol.contract`, `.mangled`, `.address`, `.reached` | contract-to-instruction binding |
 | `harness.sha256`, `harness.source` | the generated wrapper, verbatim |
-| `inputs[].role`, `.repr`, `.bits` | roles and widths as transferred into the analysis |
+| `inputs[].role`, `.repr`, `.bits`, `.domain` | roles, widths and any generated restriction, as transferred into the analysis |
+| `input_domain` / `generated_domain` | the developer's `assume` constraints, verbatim, kept apart from the generator's |
+| `artifact.path_retained` | whether the recorded path outlived the run |
 | `production_artifact` | always `not analyzed`, with the reason |
+
+**Report-level provenance names the analyzer and nothing it analyzed.** A run
+builds one executable per contract, so there is no single artifact a report can
+describe: `analyzer` carries the analyzer, its build, the pinned image, the
+solver, the container runtime, the compiler and the platform, and the artifact
+hash, build flags, lockfile fingerprint and resolved symbol live on each
+contract. The first revision put M4's `SymbolicProvenance` at report level,
+which advertised the **last** contract's executable — and M4's direct-`rustc`
+build flags, which this path does not use — as though they described the whole
+run.
 
 `harness.source`, the BINSEC script, the descriptor and the solver output
 together form the evidence bundle: enough to re-run the analysis by hand without
@@ -527,6 +593,22 @@ fail-closed conditions, plus the M5-specific ones:
 An error is an infrastructure failure, exit 2, and never a verdict. The
 distinction matters: `INCONCLUSIVE` says the analysis ran and established
 nothing; an error says no analysis happened.
+
+### Validation order
+
+Everything decidable from the command line and the configuration is checked
+**before** the container backend is prepared: the manifest exists, the
+configuration parses and validates, and every selected contract has a
+`[verify."…"]` section. The first revision prepared the backend first, so on a
+machine without the analyzer image a misspelled contract name reported a
+missing image rather than the typo — and the CLI test covering the typo failed
+in the CI job that has no image. Argument validation must not depend on a
+heavyweight backend, and `a_selection_error_is_reported_without_any_backend`
+asserts it with an emptied `PATH`.
+
+Role validation is the one check that cannot move: it needs the descriptor,
+which needs the library compiled. It therefore runs after the backend is
+located, which is also where a missing analyzer is cheapest to report.
 
 ## Examples
 
@@ -659,7 +741,10 @@ attributed to the developer's own source line (`tag.rs:55`, `lookup.rs:37`,
 `lookup.rs:51`, `controls.rs:32`), never to the generated harness.
 
 `examples/external-library`, outside this workspace and with its own lockfile,
-verifies its two contracts through the same CLI.
+verifies its three contracts through the same CLI — including `mix_when`, whose
+public `bool` exercises the generated domain restriction. Its contracts say
+`dynamic = false`, so its ordinary `cargo test` compiles with no
+dev-dependency at all; CI asserts that.
 
 ### What the counterexample shows
 
@@ -715,6 +800,33 @@ it.
   defect was invisible before this milestone because the only module-qualified
   contracts in the repository were M5's.
 
+### Corrected after review
+
+Five findings from review of the first revision, in the order they were fixed:
+
+1. **A missing analyzer masked a configuration error.** The backend was
+   prepared before the selection was validated, so a misspelled contract name
+   reported "cannot obtain the analyzer image" on any machine without it — and
+   the CLI test covering the typo failed in the CI job that has none. See
+   [Validation order](#validation-order).
+2. **Generated files went to a predictable path under `/tmp`.** Replaced with
+   an atomically created private directory, plus `--artifact-dir` for keeping
+   the evidence bundle. See [Where generated files live](#where-generated-files-live).
+   M4's build directory was hardened the same way.
+3. **An annotated library could not run `cargo test`.** The attribute always
+   emitted `#[cfg(test)]` code calling into `trace-check-test`, so a crate that
+   declared only the macro dependency failed to build its own test targets.
+   `dynamic = false` drops that machinery. Deliberately opt-**out**: a contract
+   with no metadata test disappears from M3's coverage accounting, and a
+   contract that quietly stops being accounted for is the failure mode this
+   project exists to prevent, so the safe behavior is the default.
+4. **Report-level provenance described one artifact out of several.** Split into
+   analyzer identity at report level and artifact identity per contract; see
+   [Reports](#reports).
+5. **A public `bool` was documented as constrained and was not.** The
+   constraint is now generated, reported, and checked in three places; see
+   [Modeling Rust's valid values](#modeling-rusts-valid-values).
+
 ### What validates the validator
 
 `ci/verify-m5-library.py` checks the report, not the exit code. A
@@ -730,11 +842,15 @@ statement that no production binary was analyzed. No two contracts may share an
 artifact.
 
 Each of those was confirmed by tampering with a passing report before being
-relied on. Narrowing a secret's width to 8 bits, relabelling it public, marking
-a verified contract unreached, zeroing its discharged-check counts, removing
-the harness source, re-attributing a finding to the harness, claiming the
-production binary was analyzed, and pointing two contracts at one artifact were
-all caught.
+relied on. Fourteen mutations were tried and all fourteen were caught:
+narrowing a secret's width to 8 bits, relabelling it public, marking a verified
+contract unreached, zeroing its discharged-check counts, removing the harness
+source, re-attributing a finding to the harness, claiming the production binary
+was analyzed, pointing two contracts at one artifact, reintroducing
+report-level artifact provenance, hanging an artifact hash on the analyzer
+object, dropping the path-retention statement, inventing an unexplained
+generated restriction, adding a `bool` input with no restriction, and listing a
+restriction that never reached the script.
 
 ### Where the strongest guarantees live
 
@@ -748,3 +864,8 @@ all caught.
 | a missing symbol is not a verdict | `a_missing_symbol_is_an_explicit_error` |
 | a partial exploration is not a verdict | `exceeding_the_depth_bound_is_inconclusive` |
 | a narrow model does not read like a broad one | `a_narrow_observation_model_is_named_as_such` |
+| a selection error is not masked by a missing backend | `a_selection_error_is_reported_without_any_backend`, with an emptied `PATH` |
+| generated files are not written through a planted path | `an_ephemeral_workspace_is_private_and_removed`, `a_kept_workspace_never_reuses_an_existing_entry`, `a_contract_directory_is_not_reused` |
+| a multi-contract report names no shared artifact | `a_multi_contract_report_claims_no_shared_artifact` |
+| a `bool`'s analyzed domain is Rust's valid values | `a_public_bool_is_restricted_in_the_generated_script`, which checks the script the analyzer was given |
+| an annotation does not break `cargo test` | `cargo_test_compiles_for_an_annotated_library` |

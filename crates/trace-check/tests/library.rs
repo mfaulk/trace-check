@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use trace_check::contract::{ContractError, VerifyConfig, CONFIG_FILE};
-use trace_check::harness::{self, HarnessError, Library};
+use trace_check::harness::{self, HarnessError, Library, Workspace};
 use trace_check::library_report::LibraryReport;
 use trace_check::security::Outcome;
 use trace_check::symbolic::{CheckFeature, Verifier};
@@ -67,15 +67,15 @@ fn analyzer_available() -> bool {
 }
 
 /// Verifies `contracts` from `manifest_path` with `config`, in a private
-/// working directory.
+/// workspace that is removed when the call returns.
 fn verify_with(
     manifest_path: &Path,
     config: &VerifyConfig,
     contracts: &[String],
-    work_root: &Path,
 ) -> Result<LibraryReport, HarnessError> {
+    let workspace = Workspace::ephemeral()?;
     let library = Library::resolve(manifest_path, &[])?;
-    trace_check::run_contract_verification(&library, config, contracts, work_root, None)
+    trace_check::run_contract_verification(&library, config, contracts, &workspace, None)
 }
 
 /// Every configured contract, verified once per test binary.
@@ -88,9 +88,8 @@ fn suite() -> Option<&'static LibraryReport> {
             }
             let config = config();
             let contracts: Vec<String> = config.contracts().iter().map(|c| c.to_string()).collect();
-            let work = std::env::temp_dir().join("trace-check-library-it");
             Some(
-                verify_with(&manifest(), &config, &contracts, &work)
+                verify_with(&manifest(), &config, &contracts)
                     .expect("the bundled contracts verify"),
             )
         })
@@ -307,13 +306,8 @@ fn the_verdict_follows_the_library_implementation() {
         "the declared expectation must still say the function is safe"
     );
 
-    let report = verify_with(
-        &copy.join("Cargo.toml"),
-        &config,
-        &contracts,
-        &staged.path().join("work"),
-    )
-    .expect("the mutated library analyzes");
+    let report = verify_with(&copy.join("Cargo.toml"), &config, &contracts)
+        .expect("the mutated library analyzes");
 
     let entry = contract_report(&report, &contracts[0]);
     assert_eq!(
@@ -350,12 +344,10 @@ fn an_undeclared_contract_is_an_explicit_error() {
         .verify
         .insert("crypto::tag::no_such_function".to_string(), settings);
 
-    let staged = tempfile::tempdir().expect("temp dir");
     let error = verify_with(
         &manifest(),
         &config,
         &["crypto::tag::no_such_function".to_string()],
-        staged.path(),
     )
     .expect_err("an undeclared contract must be refused");
     let message = error.to_string();
@@ -379,14 +371,8 @@ fn an_unannotated_function_is_an_explicit_error() {
         .verify
         .insert("crypto::tag::TAG_LEN".to_string(), settings);
 
-    let staged = tempfile::tempdir().expect("temp dir");
-    let error = verify_with(
-        &manifest(),
-        &config,
-        &["crypto::tag::TAG_LEN".to_string()],
-        staged.path(),
-    )
-    .expect_err("an unannotated item must be refused");
+    let error = verify_with(&manifest(), &config, &["crypto::tag::TAG_LEN".to_string()])
+        .expect_err("an unannotated item must be refused");
     assert!(error.to_string().contains("#[constant_time]"), "{error}");
 }
 
@@ -443,12 +429,10 @@ fn configuration_cannot_reassign_a_role() {
         .inputs
         .insert("expected".to_string(), "public-symbolic".to_string());
 
-    let staged = tempfile::tempdir().expect("temp dir");
     let error = verify_with(
         &manifest(),
         &config,
         &["crypto::tag::verify_tag".to_string()],
-        staged.path(),
     )
     .expect_err("a role override must be refused");
     let message = error.to_string();
@@ -469,12 +453,10 @@ fn an_unconfigured_contract_is_refused() {
     }
     let mut config = config();
     config.verify.remove("crypto::tag::verify_tag");
-    let staged = tempfile::tempdir().expect("temp dir");
     let error = verify_with(
         &manifest(),
         &config,
         &["crypto::tag::verify_tag".to_string()],
-        staged.path(),
     )
     .expect_err("an unconfigured contract must be refused");
     assert!(
@@ -489,26 +471,30 @@ fn an_unconfigured_contract_is_refused() {
 /// A symbol the artifact does not define is an explicit error, not a verdict.
 /// This is the "inlined, removed, or misnamed" case: there is nothing to
 /// analyze, and the message says so.
+///
+/// Uses a kept workspace on purpose. The default one is removed when the run
+/// ends, which is correct but would leave this assertion with no artifact to
+/// interrogate -- and an early return here would make the test vacuous.
 #[test]
 fn a_missing_symbol_is_an_explicit_error() {
     if !analyzer_available() {
         return;
     }
-    let Some(report) = suite() else { return };
-    let artifact = Path::new(
-        &contract_report(report, "crypto::tag::verify_tag")
-            .artifact
-            .path,
-    )
-    .to_path_buf();
-    if !artifact.is_file() {
-        // The suite's working directory is per-process and may have been
-        // cleaned; nothing to assert against.
-        return;
-    }
+    let parent = tempfile::tempdir().expect("temp dir");
+    let workspace = Workspace::kept_in(parent.path()).expect("created");
+    let config = config();
+    let contracts = vec!["crypto::tag::verify_tag".to_string()];
+    let library = Library::resolve(&manifest(), &[]).expect("resolves");
+    let report =
+        trace_check::run_contract_verification(&library, &config, &contracts, &workspace, None)
+            .expect("verifies");
+    let artifact = PathBuf::from(&contract_report(&report, &contracts[0]).artifact.path);
+    assert!(artifact.is_file(), "the kept artifact must still exist");
+
     // Present, by construction.
     harness::resolve_symbol(&artifact, "crypto::tag::verify_tag").expect("resolves");
-    // Absent.
+    // Absent: inlined away, removed, or misnamed -- indistinguishable from
+    // here, and all three mean there is nothing to analyze.
     let error = harness::resolve_symbol(&artifact, "crypto::tag::vanished").expect_err("refused");
     let message = error.to_string();
     assert!(message.contains("resolves to no symbol"), "{message}");
@@ -529,12 +515,10 @@ fn exceeding_the_depth_bound_is_inconclusive() {
         .expect("configured");
     // The unbounded run reaches a maximum path depth in the hundreds.
     settings.max_depth = 40;
-    let staged = tempfile::tempdir().expect("temp dir");
     let report = verify_with(
         &manifest(),
         &config,
         &["crypto::tag::verify_tag".to_string()],
-        staged.path(),
     )
     .expect("the bounded run analyzes");
     let entry = contract_report(&report, "crypto::tag::verify_tag");
@@ -567,12 +551,10 @@ fn a_narrow_observation_model_is_named_as_such() {
     settings.checks = vec![CheckFeature::ControlFlow];
     settings.expected_outcome = "VERIFIED_BOUNDED".to_string();
 
-    let staged = tempfile::tempdir().expect("temp dir");
     let report = verify_with(
         &manifest(),
         &config,
         &["crypto::lookup::substitute_indexed".to_string()],
-        staged.path(),
     )
     .expect("the narrow run analyzes");
     let entry = contract_report(&report, "crypto::lookup::substitute_indexed");
@@ -672,4 +654,155 @@ fn stage_library(root: &Path) -> PathBuf {
     std::fs::write(copy.join("Cargo.toml"), format!("{staged}\n[workspace]\n"))
         .expect("write manifest");
     copy
+}
+
+/// A selection error is reported with no backend involved at all.
+///
+/// The ordering regression from review: selection used to be validated inside
+/// the per-contract loop, after the container backend was prepared, so on a
+/// machine without the analyzer image a misspelled contract reported a missing
+/// image rather than the typo. Asserted here without touching a runtime —
+/// `require_configured` is reachable from the configuration alone.
+#[test]
+fn a_selection_error_needs_no_backend() {
+    let config = config();
+    let error = config
+        .require_configured(&["crypto::tag::verify_tga".to_string()])
+        .expect_err("a typo is refused");
+    let message = error.to_string();
+    assert!(message.contains("verify_tga"), "{message}");
+    assert!(message.contains("crypto::tag::verify_tag"), "{message}");
+    assert!(!message.contains("analyzer image"), "{message}");
+    config
+        .require_configured(&["crypto::tag::verify_tag".to_string()])
+        .expect("a configured contract is accepted");
+}
+
+/// A public `bool` reaches the analyzer with a generated domain restriction, so
+/// the searched domain is Rust's valid values rather than all 256 bytes of a
+/// symbolic byte. Verified end to end, including the generated BINSEC `assume`.
+#[test]
+fn a_public_bool_is_restricted_in_the_generated_script() {
+    if !analyzer_available() {
+        return;
+    }
+    let manifest = workspace_root().join("examples/external-library/Cargo.toml");
+    let config = VerifyConfig::load(&manifest.parent().unwrap().join(CONFIG_FILE))
+        .expect("the external configuration is valid");
+    let contracts = vec!["external_library::mix_when".to_string()];
+    let report = verify_with(&manifest, &config, &contracts).expect("verifies");
+    let entry = contract_report(&report, &contracts[0]);
+
+    assert_eq!(entry.analysis.outcome, Outcome::VerifiedBounded);
+    assert_eq!(entry.generated_domain, vec!["TC_PUBLIC_ENABLED <= 1"]);
+    // The developer declared none, and the generated one is not folded in with
+    // theirs.
+    assert!(entry.input_domain.is_empty());
+    // It really reached the analyzer: the script carries the directive.
+    assert!(
+        entry
+            .analysis
+            .script
+            .contains("assume TC_PUBLIC_ENABLED <= 1"),
+        "{}",
+        entry.analysis.script
+    );
+    let flag = entry
+        .inputs
+        .iter()
+        .find(|input| input.parameter == "enabled")
+        .expect("the bool input");
+    assert_eq!(flag.bits, 8);
+    assert_eq!(flag.role, trace_check::contract::Role::Public);
+    assert_eq!(flag.domain.as_deref(), Some("TC_PUBLIC_ENABLED <= 1"));
+    // Branching on a public input is not a leak.
+    assert!(entry.analysis.divergences.is_empty());
+}
+
+/// A library whose only dependency is the annotation macro verifies, and its
+/// contracts opt out of the dynamic adapter so its own `cargo test` compiles.
+/// That compatibility is asserted in `cargo_test_compiles_for_an_annotated_library`.
+#[test]
+fn an_annotation_only_library_verifies() {
+    if !analyzer_available() {
+        return;
+    }
+    let manifest = workspace_root().join("examples/external-library/Cargo.toml");
+    let config = VerifyConfig::load(&manifest.parent().unwrap().join(CONFIG_FILE))
+        .expect("the external configuration is valid");
+    let contracts: Vec<String> = config.contracts().iter().map(|c| c.to_string()).collect();
+    let report = verify_with(&manifest, &config, &contracts).expect("verifies");
+    assert!(report.summary.expectations_reproduced);
+    assert_eq!(report.exit_code(), 0);
+    assert!(report.contracts.iter().all(|entry| entry.symbol.reached));
+}
+
+/// Adding a verification annotation must not stop a library from building its
+/// own test suite.
+///
+/// `#[constant_time]`'s dynamic machinery calls into `trace-check-test`, which
+/// needs `std` and has to be a dev-dependency. A library that wants only the
+/// contract verified says `dynamic = false`, and this is the test that keeps
+/// that promise: an ordinary `cargo test` over the annotation-only example must
+/// compile its library *and* its test targets.
+#[test]
+fn cargo_test_compiles_for_an_annotated_library() {
+    let manifest = workspace_root().join("examples/external-library/Cargo.toml");
+    let target = tempfile::tempdir().expect("temp dir");
+    let output = std::process::Command::new("cargo")
+        .args(["test", "--locked", "--all-targets", "--manifest-path"])
+        .arg(&manifest)
+        .arg("--target-dir")
+        .arg(target.path())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("cargo runs");
+    assert!(
+        output.status.success(),
+        "`cargo test` must compile for a library that only carries the annotation:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The default workspace is a private directory created atomically and removed
+/// when the run ends, and the report says the recorded path is gone rather than
+/// leaving a dangling one to be trusted.
+#[test]
+fn the_default_workspace_does_not_outlive_the_run() {
+    let Some(report) = suite() else { return };
+    let entry = contract_report(report, "crypto::tag::verify_tag");
+    assert!(!entry.artifact.path_retained);
+    assert!(!Path::new(&entry.artifact.path).exists());
+    // The hash is what the result is pinned to.
+    assert_eq!(entry.artifact.sha256.len(), 64);
+    assert!(report.to_text().contains("removed after the run"));
+}
+
+/// `--artifact-dir`'s workspace keeps the evidence bundle, in a freshly created
+/// directory inside the caller's rather than at a predictable path.
+#[test]
+fn a_kept_workspace_preserves_the_evidence_bundle() {
+    if !analyzer_available() {
+        return;
+    }
+    let parent = tempfile::tempdir().expect("temp dir");
+    let workspace = Workspace::kept_in(parent.path()).expect("created");
+    let root = workspace.root().to_path_buf();
+    assert_ne!(root, parent.path());
+
+    let config = config();
+    let contracts = vec!["crypto::lookup::substitute_indexed".to_string()];
+    let library = Library::resolve(&manifest(), &[]).expect("resolves");
+    let report =
+        trace_check::run_contract_verification(&library, &config, &contracts, &workspace, None)
+            .expect("verifies");
+    let entry = contract_report(&report, &contracts[0]);
+    assert!(entry.artifact.path_retained);
+    let artifact = Path::new(&entry.artifact.path);
+    assert!(
+        artifact.is_file(),
+        "{} should still exist",
+        entry.artifact.path
+    );
+    assert!(artifact.starts_with(&root));
 }

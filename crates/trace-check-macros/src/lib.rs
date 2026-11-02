@@ -50,14 +50,35 @@ use syn::{
 /// pub fn verify_tag(expected: &[u8; 32], supplied: &[u8; 32]) -> bool { … }
 /// ```
 ///
-/// Emits three things:
+/// Emits:
 ///
 /// * the function **verbatim** — no wrapper, no instrumentation, so production
 ///   behavior is untouched;
-/// * under `#[cfg(test)]`, an **analysis adapter** named `<function>_ct`, plus
-///   an invocation counter;
-/// * under `#[cfg(test)]`, a metadata test declaring the contract, so a
+/// * `#[doc(hidden)]` constants describing the contract, always present so a
+///   verification harness can read them from an ordinary library build;
+/// * under `#[cfg(test)]`, an **analysis adapter** named `<function>_ct`, an
+///   invocation counter, and a metadata test declaring the contract — so a
 ///   contract with no covering test is still discoverable.
+///
+/// # `dynamic = false`
+///
+/// The last group calls into `trace-check-test`, which needs `std` and must be
+/// a dev-dependency. A library that wants its contract *verified* but carries
+/// no dynamic tests — an annotation-only `no_std` consumer whose only
+/// dependency is this macro crate — writes
+/// `#[constant_time(secret = "key", dynamic = false)]` and keeps a compilable
+/// `cargo test`.
+///
+/// It is **opt-out, not opt-in**: a contract without the metadata test
+/// disappears from `cargo trace-check test`'s coverage accounting, and a
+/// contract that quietly stops being accounted for is the failure mode this
+/// project exists to prevent. So the safe behavior is what you get without
+/// thinking about it.
+///
+/// Forgetting it where it is needed is a compile error naming the missing
+/// `trace_check_test` crate; using `#[ct_test(target = …)]` against a contract
+/// that opted out is a compile error naming the missing `<function>_ct`
+/// adapter.
 ///
 /// # The adapter owns the declared secrets
 ///
@@ -89,9 +110,17 @@ use syn::{
 pub fn constant_time(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as SecretArgs);
     let function = parse_macro_input!(item as ItemFn);
+    expand_constant_time(args, function).into()
+}
 
+/// The expansion, over `proc_macro2` tokens so it can be unit-tested.
+///
+/// A `#[proc_macro_attribute]` function cannot be called outside macro
+/// expansion, and the two shapes this emits — with and without the dynamic
+/// adapter — are exactly the thing worth a test.
+fn expand_constant_time(args: SecretArgs, function: ItemFn) -> proc_macro2::TokenStream {
     if let Err(error) = reject_unsupported_signature(&function) {
-        return error.to_compile_error().into();
+        return error.to_compile_error();
     }
 
     let parameters = parameter_names(&function);
@@ -109,8 +138,7 @@ pub fn constant_time(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 ),
             )
-            .to_compile_error()
-            .into();
+            .to_compile_error();
         }
     }
     if args.secrets.is_empty() {
@@ -119,8 +147,7 @@ pub fn constant_time(attr: TokenStream, item: TokenStream) -> TokenStream {
             "`constant_time` needs at least one `secret = \"param\"`; a contract with no \
              secret declares nothing",
         )
-        .to_compile_error()
-        .into();
+        .to_compile_error();
     }
 
     let name = function.sig.ident.clone();
@@ -138,7 +165,7 @@ pub fn constant_time(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let adapter_parts = match adapter_signature(&function, &args.secrets) {
         Ok(parts) => parts,
-        Err(error) => return error.to_compile_error().into(),
+        Err(error) => return error.to_compile_error(),
     };
     let AdapterSignature {
         declarations: arg_decls,
@@ -149,6 +176,63 @@ pub fn constant_time(attr: TokenStream, item: TokenStream) -> TokenStream {
     let return_type = match &function.sig.output {
         ReturnType::Default => quote! {},
         ReturnType::Type(arrow, ty) => quote! { #arrow #ty },
+    };
+
+    // The dynamic machinery calls into `trace-check-test`, which needs `std`
+    // and has to be a dev-dependency. A library that only wants the contract
+    // verified — an annotation-only `no_std` consumer — opts out with
+    // `dynamic = false`, and its ordinary `cargo test` then compiles. The
+    // default stays on: without it, a contract would silently disappear from
+    // M3's coverage accounting, and an untested contract reading as fine is the
+    // failure mode this project exists to prevent.
+    let dynamic = if args.dynamic {
+        quote! {
+            /// Counts invocations made through the contract adapter. Test-only.
+            #[cfg(test)]
+            #[allow(non_upper_case_globals)]
+            #visibility static #counter: ::std::sync::atomic::AtomicU64 =
+                ::std::sync::atomic::AtomicU64::new(0);
+
+            /// Analysis adapter: owns and marks the declared secrets, runs the
+            /// positive control, invokes the untouched function with each secret
+            /// in its declared slot, and declassifies the result.
+            ///
+            /// `#[inline(never)]` keeps this a separate frame so it cannot
+            /// perturb the analysis of the function itself.
+            #[cfg(test)]
+            #[inline(never)]
+            #[allow(non_snake_case)]
+            #visibility fn #adapter( #( #arg_decls ),* ) #return_type {
+                #counter.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+                ::trace_check_test::contract_begin(
+                    &::trace_check_test::meta::qualified(module_path!(), #name_literal),
+                );
+                // Laundered before marking: interprocedural constant
+                // propagation would otherwise let the optimizer use an
+                // immediate and never read the marked storage.
+                #( #secret_bindings )*
+                let __trace_check_guards = ( #( #secret_marks, )* );
+                let __trace_check_result = #name( #( #call_arguments ),* );
+                drop(__trace_check_guards);
+                ::trace_check_test::finish(__trace_check_result)
+            }
+
+            #[cfg(test)]
+            #[test]
+            #[ignore = "trace-check contract metadata; run `cargo trace-check test`"]
+            #[allow(non_snake_case)]
+            fn #meta_fn() {
+                ::trace_check_test::meta::emit_contract(
+                    &::trace_check_test::meta::qualified(module_path!(), #name_literal),
+                    #name_literal,
+                    &[ #( #secrets ),* ],
+                    file!(),
+                    line!(),
+                );
+            }
+        }
+    } else {
+        quote! {}
     };
 
     quote! {
@@ -173,51 +257,8 @@ pub fn constant_time(attr: TokenStream, item: TokenStream) -> TokenStream {
         #[allow(non_upper_case_globals)]
         #visibility const #descriptor_const: &str = #descriptor;
 
-        /// Counts invocations made through the contract adapter. Test-only.
-        #[cfg(test)]
-        #[allow(non_upper_case_globals)]
-        #visibility static #counter: ::std::sync::atomic::AtomicU64 =
-            ::std::sync::atomic::AtomicU64::new(0);
-
-        /// Analysis adapter: owns and marks the declared secrets, runs the
-        /// positive control, invokes the untouched function with each secret in
-        /// its declared slot, and declassifies the result.
-        ///
-        /// `#[inline(never)]` keeps this a separate frame so it cannot perturb
-        /// the analysis of the function itself.
-        #[cfg(test)]
-        #[inline(never)]
-        #[allow(non_snake_case)]
-        #visibility fn #adapter( #( #arg_decls ),* ) #return_type {
-            #counter.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
-            ::trace_check_test::contract_begin(
-                &::trace_check_test::meta::qualified(module_path!(), #name_literal),
-            );
-            // Laundered before marking: interprocedural constant propagation
-            // would otherwise let the optimizer use an immediate and never read
-            // the marked storage.
-            #( #secret_bindings )*
-            let __trace_check_guards = ( #( #secret_marks, )* );
-            let __trace_check_result = #name( #( #call_arguments ),* );
-            drop(__trace_check_guards);
-            ::trace_check_test::finish(__trace_check_result)
-        }
-
-        #[cfg(test)]
-        #[test]
-        #[ignore = "trace-check contract metadata; run `cargo trace-check test`"]
-        #[allow(non_snake_case)]
-        fn #meta_fn() {
-            ::trace_check_test::meta::emit_contract(
-                &::trace_check_test::meta::qualified(module_path!(), #name_literal),
-                #name_literal,
-                &[ #( #secrets ),* ],
-                file!(),
-                line!(),
-            );
-        }
+        #dynamic
     }
-    .into()
 }
 
 /// Marks a test as a constant-time check.
@@ -722,9 +763,18 @@ fn parameter_names(function: &ItemFn) -> Vec<String> {
         .collect()
 }
 
-/// `secret = "a", secret = "b"`
+/// `secret = "a", secret = "b"`, optionally `dynamic = false`.
+#[derive(Debug)]
 struct SecretArgs {
     secrets: Vec<String>,
+    /// Whether to emit the `#[cfg(test)]` dynamic-analysis machinery.
+    ///
+    /// On by default, because turning it off removes the contract from M3's
+    /// coverage accounting and an untested contract must never read as fine. A
+    /// library that only wants its contract *verified* — and so declares no
+    /// dev-dependency on `trace-check-test` — sets `dynamic = false` and keeps
+    /// a compilable `cargo test`.
+    dynamic: bool,
     span: proc_macro2::Span,
 }
 
@@ -733,20 +783,41 @@ impl Parse for SecretArgs {
         let span = input.span();
         let metas = Punctuated::<Meta, Token![,]>::parse_terminated(input)?;
         let mut secrets = Vec::new();
+        let mut dynamic = true;
         for meta in metas {
             match &meta {
                 Meta::NameValue(pair) if pair.path.is_ident("secret") => {
                     secrets.push(string_value(&pair.value)?);
                 }
+                Meta::NameValue(pair) if pair.path.is_ident("dynamic") => {
+                    dynamic = bool_value(&pair.value)?;
+                }
                 other => {
                     return Err(syn::Error::new_spanned(
                         other,
-                        "expected `secret = \"parameter\"`",
+                        "expected `secret = \"parameter\"` or `dynamic = false`",
                     ))
                 }
             }
         }
-        Ok(SecretArgs { secrets, span })
+        Ok(SecretArgs {
+            secrets,
+            dynamic,
+            span,
+        })
+    }
+}
+
+fn bool_value(expr: &Expr) -> syn::Result<bool> {
+    match expr {
+        Expr::Lit(ExprLit {
+            lit: Lit::Bool(value),
+            ..
+        }) => Ok(value.value()),
+        other => Err(syn::Error::new_spanned(
+            other,
+            "expected `dynamic = true` or `dynamic = false`",
+        )),
     }
 }
 
@@ -919,6 +990,102 @@ mod tests {
             descriptor.chars().filter(|c| *c == '"').count() % 2 == 0,
             "{descriptor}"
         );
+    }
+
+    fn expand(attr: proc_macro2::TokenStream, item: proc_macro2::TokenStream) -> String {
+        let args: SecretArgs = syn::parse2(attr).expect("arguments parse");
+        let function: ItemFn = syn::parse2(item).expect("function parses");
+        expand_constant_time(args, function).to_string()
+    }
+
+    /// By default the dynamic machinery is emitted: the adapter, its counter
+    /// and the metadata test that makes an untested contract discoverable.
+    #[test]
+    fn the_dynamic_adapter_is_emitted_by_default() {
+        let expanded = expand(
+            quote! { secret = "expected" },
+            quote! { pub fn verify_tag(expected: &[u8; 16], supplied: &[u8; 16]) -> bool { true } },
+        );
+        assert!(expanded.contains("verify_tag_ct"), "{expanded}");
+        assert!(
+            expanded.contains("__TRACE_CHECK_CALLS_verify_tag"),
+            "{expanded}"
+        );
+        assert!(
+            expanded.contains("__trace_check_contract_verify_tag"),
+            "{expanded}"
+        );
+        assert!(expanded.contains("trace_check_test"), "{expanded}");
+    }
+
+    /// `dynamic = false` emits the function and its descriptor and nothing
+    /// else, so a library whose only dependency is this macro crate still
+    /// compiles its own `cargo test`.
+    #[test]
+    fn opting_out_emits_no_reference_to_trace_check_test() {
+        let expanded = expand(
+            quote! { secret = "expected", dynamic = false },
+            quote! { pub fn verify_tag(expected: &[u8; 16], supplied: &[u8; 16]) -> bool { true } },
+        );
+        assert!(
+            !expanded.contains("trace_check_test"),
+            "an opted-out contract must not reference a crate the consumer need not \
+             declare:\n{expanded}"
+        );
+        assert!(!expanded.contains("verify_tag_ct"), "{expanded}");
+        assert!(!expanded.contains("std :: sync :: atomic"), "{expanded}");
+        // The contract itself is still fully described.
+        assert!(
+            expanded.contains("__TRACE_CHECK_CONTRACT_verify_tag"),
+            "{expanded}"
+        );
+        assert!(
+            expanded.contains("__TRACE_CHECK_MODULE_verify_tag"),
+            "{expanded}"
+        );
+        assert!(
+            expanded.contains("__TRACE_CHECK_SITE_verify_tag"),
+            "{expanded}"
+        );
+        assert!(expanded.contains("ref-byte-array"), "{expanded}");
+    }
+
+    /// The descriptor constants are emitted either way, because a verification
+    /// harness links the ordinary library build and never a test build.
+    #[test]
+    fn the_descriptor_is_emitted_in_both_modes() {
+        for attr in [
+            quote! { secret = "value" },
+            quote! { secret = "value", dynamic = false },
+        ] {
+            let expanded = expand(attr, quote! { pub fn f(value: u32) -> u32 { value } });
+            assert!(expanded.contains("__TRACE_CHECK_CONTRACT_f"), "{expanded}");
+            // Not behind cfg(test): that was the whole reason for the constant.
+            let descriptor = expanded
+                .split("__TRACE_CHECK_CONTRACT_f")
+                .next()
+                .expect("a prefix");
+            assert!(
+                !descriptor.trim_end().ends_with("# [cfg (test)]"),
+                "the descriptor must not be test-only:\n{expanded}"
+            );
+        }
+    }
+
+    /// A non-boolean `dynamic` value is rejected rather than coerced.
+    #[test]
+    fn a_non_boolean_dynamic_value_is_rejected() {
+        let parsed: syn::Result<SecretArgs> = syn::parse2(quote! { secret = "a", dynamic = "yes" });
+        let error = parsed.expect_err("rejected");
+        assert!(error.to_string().contains("dynamic = true"), "{error}");
+    }
+
+    /// An unknown argument names both accepted forms.
+    #[test]
+    fn an_unknown_argument_names_the_accepted_forms() {
+        let parsed: syn::Result<SecretArgs> = syn::parse2(quote! { secrets = "a" });
+        let error = parsed.expect_err("rejected");
+        assert!(error.to_string().contains("dynamic = false"), "{error}");
     }
 
     /// Rendered types read the way a developer wrote them.

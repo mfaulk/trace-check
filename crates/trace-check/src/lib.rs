@@ -170,8 +170,8 @@ pub fn run_symbolic(
     ))
 }
 
-use contract::{ContractError, VerifyConfig};
-use harness::{Artifact, Harness, HarnessError, Library, ResolvedSymbol};
+use contract::VerifyConfig;
+use harness::{Artifact, Harness, HarnessError, Library, ResolvedSymbol, Workspace};
 use library_report::{LibraryReport, Verified};
 
 /// Verifies declared contracts against the real functions in a Cargo library.
@@ -181,37 +181,33 @@ use library_report::{LibraryReport, Verified};
 /// as dead code — a multi-entry harness silently lost two entry symbols during
 /// the feasibility spike. Per-contract packages make that unrepresentable, and
 /// let each report name the exact executable its result describes.
+///
+/// # Order of operations
+///
+/// Everything decidable from the configuration and the selection is checked
+/// **before** the analyzer backend is prepared. An earlier revision prepared
+/// the container backend first, so on a machine without the analyzer image a
+/// misspelled contract name reported a missing image rather than the typo —
+/// and a CLI argument-validation test depended on a container runtime it had no
+/// business needing.
 pub fn run_contract_verification(
     library: &Library,
     config: &VerifyConfig,
     contracts: &[String],
-    work_root: &Path,
+    workspace: &Workspace,
     runtime: Option<&str>,
 ) -> Result<LibraryReport, HarnessError> {
+    config.require_configured(contracts)?;
+
     let mut verifier = symbolic::Verifier::prepare_with(runtime)?;
     verifier.check_image()?;
 
     let mut entries = Vec::new();
-    let mut provenance = None;
     for contract_id in contracts {
-        let settings =
-            config
-                .settings(contract_id)
-                .ok_or_else(|| ContractError::NotConfigured {
-                    contract: contract_id.clone(),
-                    available: config.contracts().iter().map(|c| c.to_string()).collect(),
-                })?;
-        // A generated package per contract, sharing one target directory.
-        // Per-contract target directories rebuilt `core`, `subtle` and the
-        // library itself for every contract and left hundreds of megabytes
-        // behind; sharing is safe because each generated package has its own
-        // name, so their binaries do not collide.
-        let work_dir = work_root.join("contracts").join(sanitize(contract_id));
-        let target_dir = work_root.join("target");
-        for directory in [&work_dir, &target_dir] {
-            std::fs::create_dir_all(directory)
-                .map_err(|e| HarnessError::Io(format!("{}: {e}", directory.display())))?;
-        }
+        let settings = config
+            .settings(contract_id)
+            .expect("the selection was validated above");
+        let (work_dir, target_dir) = workspace.directories_for(contract_id)?;
 
         let contract = harness::probe_contract(library, contract_id, &work_dir, &target_dir)?;
         // Checked after the descriptor is known, so the message can name the
@@ -225,7 +221,6 @@ pub fn run_contract_verification(
 
         let case = harness::verification_case(&contract, &symbol, &generated, settings);
         let result = verifier.verify(&case, &artifact.path, &artifact.sha256)?;
-        provenance = Some(verifier.provenance(&artifact.path, &artifact.sha256));
 
         entries.push(Verified {
             contract,
@@ -238,12 +233,10 @@ pub fn run_contract_verification(
         });
     }
 
-    let provenance = provenance.unwrap_or_else(|| verifier.provenance(Path::new("<none>"), ""));
-    Ok(library_report::build(entries, provenance, contracts.len()))
-}
-
-/// A contract identity as a directory name. Identities are Rust paths, already
-/// validated by `harness::split_contract`, so this only replaces separators.
-fn sanitize(contract: &str) -> String {
-    contract.replace("::", "-")
+    Ok(library_report::build(
+        entries,
+        verifier.identity(),
+        contracts.len(),
+        workspace.is_kept(),
+    ))
 }

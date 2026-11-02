@@ -14,3 +14,10 @@ rationale = "every secret executes the same instructions, so only an address-awa
 max_depth = 4000
 checks = ["control-flow", "memory-access"]
 expected_outcome = "LEAK_DETECTED"
+
+[verify."external_library::mix_when"]
+description = "selection driven by a public bool, whose domain the generator restricts"
+rationale = "the secret is consumed by arithmetic only; the branch is on a public input, which both compared executions share. The generated `<= 1` constraint is what keeps the analyzed domain to Rust's valid bool values"
+max_depth = 4000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "VERIFIED_BOUNDED"
