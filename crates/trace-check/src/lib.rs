@@ -36,6 +36,7 @@ pub mod contract;
 pub mod coverage;
 pub mod dynamic_harness;
 pub mod experiment;
+pub mod explore;
 pub mod generate;
 pub mod harness;
 pub mod library_report;

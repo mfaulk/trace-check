@@ -36,6 +36,14 @@ pub const CORPUS_SCHEMA_VERSION: u32 = 1;
 /// Default number of cases when a contract names no budget.
 pub const DEFAULT_CASES: usize = 64;
 
+/// One case as a backend is handed it: an id, how it was produced, and a value
+/// per declared parameter.
+///
+/// M7's exploration keeps the **global** candidate id a case will be reported
+/// and selected under, so ids travel with the values rather than being assigned
+/// by whoever builds the corpus.
+pub type CaseEntry = (usize, Strategy, Vec<(String, Value)>);
+
 /// Default seed, so an unconfigured run is still reproducible.
 pub const DEFAULT_SEED: u64 = 0x7472_6163_655f_636b;
 
@@ -54,6 +62,14 @@ pub enum Strategy {
     Relationships,
     /// Replayed from a persisted failure.
     Regression,
+    /// Discovered by M7's coverage-guided exploration.
+    ///
+    /// Not a strategy a configuration may request: it is produced by feedback
+    /// from an instrumented artifact, not by a rule over the descriptor, so
+    /// asking for it in `strategies` would name something `generate` cannot do.
+    /// [`crate::contract::CheckSettings::validate`] refuses it there and points
+    /// at the `[check."…".explore]` table instead.
+    Explored,
 }
 
 impl Strategy {
@@ -64,6 +80,7 @@ impl Strategy {
             Strategy::Random => "random",
             Strategy::Relationships => "relationships",
             Strategy::Regression => "regression",
+            Strategy::Explored => "explored",
         }
     }
 
@@ -794,6 +811,10 @@ pub fn generate(
             Strategy::Regression => {
                 // Replayed above, ahead of every generated strategy.
             }
+            Strategy::Explored => {
+                // Produced by `crate::explore` from coverage feedback, not by
+                // any rule this function could apply.
+            }
         }
     }
 
@@ -861,6 +882,68 @@ pub fn verbatim(
             emitted: emitted.len(),
             duplicates: 0,
         }],
+        cases: emitted,
+    })
+}
+
+/// Builds a corpus from cases that already have ids and strategies.
+///
+/// The form M7 needs. Exploration hands the discovery artifact one batch per
+/// round, and a batch's cases keep the **global** candidate ids they will be
+/// reported and selected under — so ids are neither renumbered nor required to
+/// be contiguous, which is what [`verbatim`] and [`generate`] both do.
+///
+/// Order and multiplicity are preserved and nothing is deduplicated: the caller
+/// has already decided what to run. Per-case validation against the contract
+/// still happens, so a mutated value can never be bound to the wrong width —
+/// that check is the one thing no caller is trusted to have done.
+pub fn with_ids(
+    contract: &str,
+    descriptor: &Descriptor,
+    cases: &[CaseEntry],
+) -> Result<Corpus, GenerateError> {
+    if cases.is_empty() {
+        return Err(GenerateError::Regression {
+            detail: "no cases were given, so there is nothing to run".to_string(),
+        });
+    }
+    let parameters = &descriptor.parameters;
+    let mut emitted = Vec::with_capacity(cases.len());
+    let mut tallies: Vec<(Strategy, usize)> = Vec::new();
+    for (id, strategy, inputs) in cases {
+        let values = align_regression(parameters, inputs)?;
+        match tallies.iter_mut().find(|(known, _)| known == strategy) {
+            Some((_, count)) => *count += 1,
+            None => tallies.push((*strategy, 1)),
+        }
+        emitted.push(GeneratedCase {
+            id: *id,
+            strategy: *strategy,
+            inputs: parameters
+                .iter()
+                .map(|parameter| parameter.name.clone())
+                .zip(values)
+                .collect(),
+        });
+    }
+    let mut strategies_requested: Vec<Strategy> =
+        tallies.iter().map(|(strategy, _)| *strategy).collect();
+    strategies_requested.sort_unstable();
+    Ok(Corpus {
+        schema_version: CORPUS_SCHEMA_VERSION,
+        contract: contract.to_string(),
+        seed: 0,
+        budget: emitted.len(),
+        strategies_requested,
+        coverage: tallies
+            .into_iter()
+            .map(|(strategy, count)| StrategyCoverage {
+                strategy,
+                planned: count,
+                emitted: count,
+                duplicates: 0,
+            })
+            .collect(),
         cases: emitted,
     })
 }

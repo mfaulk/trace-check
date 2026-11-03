@@ -184,6 +184,13 @@ pub struct CoverageObservation {
     pub coverage_map_id: String,
     /// In-scope regions this case covered. Empty unless `status` is `Observed`.
     pub covered_regions: RegionSet,
+    /// In-scope coverage records this case entered, by their mangled name.
+    ///
+    /// A coarser signal than the region set and a more useful priority: a
+    /// candidate that entered a function nothing had entered opened a larger
+    /// unexplored area than one that reached another region inside a function
+    /// already being explored.
+    pub covered_functions: BTreeSet<String>,
     /// Whether a coverage record for the contract's own function was executed.
     pub target_invoked: bool,
     pub status: ExecutionStatus,
@@ -645,6 +652,7 @@ impl<'a> Collector<'a> {
             artifact_sha256: self.artifact_sha256.clone(),
             coverage_map_id: coverage_map_id.to_string(),
             covered_regions: RegionSet::new(),
+            covered_functions: BTreeSet::new(),
             target_invoked: false,
             status,
         };
@@ -694,15 +702,24 @@ impl<'a> Collector<'a> {
             }
         };
         let mut covered = RegionSet::new();
+        let mut functions = BTreeSet::new();
         let mut target_invoked = false;
         for function in &export.functions {
             if self.matches_target(&function.name) && function.count > 0 {
                 target_invoked = true;
             }
+            let mut in_scope = false;
             for region in &function.regions {
-                if region.count > 0 && self.in_scope(&region.region.file) {
+                if !self.in_scope(&region.region.file) {
+                    continue;
+                }
+                in_scope = true;
+                if region.count > 0 {
                     covered.insert(region.region.clone());
                 }
+            }
+            if in_scope && function.count > 0 {
+                functions.insert(function.name.clone());
             }
         }
         CoverageObservation {
@@ -710,6 +727,7 @@ impl<'a> Collector<'a> {
             artifact_sha256: self.artifact_sha256.clone(),
             coverage_map_id: coverage_map_id.to_string(),
             covered_regions: covered,
+            covered_functions: functions,
             target_invoked,
             status: ExecutionStatus::Observed,
         }
@@ -1051,6 +1069,7 @@ mod tests {
             artifact_sha256: "deadbeef".to_string(),
             coverage_map_id: "map".to_string(),
             covered_regions: [region("a.rs", 9)].into_iter().collect(),
+            covered_functions: BTreeSet::new(),
             target_invoked: true,
             status: ExecutionStatus::Observed,
         };
@@ -1068,6 +1087,7 @@ mod tests {
             artifact_sha256: "deadbeef".to_string(),
             coverage_map_id: "map".to_string(),
             covered_regions: [region("a.rs", 1), region("a.rs", 2)].into_iter().collect(),
+            covered_functions: BTreeSet::new(),
             target_invoked: false,
             status: ExecutionStatus::ProfileInvalid {
                 detail: "doubled".to_string(),
