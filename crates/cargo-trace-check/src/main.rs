@@ -127,10 +127,20 @@ enum Command {
         contract: Vec<String>,
         /// Check every contract with a [check."..."] entry in trace-check.toml.
         ///
-        /// Deliberately not called --all-contracts: it covers what the
-        /// configuration names, not every annotation in the source tree.
+        /// Covers what the *configuration* names. See --all-contracts for
+        /// every declaration the compiler found.
         #[arg(long, conflicts_with = "replay")]
         all_configured: bool,
+        /// Enforce every `#[constant_time]` declaration in the selected build.
+        ///
+        /// Discovers contracts from the compiled library rather than from
+        /// configuration, so a new annotation is enforced without anyone
+        /// remembering to add an entry. Reports an explicit status for every
+        /// declaration, including ones it cannot analyze.
+        ///
+        /// Distinct from --all-configured, which selects configuration keys.
+        #[arg(long, conflicts_with_all = ["replay", "all_configured"])]
+        all_contracts: bool,
         /// Library manifest to check contracts from. Defaults to ./Cargo.toml.
         #[arg(long)]
         manifest_path: Option<PathBuf>,
@@ -195,8 +205,32 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Format::Text)]
         format: Format,
     },
+    /// Show which required analyses each declared contract has.
+    ///
+    /// Read-only: it resolves the policy against the compiler-derived
+    /// inventory and prints the matrix without running any analysis, so
+    /// exemptions, unsupported signatures and missing backends are all visible
+    /// immediately.
+    Coverage {
+        #[arg(long)]
+        manifest_path: Option<PathBuf>,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long, value_delimiter = ',')]
+        features: Vec<String>,
+        #[arg(long, value_enum, default_value_t = Format::Text)]
+        format: Format,
+    },
     /// List the discovered checks and contracts without running them.
     List {
+        /// List the compiler-derived contract inventory instead of the test
+        /// metadata.
+        ///
+        /// Reads `#[constant_time]` declarations out of the compiled library,
+        /// so it finds annotation-only contracts that have no test adapter and
+        /// follows the selected feature configuration.
+        #[arg(long)]
+        contracts: bool,
         #[arg(long)]
         manifest_path: Option<PathBuf>,
         #[arg(long)]
@@ -252,20 +286,39 @@ fn execute(cli: Cli) -> Result<u8, String> {
                 max_output_bytes,
             },
         ),
+        Command::Coverage {
+            manifest_path,
+            config,
+            features,
+            format,
+        } => coverage(
+            manifest_path.as_deref(),
+            config.as_deref(),
+            &features,
+            format,
+        ),
         Command::List {
+            contracts,
             manifest_path,
             profile,
             features,
             format,
-        } => list(
-            manifest_path.as_deref(),
-            profile.as_deref(),
-            &features,
-            format,
-        ),
+        } => {
+            if contracts {
+                list_contracts(manifest_path.as_deref(), &features, format)
+            } else {
+                list(
+                    manifest_path.as_deref(),
+                    profile.as_deref(),
+                    &features,
+                    format,
+                )
+            }
+        }
         Command::Check {
             contract,
             all_configured,
+            all_contracts,
             manifest_path,
             config,
             features,
@@ -285,6 +338,7 @@ fn execute(cli: Cli) -> Result<u8, String> {
         } => check(CheckRequest {
             selected: contract,
             all_configured,
+            all_contracts,
             manifest_path,
             config_path: config,
             features,
@@ -369,6 +423,7 @@ fn execute(cli: Cli) -> Result<u8, String> {
 struct CheckRequest {
     selected: Vec<String>,
     all_configured: bool,
+    all_contracts: bool,
     manifest_path: Option<PathBuf>,
     config_path: Option<PathBuf>,
     features: Vec<String>,
@@ -385,6 +440,7 @@ fn check(request: CheckRequest) -> Result<u8, String> {
     let CheckRequest {
         selected,
         all_configured,
+        all_contracts,
         manifest_path,
         config_path,
         features,
@@ -466,6 +522,28 @@ fn check(request: CheckRequest) -> Result<u8, String> {
         VerifyConfig::empty()
     };
 
+    // `--all-contracts` is a different question from `--all-configured`, and
+    // goes through a different orchestration: it starts from the
+    // compiler-derived inventory and reports a status for every declaration,
+    // including ones no configuration mentions and ones it cannot analyze.
+    if all_contracts {
+        let report = trace_check::run_contract_coverage(
+            &library,
+            &config,
+            &workspace,
+            &overrides,
+            &trace_check::Selection::AllContracts,
+            reproducer_dir.as_deref(),
+            &today(),
+        )
+        .map_err(|e| e.to_string())?;
+        match format {
+            Format::Text => print!("{}", report.to_text()),
+            Format::Json => println!("{}", report.to_json()),
+        }
+        return Ok(report.exit_code());
+    }
+
     let contracts: Vec<String> = if all_configured {
         config
             .checked_contracts()
@@ -497,6 +575,125 @@ fn check(request: CheckRequest) -> Result<u8, String> {
 /// First twelve characters of a hash, for human-readable output.
 fn short(hash: &str) -> String {
     hash.chars().take(12).collect()
+}
+
+/// Today, as `YYYY-MM-DD`, for exemption expiry.
+///
+/// Computed from the system clock rather than taken from the environment, and
+/// passed explicitly into the policy resolver so that resolver stays a pure
+/// function a test can pin to any date.
+fn today() -> String {
+    // Days since the Unix epoch, converted with the civil-from-days algorithm.
+    // A date library for one subtraction would be a dependency to audit.
+    let days = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() / 86_400)
+        .unwrap_or(0) as i64;
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// Howard Hinnant's `civil_from_days`, for the one date this tool needs.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = (z - era * 146_097) as u64;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era as i64 + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * shifted_month + 2) / 5 + 1) as u32;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    } as u32;
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+/// `list --contracts`: the compiler-derived inventory, without running
+/// anything.
+fn list_contracts(
+    manifest_path: Option<&std::path::Path>,
+    features: &[String],
+    format: Format,
+) -> Result<u8, String> {
+    let manifest = manifest_path
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("Cargo.toml"));
+    if !manifest.is_file() {
+        return Err(format!(
+            "{} is not a file; pass --manifest-path to name the library to inventory",
+            manifest.display()
+        ));
+    }
+    let library = Library::resolve(&manifest, features).map_err(|e| e.to_string())?;
+    let workspace = Workspace::ephemeral().map_err(|e| e.to_string())?;
+    let inventory =
+        trace_check::read_contract_inventory(&library, &workspace).map_err(|e| e.to_string())?;
+    match format {
+        Format::Text => print!(
+            "{}",
+            trace_check::coverage_report::inventory_to_text(&inventory)
+        ),
+        Format::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&inventory).expect("an inventory is serializable")
+        ),
+    }
+    // An inventory that could not be completed is not a successful listing.
+    Ok(if inventory.complete() { 0 } else { 2 })
+}
+
+/// `coverage`: the contract matrix, without running any analysis.
+///
+/// Separate from `check` on purpose. Inspecting what is required and what is
+/// outstanding is a different activity from enforcing it, and a developer
+/// adopting the tool wants the first without waiting for the second.
+fn coverage(
+    manifest_path: Option<&std::path::Path>,
+    config_path: Option<&std::path::Path>,
+    features: &[String],
+    format: Format,
+) -> Result<u8, String> {
+    let manifest = manifest_path
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("Cargo.toml"));
+    if !manifest.is_file() {
+        return Err(format!(
+            "{} is not a file; pass --manifest-path to name the library",
+            manifest.display()
+        ));
+    }
+    let library = Library::resolve(&manifest, features).map_err(|e| e.to_string())?;
+    let workspace = Workspace::ephemeral().map_err(|e| e.to_string())?;
+    let config_path = config_path
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| {
+            manifest
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .join(contract::CONFIG_FILE)
+        });
+    let config = if config_path.is_file() {
+        VerifyConfig::load(&config_path).map_err(|e| e.to_string())?
+    } else {
+        VerifyConfig::empty()
+    };
+    let report = trace_check::report_contract_coverage(
+        &library,
+        &config,
+        &workspace,
+        &trace_check::Selection::AllContracts,
+        &today(),
+    )
+    .map_err(|e| e.to_string())?;
+    match format {
+        Format::Text => print!("{}", report.to_text()),
+        Format::Json => println!("{}", report.to_json()),
+    }
+    Ok(report.exit_code())
 }
 
 fn test(

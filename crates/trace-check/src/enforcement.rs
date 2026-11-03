@@ -538,6 +538,18 @@ pub struct PlanEntry {
     /// Statuses settled without running anything: unsupported signatures,
     /// waivers, contracts not selected for this run.
     pub settled: BTreeMap<Analysis, Status>,
+    /// The outcome an *analyzer-regression* fixture is declared to produce.
+    ///
+    /// `None` for a security contract, which is the default and the policy a
+    /// developer's own function gets. M6's split is preserved rather than
+    /// reinterpreted: for a security contract a leak fails, and for a fixture
+    /// that exists to hold trace-check to detecting a planted leak, finding it
+    /// is the fixture passing.
+    ///
+    /// It can only arrive from an explicit `expectation =
+    /// "analyzer-regression"`, because `CheckSettings::validate` refuses an
+    /// `expected_outcome` on a security contract.
+    pub regression_expectation: Option<Outcome>,
     /// Whether this contract was selected for the requested run.
     pub selected: bool,
 }
@@ -603,6 +615,7 @@ impl Plan {
                     is_selected,
                     available,
                     today,
+                    config.settings(&declaration.id).is_some(),
                 ) {
                     settled.insert(*analysis, status);
                 }
@@ -612,6 +625,7 @@ impl Plan {
                 site: declaration.site(),
                 required,
                 settled,
+                regression_expectation: regression_expectation(config, &declaration.id),
                 selected: is_selected,
             });
         }
@@ -627,6 +641,16 @@ impl Plan {
     }
 }
 
+/// The declared outcome of an analyzer-regression fixture, if the
+/// configuration makes it one.
+fn regression_expectation(config: &VerifyConfig, contract: &str) -> Option<Outcome> {
+    let settings = config.check.get(contract)?;
+    if settings.expectation != crate::contract::Expectation::AnalyzerRegression {
+        return None;
+    }
+    Outcome::parse(settings.expected_outcome.as_deref()?)
+}
+
 /// What one requirement's status is before any backend runs, if it is already
 /// decided.
 fn settle(
@@ -636,6 +660,7 @@ fn settle(
     selected: bool,
     available: &Available,
     today: &str,
+    configured_for_symbolic: bool,
 ) -> Option<Status> {
     // An expired waiver is not a waiver. It is reported as the gap it always
     // was, with its reason, so the lapse is visible rather than silent.
@@ -662,6 +687,32 @@ fn settle(
         if let Err(reason) = generated_support(&declaration.descriptor) {
             return Some(Status::Unsupported { reason });
         }
+    }
+    // Symbolic verification needs declared bounds -- an exploration depth and
+    // an observation model -- which cannot be inferred from a signature. A
+    // requirement with no `[verify]` entry is a configuration gap, and saying
+    // so here means the developer hears it before a container is started.
+    if analysis == Analysis::Symbolic && !configured_for_symbolic {
+        return Some(Status::Inconclusive {
+            detail: format!(
+                "`symbolic` is required but there is no [verify.\"{}\"] entry. A bounded \
+                 symbolic search needs a declared depth and observation model, which cannot be \
+                 inferred from the signature",
+                declaration.id
+            ),
+        });
+    }
+    // A `dynamic` requirement is evidence from a developer-written
+    // `#[ct_test]`, which `cargo trace-check test` produces and this command
+    // does not run.
+    if analysis == Analysis::Dynamic && !declaration.dynamic_adapter_enabled {
+        return Some(Status::Unsupported {
+            reason: format!(
+                "`dynamic` is required but `{}` is declared `dynamic = false`, so no test \
+                 adapter exists to cover it",
+                declaration.id
+            ),
+        });
     }
     if !selected {
         return Some(Status::NotSelected);
@@ -772,6 +823,9 @@ impl Available {
 pub struct ContractCoverage {
     pub id: String,
     pub site: String,
+    /// See [`PlanEntry::regression_expectation`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub regression_expectation: Option<Outcome>,
     /// Whether the macro emitted M3's test adapter for it, recorded because a
     /// `dynamic` requirement cannot be met without one.
     pub dynamic_adapter_enabled: bool,
@@ -796,11 +850,19 @@ impl ContractCoverage {
     /// Checked ahead of satisfaction, deliberately: a waiver may excuse a
     /// missing analysis, and nothing excuses a leak that was found.
     pub fn violated(&self) -> bool {
-        self.status.values().any(Status::violation)
-            || self
-                .evidence
-                .iter()
-                .any(|evidence| evidence.outcome == Outcome::LeakDetected)
+        if self.status.values().any(Status::violation) {
+            return true;
+        }
+        // Evidence of a leak is a violation *unless* this contract is a
+        // declared analyzer-regression fixture whose whole purpose is to be
+        // detected. That split is M6's and is preserved exactly: only an
+        // explicit `expectation = "analyzer-regression"` with a matching
+        // `expected_outcome` reaches here, and a security contract cannot
+        // declare one.
+        self.evidence.iter().any(|evidence| {
+            evidence.outcome == Outcome::LeakDetected
+                && self.regression_expectation != Some(Outcome::LeakDetected)
+        })
     }
 
     /// Requirements that are neither satisfied nor violated.
@@ -849,6 +911,7 @@ impl Coverage {
                 .map(|entry| ContractCoverage {
                     id: entry.id.clone(),
                     site: entry.site.clone(),
+                    regression_expectation: entry.regression_expectation,
                     dynamic_adapter_enabled: inventory
                         .contract(&entry.id)
                         .is_some_and(|d| d.dynamic_adapter_enabled),
@@ -891,19 +954,30 @@ impl Coverage {
             return;
         };
         let analysis = evidence.analysis;
-        let status = if evidence.outcome == Outcome::LeakDetected {
-            Status::LeakDetected
-        } else if evidence.outcome == analysis.discharged_by() {
-            Status::Checked
-        } else {
-            Status::Inconclusive {
+        let status = match contract.regression_expectation {
+            // An analyzer-regression fixture is held to the outcome it
+            // declares, which is a statement about trace-check rather than
+            // about the function being secure. A planted leak that was found
+            // is the fixture passing; a declared outcome that did not arrive
+            // is the fixture failing.
+            Some(declared) if evidence.outcome == declared => Status::Checked,
+            Some(declared) => Status::Inconclusive {
+                detail: format!(
+                    "analyzer regression: declared {declared} but {analysis} produced {}: {}",
+                    evidence.outcome, evidence.detail
+                ),
+            },
+            // A security contract. A leak fails, whatever else is configured.
+            None if evidence.outcome == Outcome::LeakDetected => Status::LeakDetected,
+            None if evidence.outcome == analysis.discharged_by() => Status::Checked,
+            None => Status::Inconclusive {
                 detail: format!(
                     "{analysis} requires {} and the analysis produced {}: {}",
                     analysis.discharged_by(),
                     evidence.outcome,
                     evidence.detail
                 ),
-            }
+            },
         };
         // A leak overwrites anything, including an exemption. Nothing else
         // overwrites a leak.
@@ -1050,6 +1124,54 @@ impl Enforcement {
         "Enforcement coverage is the proportion of declared requirements that were met. It is \
          not the proportion of secret inputs proven safe, and it says nothing about functions \
          that carry no declaration."
+    }
+}
+
+/// Inventory fixtures for tests in this crate.
+#[cfg(test)]
+pub mod test_support {
+    use crate::inventory::{ArchiveRead, BuildIdentity, ContractDeclaration, ContractInventory};
+
+    /// A declaration with one `u8` secret parameter.
+    pub fn declaration(id: &str) -> ContractDeclaration {
+        let json = r#"{"schema_version":1,"function":"probe","parameters":[{"name":"key","position":0,"role":"secret","repr":"u8","rust_type":"u8"}],"returns":{"repr":"u8","rust_type":"u8"}}"#;
+        ContractDeclaration {
+            id: id.to_string(),
+            module: id.rsplit_once("::").expect("a qualified id").0.to_string(),
+            function: "probe".to_string(),
+            source_file: "src/lib.rs".to_string(),
+            source_line: 7,
+            dynamic_adapter_enabled: true,
+            descriptor: crate::contract::Descriptor::parse(json).expect("parses"),
+            descriptor_json: json.to_string(),
+            descriptor_sha256: "sha".to_string(),
+        }
+    }
+
+    pub fn identity() -> BuildIdentity {
+        BuildIdentity {
+            package: "crypto-library".to_string(),
+            version: "0.1.0".to_string(),
+            lib_target: "crypto".to_string(),
+            manifest_path: "/x/Cargo.toml".to_string(),
+            features: Vec::new(),
+            target_triple: "x86_64-unknown-linux-gnu".to_string(),
+            rustc_version: "rustc 1.97.0".to_string(),
+            profile: crate::inventory::PROFILE.to_string(),
+            artifact_path: "/x/libcrypto.rlib".to_string(),
+            artifact_sha256: "deadbeef".to_string(),
+        }
+    }
+
+    pub fn inventory(ids: &[&str]) -> ContractInventory {
+        crate::inventory::assemble_for_test(
+            identity(),
+            ArchiveRead {
+                contracts: ids.iter().map(|id| declaration(id)).collect(),
+                objects_inspected: 1,
+                objects_read: 1,
+            },
+        )
     }
 }
 
@@ -1814,14 +1936,17 @@ mod tests {
             &Available::all(),
         );
         let contract = coverage.contract("crypto::a::probe").expect("the contract");
+        // Total over the requirements: every one has *a* status.
         assert_eq!(contract.status.len(), contract.required.len());
-        for analysis in &contract.required {
-            assert_eq!(
-                contract.status[analysis],
-                Status::NotAnalyzed,
-                "{analysis} had no status"
-            );
-        }
+        // `generated` and `dynamic` await a backend; `symbolic` was already
+        // settled, because it needs declared bounds this configuration has
+        // none of. Either way, none of them is absent.
+        assert_eq!(contract.status[&Analysis::Generated], Status::NotAnalyzed);
+        assert_eq!(contract.status[&Analysis::Dynamic], Status::NotAnalyzed);
+        assert!(matches!(
+            contract.status[&Analysis::Symbolic],
+            Status::Inconclusive { .. }
+        ));
         // All three appear as gaps, and all three block.
         assert_eq!(contract.gaps().len(), 3);
         let blocking = coverage.blocking(&found, &policy);
@@ -1836,6 +1961,116 @@ mod tests {
                 "{analysis} was not named in {blocking:?}"
             );
         }
+    }
+
+    /// M6's expectation split survives: a declared analyzer-regression fixture
+    /// passes by being detected, and a security contract fails by it.
+    ///
+    /// The two meanings must not be reinterpreted by M8, so this test asserts
+    /// both directions over the *same* evidence.
+    #[test]
+    fn an_analyzer_regression_fixture_passes_by_being_detected() {
+        use crate::contract::{CheckSettings, Expectation};
+
+        let found = inventory(&["crypto::a::probe"]);
+        let policy = PolicyConfig::default();
+        let selected = vec!["crypto::a::probe".to_string()];
+
+        // As a declared regression fixture: the planted leak is the point.
+        let mut regression = VerifyConfig::empty();
+        regression.check.insert(
+            "crypto::a::probe".to_string(),
+            CheckSettings {
+                expectation: Expectation::AnalyzerRegression,
+                expected_outcome: Some("LEAK_DETECTED".to_string()),
+                ..CheckSettings::default()
+            },
+        );
+        let plan = Plan::resolve(
+            &found,
+            &regression,
+            &policy,
+            &selected,
+            &Available::all(),
+            TODAY,
+        );
+        let mut coverage = Coverage::from_plan(&plan, &found);
+        coverage.fold(
+            "crypto::a::probe",
+            evidence(Analysis::Generated, Outcome::LeakDetected),
+        );
+        let contract = coverage.contract("crypto::a::probe").expect("the contract");
+        assert_eq!(contract.status[&Analysis::Generated], Status::Checked);
+        assert!(
+            !contract.violated(),
+            "a declared regression is not a violation"
+        );
+        assert!(contract.satisfied());
+        assert!(coverage.blocking(&found, &policy).is_empty());
+
+        // The same evidence, as a security contract: a failure.
+        let plan = Plan::resolve(
+            &found,
+            &VerifyConfig::empty(),
+            &policy,
+            &selected,
+            &Available::all(),
+            TODAY,
+        );
+        let mut coverage = Coverage::from_plan(&plan, &found);
+        coverage.fold(
+            "crypto::a::probe",
+            evidence(Analysis::Generated, Outcome::LeakDetected),
+        );
+        let contract = coverage.contract("crypto::a::probe").expect("the contract");
+        assert_eq!(contract.status[&Analysis::Generated], Status::LeakDetected);
+        assert!(contract.violated());
+        assert_eq!(coverage.enforcement().violations, 1);
+    }
+
+    /// A regression fixture that does **not** produce its declared outcome
+    /// fails, naming both what was declared and what arrived.
+    #[test]
+    fn an_unmet_regression_expectation_fails() {
+        use crate::contract::{CheckSettings, Expectation};
+
+        let found = inventory(&["crypto::a::probe"]);
+        let policy = PolicyConfig::default();
+        let mut config = VerifyConfig::empty();
+        config.check.insert(
+            "crypto::a::probe".to_string(),
+            CheckSettings {
+                expectation: Expectation::AnalyzerRegression,
+                expected_outcome: Some("LEAK_DETECTED".to_string()),
+                ..CheckSettings::default()
+            },
+        );
+        let plan = Plan::resolve(
+            &found,
+            &config,
+            &policy,
+            &["crypto::a::probe".to_string()],
+            &Available::all(),
+            TODAY,
+        );
+        let mut coverage = Coverage::from_plan(&plan, &found);
+        // The planted leak was not found: the fixture is broken, or the
+        // analyzer regressed.
+        coverage.fold(
+            "crypto::a::probe",
+            evidence(Analysis::Generated, Outcome::NoLeakObserved),
+        );
+        let contract = coverage.contract("crypto::a::probe").expect("the contract");
+        assert!(!contract.satisfied());
+        assert!(!contract.violated());
+        match &contract.status[&Analysis::Generated] {
+            Status::Inconclusive { detail } => {
+                assert!(detail.contains("declared LEAK_DETECTED"), "{detail}");
+                assert!(detail.contains("NO_LEAK_OBSERVED"), "{detail}");
+            }
+            other => panic!("unexpected status: {other:?}"),
+        }
+        assert!(!coverage.blocking(&found, &policy).is_empty());
     }
 
     /// Every analysis name round-trips, so a configuration cannot silently
