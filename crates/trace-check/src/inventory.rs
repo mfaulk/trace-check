@@ -328,6 +328,13 @@ pub struct ArchiveRead {
     pub objects_read: usize,
 }
 
+/// Assembles an inventory from a build identity and a read, for tests that
+/// need one without a compiled artifact.
+#[doc(hidden)]
+pub fn assemble_for_test(build: BuildIdentity, read: ArchiveRead) -> ContractInventory {
+    assemble(build, read)
+}
+
 fn assemble(build: BuildIdentity, read: ArchiveRead) -> ContractInventory {
     let mut contracts = read.contracts;
     contracts.sort_by(|left, right| left.id.cmp(&right.id));
