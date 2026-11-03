@@ -282,7 +282,7 @@ impl Library {
     /// `package = …` plus an explicit key lets the harness refer to the library
     /// by its *lib* name, which is what a contract identity is qualified by and
     /// therefore what the generated call has to spell.
-    fn dependency_stanza(&self) -> String {
+    pub(crate) fn dependency_stanza(&self) -> String {
         let mut stanza = format!(
             "[dependencies.{}]\npackage = {:?}\npath = {:?}\n",
             self.lib_name,

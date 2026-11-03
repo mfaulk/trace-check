@@ -77,6 +77,15 @@ impl Mode {
     }
 }
 
+/// The process's instrumentation mode.
+///
+/// Re-exported so a generated harness needs a dependency on this crate alone.
+/// One fewer path dependency in a generated manifest is one fewer thing that
+/// can fail to resolve on a machine that is not this repository.
+pub fn run_mode() -> RunMode {
+    trace_check_secret::run_mode()
+}
+
 /// Refuses to run a check outside the instrumented runner.
 ///
 /// Generated tests are `#[ignore]`d, so reaching this function at all means

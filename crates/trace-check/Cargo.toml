@@ -15,3 +15,9 @@ sha2 = "0.10"
 tempfile = "3"
 toml = "1.1.8"
 wasmparser = "0.240"
+
+# The M6 generated-harness tests assert against the control symbols the
+# generated harness calls, so they take the constants from the crate that
+# defines them rather than restating the strings.
+[dev-dependencies]
+trace-check-test = { path = "../trace-check-test" }

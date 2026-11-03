@@ -31,6 +31,7 @@
 pub mod census;
 pub mod compare;
 pub mod contract;
+pub mod dynamic_harness;
 pub mod experiment;
 pub mod generate;
 pub mod harness;

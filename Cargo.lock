@@ -577,6 +577,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "toml",
+ "trace-check-test",
  "wasmparser",
 ]
 
