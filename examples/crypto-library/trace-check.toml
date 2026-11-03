@@ -165,9 +165,9 @@ rationale = "a finding here would be wrong in the direction that makes the tool 
 
 [check."crypto::reduce::reduce_once"]
 description = "conditional subtraction over a 32-bit secret, written with a branch"
-rationale = "recorded from the artifact rather than the source: the compiler if-converts the branch, so no leak is observed. A `u32` has 94 boundary values, which is why the budget is raised rather than the boundaries skipped"
-cases = 120
+rationale = "recorded from the artifact rather than the source: the compiler if-converts the branch, so no leak is observed. Two `u32` parameters have 94 boundary values each and sweep to 187 distinct cases, which is why the budget is raised rather than the boundaries skipped"
+cases = 200
 
 [check."crypto::reduce::reduce_once_masked"]
 description = "the same reduction with the subtraction selected by a mask"
-cases = 120
+cases = 200

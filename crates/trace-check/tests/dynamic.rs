@@ -844,3 +844,134 @@ struct StagedCheck {
     run: BatchRun,
     _workspace: Workspace,
 }
+
+/// A sequence-dependent leak reproduces only when the recorded cases are
+/// replayed verbatim — order, multiplicity and all.
+///
+/// The regression this holds down: replay rebuilt its corpus through ordinary
+/// generation, which deduplicates by input value. A reproducer of two
+/// *identical* calls collapsed to one, so the only category of finding that
+/// sequence preservation exists for could never be reproduced.
+///
+/// Staged as a copy of the library whose `substitute` leaks on its second
+/// invocation and only then, so nothing about the harness or the runner is
+/// special-cased.
+#[test]
+fn a_sequence_dependent_leak_needs_verbatim_replay() {
+    if !valgrind_available() {
+        return;
+    }
+    let staged = tempfile::tempdir().expect("temp dir");
+    let copy = stage_library(staged.path());
+    let path = copy.join("src/lookup.rs");
+    let source = std::fs::read_to_string(&path).expect("lookup.rs");
+    let stateful = source.replace(
+        "    let want = index & 15;",
+        "    // Injected: leaks on the second invocation and only then.\n\
+         \x20   static CALLS: core::sync::atomic::AtomicUsize =\n\
+         \x20       core::sync::atomic::AtomicUsize::new(0);\n\
+         \x20   if CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= 1 {\n\
+         \x20       // SAFETY: the mask keeps the index inside the 16-byte table.\n\
+         \x20       return unsafe { core::ptr::read_volatile(&SBOX[(index & 15) as usize]) };\n\
+         \x20   }\n\
+         \x20   let want = index & 15;",
+    );
+    assert_ne!(stateful, source, "the injection site must still exist");
+    std::fs::write(&path, stateful).expect("write lookup.rs");
+
+    let contract_id = "crypto::lookup::substitute";
+    let one_call = vec![("index".to_string(), Value::Scalar { bits: 8, value: 42 })];
+    let twice = vec![one_call.clone(), one_call.clone()];
+
+    // Replayed verbatim, both calls survive and the second one leaks.
+    assert!(
+        run_staged_cases(&copy, contract_id, &twice),
+        "the second identical invocation leaks, so replaying both must reproduce it"
+    );
+
+    // One call cannot reproduce a leak that needs two. This is exactly what
+    // ordinary generation leaves after deduplicating the pair, which is why
+    // replay must not go through it.
+    assert!(
+        !run_staged_cases(&copy, contract_id, &[one_call]),
+        "one call reproduced a leak that needs two; this test is no longer demonstrating why \
+         verbatim replay is required"
+    );
+
+    // And the deduplication is real, not hypothetical.
+    let library =
+        Library::resolve(&copy.join("Cargo.toml"), &[]).expect("the staged library resolves");
+    let workspace = Workspace::ephemeral().expect("a private work directory");
+    let (work_dir, target_dir) = workspace
+        .directories_for(contract_id)
+        .expect("per-contract directories");
+    let contract = harness::probe_contract(&library, contract_id, &work_dir, &target_dir)
+        .expect("the contract reads");
+    assert_eq!(
+        generate::verbatim(contract_id, &contract.descriptor, &twice)
+            .expect("verbatim")
+            .cases
+            .len(),
+        2
+    );
+    assert_eq!(
+        generate::generate(
+            contract_id,
+            &contract.descriptor,
+            &GenerateSettings {
+                cases: 64,
+                strategies: Vec::new(),
+                regressions: twice,
+                ..Default::default()
+            }
+        )
+        .expect("generated")
+        .cases
+        .len(),
+        1,
+        "ordinary generation deduplicates identical cases"
+    );
+}
+
+/// Builds the staged copy's harness and runs exactly `cases`, reporting whether
+/// a finding was attributed to the contract.
+fn run_staged_cases(copy: &Path, contract_id: &str, cases: &[Vec<(String, Value)>]) -> bool {
+    let library =
+        Library::resolve(&copy.join("Cargo.toml"), &[]).expect("the staged library resolves");
+    let workspace = Workspace::ephemeral().expect("a private work directory");
+    let (work_dir, _) = workspace
+        .directories_for(contract_id)
+        .expect("per-contract directories");
+    let target_dir = shared_target_dir();
+
+    let contract = harness::probe_contract(&library, contract_id, &work_dir, &target_dir)
+        .unwrap_or_else(|e| panic!("reading {contract_id} failed: {e}"));
+    let generated = dynamic_harness::generate(&contract).expect("generated");
+    let corpus =
+        generate::verbatim(contract_id, &contract.descriptor, cases).expect("a verbatim corpus");
+    let corpus_path = dynamic_harness::stage_corpus(&corpus, &work_dir).expect("staged");
+    let artifact =
+        dynamic_harness::build(&library, &generated, contract_id, &work_dir, &target_dir)
+            .unwrap_or_else(|e| panic!("building the staged harness failed: {e}"));
+
+    let (valgrind, _version) = prepare_valgrind().expect("valgrind is available");
+    let ids: Vec<usize> = corpus.cases.iter().map(|case| case.id).collect();
+    let run = dynamic_harness::run_batch(
+        &valgrind,
+        &artifact.path,
+        &corpus_path,
+        Some(&ids),
+        native::Limits::default(),
+    )
+    .unwrap_or_else(|e| panic!("running the staged harness failed: {e}"));
+    assert!(
+        run.all_completed(),
+        "the staged run did not complete: {:?}",
+        run.incompleteness()
+    );
+    let parsed = run.run.as_ref().expect("the XML parsed");
+    let found = parsed
+        .secret_dependency_errors()
+        .any(|error| error.attributable_to(&contract.function));
+    found
+}
