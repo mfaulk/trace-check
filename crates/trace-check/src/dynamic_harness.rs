@@ -50,9 +50,22 @@ use crate::native::{self, Limits};
 pub const RUN_MODE_MARKER: &str = "trace-check-harness:";
 
 /// Printed by a case as its last act, after declassification.
+///
+/// Followed by the run's nonce and the case id. Completion evidence has to be
+/// something the *function under analysis* cannot produce: it runs in this
+/// process and can print anything it likes, and a case that forged a marker and
+/// then exited would otherwise be credited as having completed. The nonce is
+/// generated per run and passed in on the command line, so it is not in the
+/// library's source.
 pub const CASE_MARKER: &str = "trace-check-case:";
 
-/// Printed once after every selected case has completed.
+/// Printed once, after every selected case has completed.
+///
+/// The decisive piece of evidence. A process that died partway through -- or
+/// that something terminated early -- never prints this, and Valgrind's
+/// `--error-exitcode` masks the program's own status whenever Memcheck reported
+/// anything, so the exit code alone cannot distinguish a finished run from an
+/// abandoned one.
 pub const RUN_COMPLETE_MARKER: &str = "trace-check-run-complete:";
 
 /// Compilation settings for the analysis artifact, recorded because a result
@@ -262,7 +275,7 @@ fn render_source(contract: &Contract) -> Result<String, DynamicError> {
          ///\n\
          /// Nothing is decoded, formatted or compared while a value is marked:\n\
          /// those operations would produce findings belonging to the harness.\n\
-         fn run_case(id: usize, fields: &[&str]) -> Result<(), String> {{\n\
+         fn run_case(nonce: &str, id: usize, fields: &[&str]) -> Result<(), String> {{\n\
          \x20   if fields.len() != {} {{\n\
          \x20       return Err(format!(\n\
          \x20           \"case {{id}} has {{}} input(s), but `{}` declares {}\",\n\
@@ -358,7 +371,7 @@ fn render_source(contract: &Contract) -> Result<String, DynamicError> {
             out.push_str(&format!(
                 "\x20   {}({});\n\
                  \x20   drop(({},));\n\
-                 \x20   println!(\"{CASE_MARKER} {{id}} produced=unit\");\n",
+                 \x20   println!(\"{CASE_MARKER} {{nonce}} {{id}} produced=unit\");\n",
                 contract.call_path(),
                 arguments.join(", "),
                 guards.join(", ")
@@ -371,7 +384,7 @@ fn render_source(contract: &Contract) -> Result<String, DynamicError> {
                  \x20   // Declassified before it is formatted, so printing the value cannot\n\
                  \x20   // produce findings inside `core::fmt`.\n\
                  \x20   let produced = ::trace_check_test::finish(produced);\n\
-                 \x20   println!(\"{CASE_MARKER} {{id}} produced={{}}\", produced as u64);\n",
+                 \x20   println!(\"{CASE_MARKER} {{nonce}} {{id}} produced={{}}\", produced as u64);\n",
                 contract.call_path(),
                 arguments.join(", "),
                 guards.join(", ")
@@ -386,8 +399,8 @@ fn render_source(contract: &Contract) -> Result<String, DynamicError> {
         r#"
 fn main() {{
     let argv: Vec<String> = std::env::args().collect();
-    let [_, corpus_path, selection] = argv.as_slice() else {{
-        eprintln!("usage: <harness> <corpus-path> all|<id>[,<id>...]");
+    let [_, corpus_path, selection, nonce] = argv.as_slice() else {{
+        eprintln!("usage: <harness> <corpus-path> all|<id>[,<id>...] <nonce>");
         std::process::exit(2);
     }};
     let text = match std::fs::read_to_string(corpus_path) {{
@@ -450,7 +463,7 @@ fn main() {{
             std::process::exit(2);
         }};
         let borrowed: Vec<&str> = fields.iter().map(String::as_str).collect();
-        if let Err(error) = run_case(*id, &borrowed) {{
+        if let Err(error) = run_case(nonce, *id, &borrowed) {{
             // An invalid input is refused before analysis rather than bound to
             // the wrong width.
             eprintln!("case {{id}} was rejected: {{error}}");
@@ -458,7 +471,7 @@ fn main() {{
         }}
         completed += 1;
     }}
-    println!("{RUN_COMPLETE_MARKER} cases={{completed}}");
+    println!("{RUN_COMPLETE_MARKER} {{nonce}} cases={{completed}}");
 }}
 "#,
         contract.id
@@ -549,9 +562,14 @@ pub fn build(
 #[derive(Debug)]
 pub struct BatchRun {
     /// Case ids this run was asked to execute, in order.
+    ///
+    /// Always taken from the corpus or the caller's selection — never from the
+    /// harness's own output, which would make the comparison below vacuous.
     pub requested: Vec<usize>,
-    /// Case ids that printed their completion marker.
+    /// Case ids that printed their completion marker, in the order printed.
     pub completed: Vec<usize>,
+    /// Case count from the final run-completion marker, when it was printed.
+    pub run_complete: Option<usize>,
     /// Whether the harness reported running under Valgrind.
     pub instrumented: bool,
     /// The parsed Memcheck report, when the XML was complete.
@@ -559,14 +577,60 @@ pub struct BatchRun {
     /// Why the XML could not be trusted, when it could not.
     pub parse_error: Option<String>,
     pub exit_code: Option<i32>,
+    /// Whether the exit status is one a finished harness can produce.
+    pub status_ok: bool,
     pub stdout: String,
     pub stderr: String,
 }
 
 impl BatchRun {
-    /// Whether every requested case completed.
+    /// Whether this run is trustworthy evidence that every requested case ran.
+    ///
+    /// Four independent conditions, because the obvious one is not enough:
+    ///
+    /// * the exit status is one a finished harness can produce,
+    /// * the final run-completion marker was printed,
+    /// * its case count matches what was requested,
+    /// * and the completed ids are *exactly* the requested ids, in order.
+    ///
+    /// Counting completions against requests was the original check, and it
+    /// could be satisfied by a case that printed a plausible marker and then
+    /// terminated the process. Every marker now carries a per-run nonce, so the
+    /// code under analysis cannot produce one, and the final marker closes the
+    /// early-exit case that no amount of per-case evidence can.
     pub fn all_completed(&self) -> bool {
-        self.requested.len() == self.completed.len()
+        self.status_ok
+            && self.run_complete == Some(self.requested.len())
+            && self.completed == self.requested
+    }
+
+    /// Why this run is not complete evidence, for a report.
+    pub fn incompleteness(&self) -> Option<String> {
+        if self.all_completed() {
+            return None;
+        }
+        if !self.status_ok {
+            return Some(format!(
+                "the harness exited with {}, which a finished run does not",
+                self.exit_code
+                    .map_or_else(|| "a signal".to_string(), |code| format!("code {code}"))
+            ));
+        }
+        match self.run_complete {
+            None => Some(
+                "the harness never printed its run-completion marker, so it did not \
+                 finish; a case may have terminated the process early"
+                    .to_string(),
+            ),
+            Some(count) if count != self.requested.len() => Some(format!(
+                "the harness reported finishing {count} case(s) but {} were requested",
+                self.requested.len()
+            )),
+            _ => Some(format!(
+                "the completed cases {:?} are not exactly the requested cases {:?}",
+                self.completed, self.requested
+            )),
+        }
     }
 }
 
@@ -591,45 +655,112 @@ pub fn run_batch(
             .collect::<Vec<_>>()
             .join(","),
     };
-    let args = vec![corpus_path.display().to_string(), selection];
+    // Resolved before the run, from the corpus itself. Reconstructing the
+    // request from the harness's own completion markers made `all_completed`
+    // trivially true for the whole-corpus path: a harness that ran three of
+    // thirty cases reported three requested and three completed.
+    let requested: Vec<usize> = match ids {
+        Some(ids) => ids.to_vec(),
+        None => corpus_case_ids(corpus_path)?,
+    };
+    if requested.is_empty() {
+        return Err(DynamicError::NothingSelected);
+    }
+
+    let nonce = run_nonce();
+    let args = vec![corpus_path.display().to_string(), selection, nonce.clone()];
     let output = native::run_under_memcheck(valgrind, artifact, &args, &[], limits)
         .map_err(|e| DynamicError::Memcheck(e.to_string()))?;
 
-    let requested: Vec<usize> = match ids {
-        Some(ids) => ids.to_vec(),
-        None => completed_cases(&output.stdout),
-    };
     let (run, parse_error) = match memcheck::parse(&output.xml) {
         Ok(run) => (Some(run), None),
         Err(error) => (None, Some(error.to_string())),
     };
+    // Valgrind's `--error-exitcode` replaces the program's own status whenever
+    // Memcheck reported anything, so a findings exit is indistinguishable from
+    // a clean one here and both are acceptable. Anything else means the harness
+    // itself failed, which is not a security result.
+    let status_ok = output.exit_code == Some(0) || output.exited_with_findings();
     Ok(BatchRun {
         requested,
-        completed: completed_cases(&output.stdout),
+        completed: completed_cases(&output.stdout, &nonce),
+        run_complete: run_complete_count(&output.stdout, &nonce),
         instrumented: instrumented(&output.stdout),
         run,
         parse_error,
         exit_code: output.exit_code,
+        status_ok,
         stdout: output.stdout,
         stderr: output.stderr,
     })
 }
 
-/// Case ids that printed their completion marker.
+/// A value the code under analysis cannot know.
 ///
-/// Tool-controlled evidence, not a count: a case that panicked, was filtered, or
-/// exited early never prints its marker, and a clean run that executed nothing
-/// must not read as a pass.
-pub fn completed_cases(stdout: &str) -> Vec<usize> {
+/// It is compiled before this runs, and the nonce never reaches it as an input
+/// — only as an argument the generated harness echoes. That is what makes a
+/// completion marker evidence rather than a string anything in the process
+/// could print.
+fn run_nonce() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(0);
+    let mixed = nanos
+        ^ (u64::from(std::process::id()) << 32)
+        ^ SEQUENCE.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
+    format!("{mixed:016x}")
+}
+
+/// Case ids in a staged corpus, in file order.
+///
+/// The corpus is the authority on what a whole-corpus run was asked to do.
+fn corpus_case_ids(corpus_path: &Path) -> Result<Vec<usize>, DynamicError> {
+    let text = std::fs::read_to_string(corpus_path)
+        .map_err(|e| DynamicError::Io(format!("{}: {e}", corpus_path.display())))?;
+    let mut ids = Vec::new();
+    for line in text.lines().filter(|line| !line.starts_with('#')) {
+        let Some(field) = line.split(' ').find(|field| !field.is_empty()) else {
+            continue;
+        };
+        let id = field.parse().map_err(|_| {
+            DynamicError::Io(format!(
+                "{}: {field:?} is not a case id",
+                corpus_path.display()
+            ))
+        })?;
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
+/// Case ids that printed their completion marker with this run's nonce.
+///
+/// Anchored at the start of a line *and* matched against the nonce. Accepting
+/// the marker anywhere in a line meant the function under analysis could emit
+/// one: it shares this process's stdout, so "a case completed" was not
+/// tool-controlled evidence at all.
+pub fn completed_cases(stdout: &str, nonce: &str) -> Vec<usize> {
+    let prefix = format!("{CASE_MARKER} {nonce} ");
     stdout
         .lines()
-        .filter_map(|line| {
-            line.find(CASE_MARKER)
-                .map(|at| &line[at + CASE_MARKER.len()..])
-        })
+        .filter_map(|line| line.strip_prefix(&prefix))
         .filter_map(|rest| rest.split_whitespace().next())
         .filter_map(|id| id.parse().ok())
         .collect()
+}
+
+/// The case count from the final run-completion marker, if it was printed.
+pub fn run_complete_count(stdout: &str, nonce: &str) -> Option<usize> {
+    let prefix = format!("{RUN_COMPLETE_MARKER} {nonce} ");
+    stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix(&prefix))
+        .filter_map(|rest| rest.trim().strip_prefix("cases="))
+        .filter_map(|count| count.trim().parse().ok())
+        .next_back()
 }
 
 /// Whether the harness reported running under Valgrind.
@@ -870,6 +1001,36 @@ mod tests {
         );
     }
 
+    /// Every marker the harness prints carries the run's nonce, so the runner
+    /// can tell its own evidence from anything else on stdout.
+    #[test]
+    fn generated_markers_carry_the_run_nonce() {
+        let harness = generate(&contract(
+            SUBSTITUTE_MODE,
+            "crypto::lookup",
+            "substitute_mode",
+        ))
+        .expect("generated");
+        assert!(
+            harness
+                .source
+                .contains(r#"println!("trace-check-case: {nonce} {id} produced={}""#),
+            "{}",
+            harness.source
+        );
+        assert!(
+            harness
+                .source
+                .contains(r#"println!("trace-check-run-complete: {nonce} cases={completed}")"#),
+            "{}",
+            harness.source
+        );
+        // The nonce arrives on the command line, not from the corpus.
+        assert!(harness
+            .source
+            .contains("let [_, corpus_path, selection, nonce] = argv.as_slice()"));
+    }
+
     /// A unit return is still called and still records completion.
     #[test]
     fn a_unit_return_is_handled() {
@@ -917,21 +1078,146 @@ mod tests {
         assert!(error.to_string().contains("&[u8]"), "{error}");
     }
 
-    /// Completed cases are read from the tool-controlled marker, not from a
-    /// count, and a line that merely mentions the marker text does not qualify.
+    /// Completed cases come from a line-anchored, nonce-matched marker.
     #[test]
     fn completed_cases_come_from_the_marker() {
         let stdout = "\
 trace-check-harness: run_mode=valgrind
-trace-check-case: 0 produced=3
-trace-check-case: 11 produced=7
-trace-check-run-complete: cases=2
+trace-check-case: abc123 0 produced=3
+trace-check-case: abc123 11 produced=7
+trace-check-run-complete: abc123 cases=2
 ";
-        assert_eq!(completed_cases(stdout), vec![0, 11]);
+        assert_eq!(completed_cases(stdout, "abc123"), vec![0, 11]);
+        assert_eq!(run_complete_count(stdout, "abc123"), Some(2));
         assert!(instrumented(stdout));
         assert!(!instrumented("trace-check-harness: run_mode=native"));
         assert!(!instrumented("nothing here"));
-        assert!(completed_cases("no markers at all").is_empty());
+        assert!(completed_cases("no markers at all", "abc123").is_empty());
+    }
+
+    /// Output the *function under analysis* printed is not completion evidence.
+    ///
+    /// The regression: the marker was matched anywhere in a line and carried no
+    /// nonce, so a case could print a plausible marker and terminate the
+    /// process, and the runner would credit it as finished. Both halves are
+    /// covered here — a wrong nonce, and a marker embedded mid-line.
+    #[test]
+    fn forged_completion_markers_are_rejected() {
+        let forged = "\
+trace-check-harness: run_mode=valgrind
+trace-check-case: deadbeef 0 produced=3
+the library printed this: trace-check-case: abc123 1 produced=9
+trace-check-run-complete: deadbeef cases=2
+";
+        // A marker stamped with a different nonce is not this run's.
+        assert!(
+            completed_cases(forged, "abc123").is_empty(),
+            "a mid-line marker with the right nonce must still be rejected"
+        );
+        assert_eq!(run_complete_count(forged, "abc123"), None);
+        // And the run's own nonce only matches its own line-anchored markers.
+        assert_eq!(completed_cases(forged, "deadbeef"), vec![0]);
+    }
+
+    /// A run is complete evidence only when the status, the final marker, its
+    /// count, and the exact ordered case identities all agree.
+    #[test]
+    fn completion_requires_all_four_conditions() {
+        let complete = |requested: Vec<usize>,
+                        completed: Vec<usize>,
+                        run_complete: Option<usize>,
+                        status_ok: bool| BatchRun {
+            requested,
+            completed,
+            run_complete,
+            instrumented: true,
+            run: None,
+            parse_error: None,
+            exit_code: Some(0),
+            status_ok,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+
+        let good = complete(vec![0, 1], vec![0, 1], Some(2), true);
+        assert!(good.all_completed());
+        assert!(good.incompleteness().is_none());
+
+        // The original check: counts match, identities do not.
+        let swapped = complete(vec![0, 1], vec![0, 5], Some(2), true);
+        assert!(!swapped.all_completed(), "counting is not identity");
+        assert!(swapped
+            .incompleteness()
+            .expect("explained")
+            .contains("not exactly the requested"));
+
+        // Out of order is also not the requested sequence.
+        assert!(!complete(vec![0, 1], vec![1, 0], Some(2), true).all_completed());
+
+        // The process died before printing its final marker.
+        let truncated = complete(vec![0, 1], vec![0, 1], None, true);
+        assert!(!truncated.all_completed());
+        assert!(truncated
+            .incompleteness()
+            .expect("explained")
+            .contains("did not finish"));
+
+        // The final marker disagrees with the request.
+        let miscounted = complete(vec![0, 1], vec![0, 1], Some(1), true);
+        assert!(!miscounted.all_completed());
+        assert!(miscounted
+            .incompleteness()
+            .expect("explained")
+            .contains("but 2 were requested"));
+
+        // A status no finished harness produces.
+        let failed = complete(vec![0, 1], vec![0, 1], Some(2), false);
+        assert!(!failed.all_completed());
+        assert!(failed
+            .incompleteness()
+            .expect("explained")
+            .contains("exited with"));
+    }
+
+    /// A whole-corpus run takes its requested ids from the corpus file, so a
+    /// harness that ran only part of it cannot report itself complete.
+    ///
+    /// The regression: `requested` was reconstructed from the harness's own
+    /// completion markers, which made `all_completed()` unconditionally true
+    /// for this path.
+    #[test]
+    fn whole_corpus_requests_come_from_the_corpus() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("corpus.tcc");
+        std::fs::write(
+            &path,
+            "# trace-check corpus v1 contract=c::f seed=1 cases=3\n\
+             0 boundaries s:0\n\
+             1 boundaries s:1\n\
+             2 random s:200\n",
+        )
+        .expect("written");
+        assert_eq!(corpus_case_ids(&path).expect("parsed"), vec![0, 1, 2]);
+
+        // Only two of the three cases reported completion: not complete.
+        let partial = BatchRun {
+            requested: corpus_case_ids(&path).expect("parsed"),
+            completed: vec![0, 1],
+            run_complete: Some(2),
+            instrumented: true,
+            run: None,
+            parse_error: None,
+            exit_code: Some(0),
+            status_ok: true,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        assert!(!partial.all_completed());
+
+        // A malformed corpus is an error rather than a silently empty request.
+        let bad = directory.path().join("bad.tcc");
+        std::fs::write(&bad, "not-an-id boundaries s:0\n").expect("written");
+        assert!(corpus_case_ids(&bad).is_err());
     }
 
     /// An empty batch is refused rather than reported as a clean run.

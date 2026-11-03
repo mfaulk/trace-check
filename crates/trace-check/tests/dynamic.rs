@@ -149,11 +149,11 @@ fn control_fired(run: &BatchRun, symbol: &str) -> bool {
 const CALIBRATION: &str = trace_check_test::calibration::PROBE_SYMBOL;
 const BINDING: &str = trace_check_test::calibration::BINDING_PROBE_SYMBOL;
 
-/// A small budget: enough to cover two `u8` parameters' boundaries without
-/// spending a minute under Valgrind.
+/// A small budget: enough to cover two `u8` parameters' boundary floor (43)
+/// without spending a minute under Valgrind.
 fn small() -> GenerateSettings {
     GenerateSettings {
-        cases: 30,
+        cases: 50,
         ..Default::default()
     }
 }
@@ -336,7 +336,7 @@ fn a_replayed_failure_reproduces() {
         return;
     }
     let settings = GenerateSettings {
-        cases: 30,
+        cases: 50,
         strategies: vec![Strategy::Boundaries],
         regressions: vec![vec![
             ("index".to_string(), Value::Scalar { bits: 8, value: 42 }),
@@ -408,4 +408,147 @@ fn an_unknown_case_id_fails_the_run() {
         "stderr: {}",
         run.stderr
     );
+}
+
+/// A case that forges a completion marker and exits early is not accepted as
+/// having completed.
+///
+/// The strongest form of the completion-evidence problem: the *library* prints
+/// plausible markers for cases it never ran and then terminates the process.
+/// Staged as a copy whose `substitute` body does the forging, so nothing about
+/// the harness, the generator or the runner is special-cased.
+#[test]
+fn a_forged_marker_and_an_early_exit_are_not_completion() {
+    if !valgrind_available() {
+        return;
+    }
+    let staged = tempfile::tempdir().expect("temp dir");
+    let copy = stage_library(staged.path());
+    let path = copy.join("src/lookup.rs");
+    let source = std::fs::read_to_string(&path).expect("lookup.rs");
+    let forged = source.replace(
+        "    let want = index & 15;",
+        "    {\n        \
+         for id in 0..60 {\n            \
+         println!(\"trace-check-case: forged {id} produced=0\");\n        }\n        \
+         println!(\"trace-check-run-complete: forged cases=60\");\n        \
+         std::process::exit(0);\n    }\n    let want = index & 15;",
+    );
+    assert_ne!(forged, source, "the injection site must still exist");
+    std::fs::write(&path, forged).expect("write lookup.rs");
+    // The forging code needs `std`, which the library has under `cfg(test)`
+    // only, so the copy drops its `no_std` attribute.
+    let lib_path = copy.join("src/lib.rs");
+    let lib = std::fs::read_to_string(&lib_path).expect("lib.rs");
+    std::fs::write(
+        &lib_path,
+        lib.replace("#![cfg_attr(not(test), no_std)]", ""),
+    )
+    .expect("write lib.rs");
+
+    let staged = check_staged(&copy, "crypto::lookup::substitute", small());
+    assert!(
+        !staged.run.all_completed(),
+        "a forged marker plus an early exit was accepted as a complete run"
+    );
+    let why = staged
+        .run
+        .incompleteness()
+        .expect("an incomplete run must explain itself");
+    assert!(
+        staged.run.completed.len() < staged.planned,
+        "{} of {} cases were credited as completed: {why}",
+        staged.run.completed.len(),
+        staged.planned
+    );
+    // The forged markers carry a nonce this run never issued, so none of them
+    // was counted at all.
+    assert!(
+        staged.run.completed.is_empty(),
+        "forged markers were credited: {:?}",
+        staged.run.completed
+    );
+}
+
+/// Copies the example library into `root`, rewriting its workspace-inherited
+/// manifest keys and relative path dependencies so the copy builds standalone.
+fn stage_library(root: &Path) -> PathBuf {
+    let copy = root.join("crypto-library");
+    std::fs::create_dir_all(copy.join("src")).expect("src dir");
+    let source_dir = workspace_root().join("examples/crypto-library/src");
+    for entry in std::fs::read_dir(&source_dir).expect("read src") {
+        let entry = entry.expect("dir entry");
+        std::fs::copy(entry.path(), copy.join("src").join(entry.file_name())).expect("copy source");
+    }
+
+    let absolute = |relative: &str| {
+        workspace_root()
+            .join(relative)
+            .display()
+            .to_string()
+            .replace('\\', "/")
+    };
+    let manifest = std::fs::read_to_string(library_manifest()).expect("manifest");
+    let staged = manifest
+        .replace("version.workspace = true", "version = \"0.1.0\"")
+        .replace("edition.workspace = true", "edition = \"2021\"")
+        .replace(
+            "license.workspace = true",
+            "license = \"MIT OR Apache-2.0\"",
+        )
+        .replace(
+            "path = \"../../crates/trace-check-macros\"",
+            &format!("path = {:?}", absolute("crates/trace-check-macros")),
+        )
+        .replace(
+            "path = \"../../crates/trace-check-test\"",
+            &format!("path = {:?}", absolute("crates/trace-check-test")),
+        );
+    std::fs::write(copy.join("Cargo.toml"), format!("{staged}\n[workspace]\n"))
+        .expect("write manifest");
+    copy
+}
+
+/// Builds and runs a generated check against a staged library copy, returning
+/// the batch evidence for its whole corpus.
+fn check_staged(copy: &Path, contract_id: &str, settings: GenerateSettings) -> StagedCheck {
+    let library =
+        Library::resolve(&copy.join("Cargo.toml"), &[]).expect("the staged library resolves");
+    let workspace = Workspace::ephemeral().expect("a private work directory");
+    let (work_dir, _) = workspace
+        .directories_for(contract_id)
+        .expect("per-contract directories");
+    let target_dir = shared_target_dir();
+
+    let contract = harness::probe_contract(&library, contract_id, &work_dir, &target_dir)
+        .unwrap_or_else(|e| panic!("reading {contract_id} from the staged copy failed: {e}"));
+    let generated = dynamic_harness::generate(&contract).expect("generated");
+    let corpus =
+        generate::generate(contract_id, &contract.descriptor, &settings).expect("corpus generated");
+    let corpus_path = dynamic_harness::stage_corpus(&corpus, &work_dir).expect("staged");
+    let artifact =
+        dynamic_harness::build(&library, &generated, contract_id, &work_dir, &target_dir)
+            .unwrap_or_else(|e| panic!("building the staged harness failed: {e}"));
+
+    let (valgrind, _version) = prepare_valgrind().expect("valgrind is available");
+    let run = dynamic_harness::run_batch(
+        &valgrind,
+        &artifact.path,
+        &corpus_path,
+        None,
+        native::Limits::default(),
+    )
+    .unwrap_or_else(|e| panic!("running the staged harness failed: {e}"));
+    StagedCheck {
+        planned: corpus.cases.len(),
+        run,
+        _workspace: workspace,
+    }
+}
+
+/// A staged run's evidence, with the workspace held open.
+struct StagedCheck {
+    planned: usize,
+    run: BatchRun,
+    _workspace: Workspace,
 }
