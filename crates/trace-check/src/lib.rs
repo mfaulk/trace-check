@@ -34,6 +34,7 @@ pub mod check_report;
 pub mod compare;
 pub mod contract;
 pub mod coverage;
+pub mod coverage_report;
 pub mod dynamic_harness;
 pub mod enforcement;
 pub mod experiment;
@@ -310,6 +311,17 @@ pub enum CheckRunError {
     Reproducer(ReproducerError),
     Coverage(coverage::CoverageError),
     Explore(explore::ExploreError),
+    Inventory(InventoryError),
+    /// A contract was asked for that the inventory does not declare.
+    NotDeclared {
+        requested: Vec<String>,
+        available: Vec<String>,
+        variant: String,
+    },
+    /// The inventory's descriptor and the probed one disagree.
+    DescriptorDrift {
+        contract: String,
+    },
     /// No contract was selected at all.
     NothingSelected {
         available: Vec<String>,
@@ -326,6 +338,32 @@ impl std::fmt::Display for CheckRunError {
             CheckRunError::Reproducer(error) => write!(f, "{error}"),
             CheckRunError::Coverage(error) => write!(f, "{error}"),
             CheckRunError::Explore(error) => write!(f, "{error}"),
+            CheckRunError::Inventory(error) => write!(f, "{error}"),
+            CheckRunError::NotDeclared {
+                requested,
+                available,
+                variant,
+            } => write!(
+                f,
+                "{} is not declared in {variant}. The compiler-derived inventory of this build \
+                 declares: {}",
+                requested
+                    .iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if available.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    available.join(", ")
+                }
+            ),
+            CheckRunError::DescriptorDrift { contract } => write!(
+                f,
+                "`{contract}`'s inventory record and its compiled descriptor disagree, so the \
+                 artifact the inventory describes is not the artifact about to be analyzed. \
+                 Rebuild and retry"
+            ),
             CheckRunError::NothingSelected { available } => write!(
                 f,
                 "no contracts selected; pass --contract <identity> or --all-configured. \
@@ -695,6 +733,428 @@ fn explore_contract(
         selection,
     };
     Ok((corpus, evidence))
+}
+
+use coverage_report::CoverageReport;
+use enforcement::{Analysis, AnalysisEvidence, Available, Coverage, Plan};
+use inventory::{ContractInventory, InventoryError};
+
+/// How `check` chose its contracts.
+///
+/// The two `--all-*` forms cover different things and are kept apart on
+/// purpose: `--all-configured` means every explicitly configured generated
+/// check, and `--all-contracts` means every declaration the compiler put in the
+/// inventory. Reinterpreting the first as the second would silently change what
+/// an existing CI job enforces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Selection {
+    /// Every declaration in the inventory.
+    AllContracts,
+    /// Every contract with a `[check."..."]` entry. M6's meaning, unchanged.
+    AllConfigured,
+    /// Exactly these.
+    Named(Vec<String>),
+}
+
+impl Selection {
+    pub fn describe(&self) -> &'static str {
+        match self {
+            Selection::AllContracts => "--all-contracts (every declaration in the inventory)",
+            Selection::AllConfigured => "--all-configured (every configured generated check)",
+            Selection::Named(_) => "--contract (named explicitly)",
+        }
+    }
+}
+
+impl From<InventoryError> for CheckRunError {
+    fn from(error: InventoryError) -> Self {
+        CheckRunError::Inventory(error)
+    }
+}
+
+/// Enforces every applicable contract and reports the coverage matrix.
+///
+/// # Order of operations
+///
+/// 1. Build the **inventory**, which decides what exists. Nothing else can be
+///    decided first: a selection, a policy and a backend probe are all about
+///    contracts, and the set of contracts is what the inventory establishes.
+/// 2. Resolve the **plan**, before any heavyweight backend runs, so an
+///    unsupported signature, a missing analyzer, an unconfigured symbolic
+///    requirement and an unselected contract are all reported up front.
+/// 3. Run the analyses the plan still leaves outstanding.
+/// 4. Fold the evidence in, where a detected leak overrides anything.
+///
+/// Valgrind is located lazily, after the inventory and the plan, for the same
+/// reason M5 and M6 settled on: a developer whose contract cannot be analyzed
+/// should be told about the contract, not about a missing analyzer.
+pub fn run_contract_coverage(
+    library: &Library,
+    config: &VerifyConfig,
+    workspace: &Workspace,
+    overrides: &CheckOverrides,
+    selection: &Selection,
+    reproducer_dir: Option<&Path>,
+    today: &str,
+) -> Result<CoverageReport, CheckRunError> {
+    let policy = &config.policy;
+    let inventory_dir = workspace.inventory_target_dir()?;
+    let found = inventory::build_and_read(library, &inventory_dir)?;
+
+    let selected: Vec<String> = match selection {
+        Selection::AllContracts => found.contracts.iter().map(|c| c.id.clone()).collect(),
+        Selection::AllConfigured => config
+            .checked_contracts()
+            .iter()
+            .map(|c| c.to_string())
+            .collect(),
+        Selection::Named(names) => names.clone(),
+    };
+
+    // A named selection may contain something the inventory does not have.
+    // Reported as its own failure rather than quietly dropped, because "that
+    // contract does not exist in this build" is exactly what a developer with
+    // a typo needs to hear.
+    let unknown: Vec<String> = selected
+        .iter()
+        .filter(|id| found.contract(id).is_none())
+        .cloned()
+        .collect();
+    if !unknown.is_empty() {
+        return Err(CheckRunError::NotDeclared {
+            requested: unknown,
+            available: found.ids().iter().map(|id| id.to_string()).collect(),
+            variant: found.build.variant(),
+        });
+    }
+
+    // Which backends this run can use. Probed once, before the plan, so the
+    // plan can settle a missing one rather than failing halfway through.
+    let valgrind = native::prepare_valgrind().ok();
+    // Exploration can be asked for two ways, and both have to be counted.
+    // An earlier revision looked only at the *policy*, so a contract whose
+    // `[check."...".explore] enabled = true` asked for coverage-guided
+    // discovery had its tools left unlocated and fell back to the baseline
+    // corpus -- silently, which turned a configured search into no search and
+    // reported NO_LEAK_OBSERVED on the two fixtures that need one.
+    let needs_explore = found.contracts.iter().any(|declaration| {
+        policy
+            .required_for(&declaration.id)
+            .contains(&Analysis::Explore)
+            || {
+                let mut settings = config.check_settings(&declaration.id);
+                apply_overrides(&mut settings, overrides);
+                settings.explore.enabled
+            }
+    });
+    let tools = if needs_explore {
+        // A hard error, as in `run_generated_checks`: a run asked to explore
+        // that cannot explore must fail rather than quietly analyze a
+        // different corpus.
+        Some(coverage::LlvmTools::locate()?)
+    } else {
+        None
+    };
+    let available = Available {
+        generated: valgrind.is_some(),
+        explore: valgrind.is_some() && tools.is_some(),
+        symbolic: false,
+        dynamic: valgrind.is_some(),
+    };
+
+    let plan = Plan::resolve(&found, config, policy, &selected, &available, today);
+    let mut coverage = Coverage::from_plan(&plan, &found);
+
+    // Stage two: run what the plan left outstanding. Only the generated family
+    // is executed here; `symbolic` evidence comes from
+    // `cargo trace-check verify` and `dynamic` from `cargo trace-check test`,
+    // and a requirement for either is reported as outstanding rather than
+    // silently satisfied.
+    for entry in &plan.entries {
+        let outstanding = entry.outstanding();
+        let wants_generated = outstanding
+            .iter()
+            .any(|analysis| matches!(analysis, Analysis::Generated | Analysis::Explore));
+        if !wants_generated {
+            continue;
+        }
+        let Some((valgrind_path, _)) = &valgrind else {
+            continue;
+        };
+        let declaration = found
+            .contract(&entry.id)
+            .expect("selected from the inventory");
+
+        let mut settings = config.check_settings(&entry.id);
+        apply_overrides(&mut settings, overrides);
+        if outstanding.contains(&Analysis::Explore) {
+            settings.explore.enabled = true;
+        }
+        settings
+            .validate(&entry.id)
+            .map_err(HarnessError::Contract)?;
+
+        let analysed = analyse_one(
+            library,
+            workspace,
+            declaration,
+            &settings,
+            valgrind_path,
+            tools.as_ref(),
+            reproducer_dir,
+        )?;
+        for analysis in outstanding {
+            if !matches!(analysis, Analysis::Generated | Analysis::Explore) {
+                continue;
+            }
+            // `explore` is only discharged by a run that actually explored.
+            if analysis == Analysis::Explore && !analysed.explored {
+                coverage.fold(
+                    &entry.id,
+                    AnalysisEvidence {
+                        analysis,
+                        outcome: security::Outcome::Inconclusive,
+                        artifact_sha256: analysed.artifact_sha256.clone(),
+                        detail: "coverage-guided exploration did not complete".to_string(),
+                    },
+                );
+                continue;
+            }
+            coverage.fold(
+                &entry.id,
+                AnalysisEvidence {
+                    analysis,
+                    outcome: analysed.outcome,
+                    artifact_sha256: analysed.artifact_sha256.clone(),
+                    detail: analysed.message.clone(),
+                },
+            );
+        }
+    }
+
+    let provenance = coverage_report::Provenance {
+        rustc_version: native::tool_version(Path::new("rustc"), &["--version"])
+            .unwrap_or_else(|_| "rustc (version unavailable)".to_string()),
+        cargo_version: native::tool_version(Path::new("cargo"), &["--version"])
+            .unwrap_or_else(|_| "cargo (version unavailable)".to_string()),
+        target: symbolic::SUPPORTED_TARGET.to_string(),
+        library_package: library.package.clone(),
+        library_version: library.version.clone(),
+        library_manifest: library.manifest_path.clone(),
+        features: found.build.features.clone(),
+    };
+    Ok(coverage_report::build(
+        provenance,
+        &found,
+        &coverage,
+        policy,
+        selected,
+        selection.describe(),
+    ))
+}
+
+/// Resolves the policy and reports the matrix **without running anything**.
+///
+/// The read-only half of `run_contract_coverage`, for `cargo trace-check
+/// coverage`. It answers "what is required, and what is outstanding?" — which
+/// is a different question from "enforce it now", and the one a developer
+/// adopting the tool asks first.
+///
+/// Every requirement comes back as `NOT_ANALYZED` unless the plan already
+/// settled it, so an exemption, an unsupported signature and a missing backend
+/// are all visible here at no analysis cost.
+pub fn report_contract_coverage(
+    library: &Library,
+    config: &VerifyConfig,
+    workspace: &Workspace,
+    selection: &Selection,
+    today: &str,
+) -> Result<CoverageReport, CheckRunError> {
+    let policy = &config.policy;
+    let found = read_contract_inventory(library, workspace)?;
+    let selected: Vec<String> = match selection {
+        Selection::AllContracts => found.contracts.iter().map(|c| c.id.clone()).collect(),
+        Selection::AllConfigured => config
+            .checked_contracts()
+            .iter()
+            .map(|c| c.to_string())
+            .collect(),
+        Selection::Named(names) => names.clone(),
+    };
+    // Backends are probed, because "the analyzer is missing" is part of the
+    // answer to "what is outstanding".
+    let valgrind = native::prepare_valgrind().is_ok();
+    let available = Available {
+        generated: valgrind,
+        explore: valgrind && coverage::LlvmTools::locate().is_ok(),
+        symbolic: false,
+        dynamic: valgrind,
+    };
+    let plan = Plan::resolve(&found, config, policy, &selected, &available, today);
+    let coverage = Coverage::from_plan(&plan, &found);
+    let provenance = coverage_report::Provenance {
+        rustc_version: native::tool_version(Path::new("rustc"), &["--version"])
+            .unwrap_or_else(|_| "rustc (version unavailable)".to_string()),
+        cargo_version: native::tool_version(Path::new("cargo"), &["--version"])
+            .unwrap_or_else(|_| "cargo (version unavailable)".to_string()),
+        target: symbolic::SUPPORTED_TARGET.to_string(),
+        library_package: library.package.clone(),
+        library_version: library.version.clone(),
+        library_manifest: library.manifest_path.clone(),
+        features: found.build.features.clone(),
+    };
+    Ok(coverage_report::build(
+        provenance,
+        &found,
+        &coverage,
+        policy,
+        selected,
+        selection.describe(),
+    ))
+}
+
+/// Builds the inventory alone, for `list --contracts`.
+pub fn read_contract_inventory(
+    library: &Library,
+    workspace: &Workspace,
+) -> Result<ContractInventory, CheckRunError> {
+    let target = workspace.inventory_target_dir()?;
+    Ok(inventory::build_and_read(library, &target)?)
+}
+
+/// What analysing one contract produced.
+struct Analysed {
+    outcome: security::Outcome,
+    message: String,
+    artifact_sha256: String,
+    /// Whether coverage-guided exploration ran and completed.
+    explored: bool,
+}
+
+fn apply_overrides(settings: &mut contract::CheckSettings, overrides: &CheckOverrides) {
+    if let Some(cases) = overrides.cases {
+        settings.cases = cases;
+    }
+    if let Some(seed) = overrides.seed {
+        settings.seed = seed;
+    }
+    if let Some(batch_size) = overrides.batch_size {
+        settings.batch_size = batch_size;
+    }
+    if let Some(shrink) = overrides.shrink {
+        settings.shrink = shrink;
+    }
+    if let Some(explore) = overrides.explore {
+        settings.explore.enabled = explore;
+    }
+    if let Some(candidates) = overrides.explore_cases {
+        settings.explore.candidate_budget = candidates;
+        if overrides.explore.is_none() {
+            settings.explore.enabled = true;
+        }
+    }
+    if let Some(cases) = overrides.security_cases {
+        settings.explore.security_case_budget = cases;
+    }
+}
+
+/// Runs the generated (and optionally coverage-guided) check for one contract.
+///
+/// Deliberately the same pipeline `run_generated_checks` uses, reached through
+/// the same functions: M8 changes which contracts are analyzed, not how.
+#[allow(clippy::too_many_arguments)]
+fn analyse_one(
+    library: &Library,
+    workspace: &Workspace,
+    declaration: &inventory::ContractDeclaration,
+    settings: &contract::CheckSettings,
+    valgrind: &Path,
+    tools: Option<&coverage::LlvmTools>,
+    reproducer_dir: Option<&Path>,
+) -> Result<Analysed, CheckRunError> {
+    let (work_dir, target_dir) = workspace.directories_for(&declaration.id)?;
+    let contract = harness::probe_contract(library, &declaration.id, &work_dir, &target_dir)?;
+    // The inventory record and the probed descriptor must agree. They come
+    // from the same macro expansion, so a difference means the artifact the
+    // inventory was read from is not the artifact about to be analyzed.
+    if contract.descriptor != declaration.descriptor {
+        return Err(CheckRunError::DescriptorDrift {
+            contract: declaration.id.clone(),
+        });
+    }
+    let generated = dynamic_harness::generate(&contract)?;
+    let baseline = generate::generate(
+        &declaration.id,
+        &contract.descriptor,
+        &settings.generation(),
+    )?;
+
+    let mut explored = false;
+    let corpus = if settings.explore.enabled {
+        // Unreachable by construction -- the caller locates the tools when any
+        // contract asks for exploration -- and an error rather than a silent
+        // fallback, because falling back analyzes a corpus nobody asked for.
+        let tools = tools.ok_or_else(|| {
+            CheckRunError::Explore(explore::ExploreError::Io(format!(
+                "`{}` is configured to explore but the LLVM coverage tools were not located",
+                declaration.id
+            )))
+        })?;
+        let (corpus, evidence) = explore_contract(
+            library,
+            &contract,
+            &baseline,
+            tools,
+            settings,
+            &work_dir,
+            &target_dir,
+        )?;
+        explored = evidence.complete();
+        corpus
+    } else {
+        baseline
+    };
+
+    let corpus_path = dynamic_harness::stage_corpus(&corpus, &work_dir)?;
+    let artifact =
+        dynamic_harness::build(library, &generated, &declaration.id, &work_dir, &target_dir)?;
+    let mut runner = CheckRunner::new(
+        valgrind,
+        &artifact.path,
+        corpus_path,
+        work_dir.clone(),
+        native::Limits::default(),
+    );
+    let outcome = check::check_contract(
+        &mut runner,
+        &contract,
+        &corpus,
+        &generated.secret_parameters,
+        generated.marked_bytes,
+        &settings.budget(),
+    )?;
+    if let Some(directory) = reproducer_dir {
+        for (index, finding) in outcome.findings.iter().enumerate() {
+            let record = Reproducer::from_finding(
+                &declaration.id,
+                &corpus,
+                finding,
+                library,
+                &artifact.sha256,
+                dynamic_harness::PROFILE,
+            );
+            record.save(&directory.join(format!(
+                "{}-{index}.json",
+                declaration.id.replace("::", "-")
+            )))?;
+        }
+    }
+    Ok(Analysed {
+        outcome: outcome.outcome,
+        message: outcome.message,
+        artifact_sha256: artifact.sha256,
+        explored,
+    })
 }
 
 /// Replays a persisted reproducer against a freshly built artifact.

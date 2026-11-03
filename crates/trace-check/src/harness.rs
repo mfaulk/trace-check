@@ -157,6 +157,17 @@ impl Workspace {
     pub fn directories_for(&self, contract: &str) -> Result<(PathBuf, PathBuf), HarnessError> {
         Ok((self.contract_dir(contract)?, self.target_dir()?))
     }
+
+    /// Target directory for M8's contract-inventory build.
+    ///
+    /// Separate from [`Workspace::target_dir`] on purpose: the inventory build
+    /// forces `lto = off`, because an LTO rlib holds bitcode and carries no
+    /// ELF sections to read records from. Sharing a target directory with the
+    /// analysis builds would mean each invalidating the other's cache on every
+    /// run.
+    pub fn inventory_target_dir(&self) -> Result<PathBuf, HarnessError> {
+        share(&self.root().join("inventory-target"))
+    }
 }
 
 /// Creates a directory shared by every contract in a run, tolerating one that
