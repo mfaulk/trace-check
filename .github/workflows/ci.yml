@@ -21,12 +21,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # rust-toolchain.toml pins the channel and the wasm32 target.
+      # rust-toolchain.toml pins the channel, the wasm32 target and the
+      # llvm-tools component M7's coverage feedback reads.
       - name: Install the pinned Rust toolchain
         run: |
           rustup show active-toolchain || rustup toolchain install
           rustc --version
           cargo --version
+
+      # The tools must come from *this* toolchain: a system LLVM of another
+      # version cannot read this compiler's profiles, and reading the wrong
+      # thing quietly is worse than not reading it.
+      - name: Verify the toolchain's LLVM tools
+        run: |
+          set -euo pipefail
+          bin="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin"
+          test -x "$bin/llvm-profdata" || { echo "llvm-profdata is missing"; exit 1; }
+          test -x "$bin/llvm-cov" || { echo "llvm-cov is missing"; exit 1; }
+          "$bin/llvm-cov" --version | grep -F "rust-$(rustc --version | cut -d' ' -f2)"
 
       # Ubuntu's valgrind package ships the client-request headers, which the
       # trace-check-secret shim needs at build time, as well as the binary.
@@ -207,6 +219,117 @@ jobs:
       - name: Generated testing beats the hand-written check
         run: python3 ci/benchmark-m6.py
 
+      # ------------------------------------------------------------------
+      # M7: coverage-guided leakage discovery.
+      # ------------------------------------------------------------------
+
+      # The milestone's acceptance claim, as the two halves that make it a
+      # claim: the same contract and budget, with exploration as the only
+      # difference. `--no-explore` is what keeps the comparison fair -- the
+      # library's own configuration is read in both runs.
+      #
+      # Without exploration the leak is real and unreached, so the honest
+      # result is NO_LEAK_OBSERVED and the analyzer-regression fixture's
+      # declared LEAK_DETECTED goes unmet: exit 2, not 0.
+      - name: The hidden path is out of reach without coverage feedback
+        working-directory: examples/crypto-library
+        run: |
+          set +e
+          cargo run --locked --release -p cargo-trace-check -- check \
+            --contract crypto::hidden::nested_modes --no-explore \
+            > "$GITHUB_WORKSPACE/m7-without.txt"
+          code=$?
+          set -e
+          cat "$GITHUB_WORKSPACE/m7-without.txt"
+          test "$code" = "2" || {
+            echo "without exploration this fixture must be unmet (exit 2), got $code"
+            exit 1; }
+          grep -q NO_LEAK_OBSERVED "$GITHUB_WORKSPACE/m7-without.txt"
+          # `grep -v -q` is not this check: it succeeds whenever *any* line
+          # fails to match, which is always. Negate the match instead.
+          if grep -q -- "-- exploration" "$GITHUB_WORKSPACE/m7-without.txt"; then
+            echo "a run without --explore reported an exploration section"
+            exit 1
+          fi
+
+      - name: Coverage feedback reaches it, and Memcheck confirms it
+        working-directory: examples/crypto-library
+        run: |
+          set -euo pipefail
+          cargo run --locked --release -p cargo-trace-check -- check \
+            --contract crypto::hidden::nested_modes --explore \
+            | tee "$GITHUB_WORKSPACE/m7-with.txt"
+          grep -q LEAK_DETECTED "$GITHUB_WORKSPACE/m7-with.txt"
+          # Attributed to the library's own secret-indexed load, and traceable
+          # back to the candidate that produced the input.
+          grep -q 'hidden.rs:63' "$GITHUB_WORKSPACE/m7-with.txt"
+          grep -q 'input from:' "$GITHUB_WORKSPACE/m7-with.txt"
+
+      # Every configured contract, with exploration where the configuration
+      # enables it. The validator checks the report's own claims rather than
+      # the exit code: that the two artifacts are distinct, that the discovery
+      # one marked nothing, that no candidate was silently unmeasurable, that
+      # every M6 case survived into the analyzed corpus, and that the clean
+      # control was reached as deeply as the vulnerable fixture and still found
+      # clean.
+      - name: Every configured contract is checked, with coverage-guided inputs
+        working-directory: examples/crypto-library
+        run: |
+          cargo run --locked --release -p cargo-trace-check -- check \
+            --all-configured --ci --format json \
+            > "$GITHUB_WORKSPACE/m7-explore.json"
+          python3 "$GITHUB_WORKSPACE/ci/verify-m7-explore.py" \
+            "$GITHUB_WORKSPACE/m7-explore.json"
+
+      # A run asked to explore that cannot explore must fail. Falling back to
+      # M6 generation would report a search it did not perform.
+      - name: Missing coverage tools fail the run rather than falling back
+        working-directory: examples/crypto-library
+        run: |
+          set +e
+          TRACE_CHECK_LLVM_TOOLS=/nonexistent/llvm \
+            cargo run --locked --release -p cargo-trace-check -- check \
+              --contract crypto::lookup::substitute --cases 64 --explore \
+              > /tmp/m7-no-tools.txt 2>&1
+          code=$?
+          set -e
+          cat /tmp/m7-no-tools.txt
+          test "$code" != "0" || { echo "a run that could not explore passed"; exit 1; }
+          grep -qE 'llvm-profdata|llvm-cov' /tmp/m7-no-tools.txt
+          if grep -q NO_LEAK_OBSERVED /tmp/m7-no-tools.txt; then
+            echo "a failed exploration produced a clean security claim"
+            exit 1
+          fi
+
+      # A misspelled contract must be diagnosed as a contract problem, not as a
+      # missing coverage tool. The same ordering M5 and M6 settled on, extended
+      # to a third backend and asserted with that backend unreachable.
+      - name: A bad contract is diagnosed before the coverage backend
+        working-directory: examples/crypto-library
+        run: |
+          set +e
+          TRACE_CHECK_LLVM_TOOLS=/nonexistent/llvm \
+            cargo run --locked --release -p cargo-trace-check -- check \
+              --contract crypto::hidden::no_such_function --explore \
+              > /tmp/m7-bad-contract.txt 2>&1
+          code=$?
+          set -e
+          cat /tmp/m7-bad-contract.txt
+          test "$code" != "0" || { echo "a missing contract passed"; exit 1; }
+          grep -q no_such_function /tmp/m7-bad-contract.txt
+          if grep -qE 'llvm-profdata|llvm-cov' /tmp/m7-bad-contract.txt; then
+            echo "a bad contract was reported as a missing coverage tool"
+            exit 1
+          fi
+
+      # The acceptance threshold from docs/MILESTONE-07.md section 12: at least
+      # two additional confirmed discoveries over M6's default generation, none
+      # lost, and no finding on a clean control. `--quick` uses the reduced
+      # fixture set; Valgrind dominates the wall clock and the full set is
+      # mostly more of the same measurement.
+      - name: Coverage-guided discovery beats M6 generation
+        run: python3 ci/benchmark-m7.py --quick --skip-cold
+
       - name: Reproduce the demonstration
         run: cargo run --locked --release -p trace-check -- demo mac-compare
 
@@ -227,6 +350,7 @@ jobs:
             mac-compare-screen.json
             native-memcheck.json
             m6-generated.json
+            m7-explore.json
 
   # M4: bounded relational verification. A separate job because its backend is
   # a container image rather than a package, and because it must not be able to

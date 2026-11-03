@@ -275,3 +275,53 @@ The short version: instead of running inputs someone chose, it asks a solver
 whether *any* secret assignment in a declared domain changes the executed path
 or an effective address, and reports `INCONCLUSIVE` whenever the search cannot
 be shown to have finished.
+
+## Choosing the inputs: coverage-guided discovery
+
+Generated testing (`check`) and coverage-guided discovery (`check --explore`)
+answer the same security question as the dynamic backends above. What differs
+is only *which inputs are tested*, so the methodology that matters is the
+separation between choosing an input and judging it.
+
+[docs/MILESTONE-06.md](MILESTONE-06.md) covers input generation from a declared
+contract. [docs/MILESTONE-07.md](MILESTONE-07.md) covers the coverage-guided
+stage and the measurements behind its design decisions.
+
+The procedure, in the order a run performs it:
+
+1. Generate M6's corpus — boundaries, pairwise, relationships, seeded random —
+   from the contract descriptor alone.
+2. Build a **discovery artifact** with `-C instrument-coverage`. It marks no
+   secret and does not depend on the marking crate, so it cannot produce
+   evidence about secret dependence. Because it calls the LLVM profiling
+   runtime directly, it does not link without instrumentation.
+3. Read the coverage map once, and refuse to continue if it holds no record for
+   the function under study or no region inside the library — reporting coverage
+   of *something* while the function under study is invisible would be the most
+   misleading available result.
+4. Execute every M6 case in that artifact, one profile per case, and record
+   which library regions each reached.
+5. Mutate retained inputs — an exhaustive single-byte sweep per seed first, then
+   random havoc — and keep those reaching regions nothing has reached. A
+   candidate whose profile cannot be validated contributes no coverage and is
+   reported, because an empty region set reads as "reached nothing new" and a
+   silent decode failure would make a search that did nothing look like a
+   search that found nothing.
+6. Select a bounded corpus: every M6 case, plus a greedy set cover over the
+   explored candidates. Everything dropped is counted, and the two reasons are
+   kept apart because only one of them costs coverage.
+7. Analyze that corpus in the **uninstrumented** artifact, under the same two
+   positive controls, with the same batching, isolation, shrinking and
+   classification as M6.
+
+Steps 2 to 6 produce no security evidence and cannot strengthen an outcome. The
+one direction they can move a result is weaker: a run that was asked to explore
+and did not finish reports `INCONCLUSIVE`, because the inputs its result
+describes are not the inputs it was configured to search for.
+
+The boundary to keep in mind is the same one the WASM screen has, one level
+over: the instrumented artifact is not the artifact a result describes.
+Instrumentation changes code generation, so a region reached during discovery
+may be reached by different instructions, or not at all, in the optimized build.
+A finding stands regardless of how its input was chosen; a clean result never
+claims the discovery artifact's paths were verified.

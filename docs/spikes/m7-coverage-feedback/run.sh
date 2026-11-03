@@ -25,7 +25,14 @@ mkdir -p "$work"
 build() {
     # The harness calls __llvm_profile_* directly, so this build does not link
     # without instrumentation. That is deliberate: see README.md.
+    #
+    # LLVM_PROFILE_FILE is set because `rustflags` reaches proc-macro crates
+    # too: `trace-check-macros` is itself built instrumented, and rustc *runs*
+    # it to expand the library's annotations, at which point the profiling
+    # runtime writes a profile to its default path. Without this, every build
+    # drops a quarter-megabyte `default_*.profraw` in this directory.
     ( cd "$here" && env -u CARGO_TARGET_DIR RUSTFLAGS="-C instrument-coverage" \
+        LLVM_PROFILE_FILE="$work/build-%p.profraw" \
         cargo build --release --target-dir "$target" -q )
 }
 bin="$target/release/tc-spike-coverage"
@@ -131,10 +138,10 @@ print('\n'.join(' '.join(str(random.randrange(256)) for _ in range(4)) for _ in 
     echo "  build cost:"
     rm -rf "$work/cold"
     /usr/bin/time -f "    cold instrumented build: %e s" bash -c \
-        "cd '$here' && env -u CARGO_TARGET_DIR RUSTFLAGS='-C instrument-coverage' cargo build --release --target-dir '$work/cold' -q" 2>&1 | tail -1
+        "cd '$here' && env -u CARGO_TARGET_DIR RUSTFLAGS='-C instrument-coverage' LLVM_PROFILE_FILE='$work/build-%p.profraw' cargo build --release --target-dir '$work/cold' -q" 2>&1 | tail -1
     touch "$here/src/main.rs"
     /usr/bin/time -f "    warm instrumented build: %e s" bash -c \
-        "cd '$here' && env -u CARGO_TARGET_DIR RUSTFLAGS='-C instrument-coverage' cargo build --release --target-dir '$work/cold' -q" 2>&1 | tail -1
+        "cd '$here' && env -u CARGO_TARGET_DIR RUSTFLAGS='-C instrument-coverage' LLVM_PROFILE_FILE='$work/build-%p.profraw' cargo build --release --target-dir '$work/cold' -q" 2>&1 | tail -1
     echo "    without instrumentation the harness does not link:"
     ( cd "$here" && env -u CARGO_TARGET_DIR cargo build --release --target-dir "$work/plain" 2>&1 |
         grep -i 'undefined symbol' | head -3 | sed 's/^/      /' ) || true

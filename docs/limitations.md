@@ -182,6 +182,8 @@ verification in M4; the rest remains out of scope for the project as a whole:
   cache-line behavior is still unmodeled*,
 * statistical timing measurement,
 * secret-taint analysis or automatic discovery of which inputs are secret,
+* exhaustive path coverage — *M7 searches for inputs that reach new code; it
+  does not enumerate paths and does not bound what it missed*,
 * instrumentation of arbitrary crates or full protocol integrations,
 * general-purpose constant-time certification.
 
@@ -200,6 +202,46 @@ is `&[u8; TAG_LEN]`: a proc macro sees the token, not its value, and a guessed
 width marked into the analysis would make a verified result meaningless. A
 library that needs `std` cannot be linked into the freestanding artifact at
 all.
+
+## Execution coverage is not verification coverage
+
+Milestone 7 added coverage-guided input discovery, which introduces a second
+compiled artifact and a second kind of number, and the distance between those
+numbers and a security claim is the thing most worth being precise about here.
+
+The discovery artifact is built with `-C instrument-coverage`. Its machine code
+differs from the artifact a security result describes: instrumentation changes
+code generation, and the two builds may inline, vectorize and lay out
+differently. So:
+
+* **A region reached during exploration may not be reached in the security
+  artifact at all**, or may be reached by different instructions.
+* **A clean result from the discovery artifact means nothing.** It marks no
+  secret and cannot observe secret dependence; it does not even depend on the
+  marking crate.
+* **A region count is not a fraction of anything verified.** "34 regions
+  reached" says 34 regions of an instrumented build executed. It does not bound
+  the secret values checked, the paths of the production binary, or the
+  completeness of the search.
+* A report therefore carries both artifacts' hashes, in separate sections, and
+  the CI decision restates no coverage number.
+
+The feedback available on a stable toolchain is **source regions**. Branch
+coverage, edge coverage and comparison tracing are nightly-only, and reports say
+so in those words: region coverage and edge coverage are not interchangeable,
+and using one word for the other would claim a finer search than was run.
+
+Region coverage also offers no gradient toward an exact wide comparison. The
+feasibility spike measured sixteen random 32-bit tokens producing byte-identical
+coverage against a `token == 0x5a17c0de` guard — two reachable states with
+nothing observable between them. A leak behind such a guard is **not** reachable
+by this search, and `crypto::hidden::magic_gate` records that as a declared
+expectation rather than leaving the gap implicit.
+
+What coverage guidance does change is which inputs get analyzed, and only that.
+Every security conclusion still comes from the uninstrumented Memcheck artifact
+under the same two positive controls, and a completed run is still
+`NO_LEAK_OBSERVED` over the inputs selected — better chosen, not exhaustive.
 
 ## Reading the fixture's expectations
 

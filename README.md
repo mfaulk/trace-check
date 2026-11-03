@@ -20,7 +20,7 @@ the formal noninterference property, and the roadmap.
 | M4 | Bounded relational verification (BINSEC symbolic execution) | complete, experimental |
 | M5 | Verifying the real functions in a Cargo library | complete, experimental |
 | M6 | Generated constant-time testing and CI enforcement | complete, experimental |
-| M7 | Coverage-guided leakage discovery | future |
+| M7 | Coverage-guided leakage discovery | complete, experimental |
 | M8 | Compiler and build-profile regression analysis | future |
 | M9 | Hardware-oriented validation — statistical timing | future |
 
@@ -64,6 +64,7 @@ the formal noninterference property, and the roadmap.
 ```sh
 cargo trace-check test                           # your own crate's checks (M3)
 cargo trace-check check --contract my_crate::verify_tag    # generated inputs (M6)
+cargo trace-check check --contract my_crate::verify_tag --explore  # coverage-guided (M7)
 cargo trace-check verify --contract my_crate::verify_tag   # your real function (M5)
 cargo trace-check verify                         # bundled standalone cases (M4)
 cargo run -p trace-check -- native               # native, under Memcheck
@@ -173,6 +174,14 @@ instruction path whose memory access pattern still varies), and
 `secret_dependent_call_target`. A `select` with a secret condition is reported
 as informational, not a leak: it is branchless, which is the point.
 
+**Execution coverage is not verification coverage.** `check --explore` measures
+which regions of a library an input reached, in an **instrumented** artifact
+built for that purpose. A region reached there may be reached by different
+machine code, or not reached at all, in the optimized artifact a security result
+describes. Coverage decides which inputs are worth analyzing and verifies
+nothing; a report that confused the two would be claiming the stronger of two
+very different things.
+
 See [docs/limitations.md](docs/limitations.md) for the full boundary, and
 [docs/methodology.md](docs/methodology.md) for the threat model and procedure.
 
@@ -271,8 +280,15 @@ Observed event counts for `early_exit_opaque`, by mismatch position:
 
 ## Prerequisites
 
-* **Rust** — pinned by [`rust-toolchain.toml`](rust-toolchain.toml) (1.97.0 plus
-  the `wasm32-unknown-unknown` target). `rustup` installs both automatically.
+* **Rust** — pinned by [`rust-toolchain.toml`](rust-toolchain.toml) (1.97.0,
+  the `wasm32-unknown-unknown` target, and the `llvm-tools` component).
+  `rustup` installs all three automatically.
+
+  `llvm-tools` supplies the `llvm-profdata` and `llvm-cov` that
+  `check --explore` reads. They must come from the active toolchain — a system
+  LLVM of another version cannot read this compiler's profiles — so they are
+  located from the sysroot and never from `PATH`.
+  `TRACE_CHECK_LLVM_TOOLS` overrides the directory.
 * **WABT 1.0.42** — the trace grammar and instruction offsets are specific to
   this release, so the version is checked at startup:
 
@@ -312,6 +328,7 @@ Observed event counts for `early_exit_opaque`, by mismatch position:
 cargo trace-check check --contract crypto::lookup::substitute_mode
 cargo trace-check check --all-configured --ci
 cargo trace-check check --contract my_crate::verify_tag --cases 128 --seed 12345
+cargo trace-check check --contract my_crate::verify_tag --explore   # M7
 cargo trace-check check --replay failure.json
 ```
 
@@ -413,9 +430,93 @@ skipped.
 Reports distinguish three things that are easy to conflate: *contract coverage*
 (which contracts were checked), *input-strategy coverage* (which planned input
 categories were generated, with per-strategy planned/emitted counts), and
-*execution coverage* (which code paths ran) — which is **not** measured and is
-named as absent. The fraction of generated inputs executed is not a fraction of
-secret values proven safe.
+*execution coverage* (which code paths ran) — which is not measured unless
+`--explore` is passed, and is named as absent either way. The fraction of
+generated inputs executed is not a fraction of secret values proven safe.
+
+#### `--explore` — coverage-guided input discovery (M7)
+
+```sh
+rustup component add llvm-tools     # once; must be the active toolchain's
+
+cargo trace-check check --contract crypto::hidden::nested_modes \
+    --explore --explore-cases 1500 --security-cases 128
+```
+
+Generated inputs are a fixed set of guesses, and a leak behind a *conjunction*
+of public conditions is not in it. `examples/crypto-library` has that
+demonstration too: `crypto::hidden::nested_modes` guards its secret-indexed load
+behind three public predicates, and because boundary generation moves one
+parameter away from base and pairwise moves two, **neither can construct a
+reaching input at any budget**. `crates/trace-check/tests/baseline.rs` proves
+that rather than asserting it.
+
+`--explore` builds a *second* artifact with `-Cinstrument-coverage`, runs
+candidate inputs in it, and keeps the ones that reach library regions nothing
+has reached before. Satisfying the first predicate reaches a new region, so that
+input becomes a seed, and the search for the second predicate starts from one
+that already satisfies the first — a conjunction gets climbed one conjunct at a
+time. The kept inputs are then analyzed by the **same Memcheck backend**, which
+cannot tell them from boundary cases.
+
+| Flag | Meaning |
+| --- | --- |
+| `--explore` | turn exploration on for every selected contract |
+| `--no-explore` | turn it off even where `trace-check.toml` enables it |
+| `--explore-cases N` | mutation candidates per contract; implies `--explore` |
+| `--security-cases N` | cap on *explored* cases added to the analyzed corpus |
+
+```toml
+[check."crypto::hidden::nested_modes".explore]
+enabled = true              # off by default; M6 configurations stay valid
+candidate_budget = 1500
+security_case_budget = 128
+feedback = "llvm-regions"   # the only implemented mechanism
+mutate_public = true        # public inputs get most of the budget...
+mutate_secret = true        # ...but secrets are not frozen: see below
+time_limit_seconds = 300
+```
+
+**Coverage guides testing and establishes nothing.** The two artifacts are kept
+apart by construction, not by convention. The discovery artifact marks no secret
+and does not even depend on the marking crate, so it *cannot* produce
+secret-dependence evidence — and because it calls the LLVM profiling runtime
+directly, it does not even link without instrumentation, which makes "coverage
+is active" a property of the binary existing. Reports carry both artifacts'
+hashes under separate sections, and the discovery section prints that it marked
+zero bytes.
+
+**Exploration can only ever weaken a result.** It is applied after the security
+decision: a satisfied result becomes incomplete when required exploration did
+not finish, because the inputs the result describes are not the inputs the run
+was configured to search for. A detected leak stays detected, because a finding
+does not depend on how its input was chosen. Missing LLVM tools, an unreadable
+profile and a wall-clock cutoff all fail the check rather than falling back to
+M6 generation — a silent fallback would report a search that did not happen.
+
+**M6's corpus is never replaced.** Every case M6 would have generated is kept
+and analyzed; exploration adds to it, and `--security-cases` caps what it adds
+rather than the total. A coverage heuristic that displaced boundary cases would
+quietly stop finding what boundary generation is good at —
+`crypto::hidden::threshold_window` is the fixture that would catch it.
+
+**Secrets are explored too.** Public inputs get most of the budget because they
+usually decide which code runs, but a branch on secret bits is itself a
+vulnerability class and a strategy that never varied the secret could not reach
+the region behind one. A seed changes which values are tried; it can never
+change which parameter is secret.
+
+**What it will not find.** The available feedback is LLVM *source regions* —
+branch coverage, edge coverage and comparison tracing all need a nightly
+toolchain, and the report says so in those words rather than implying a finer
+search. Region coverage offers no gradient toward an exact 32-bit equality: the
+feasibility spike measured sixteen random tokens producing byte-identical
+coverage. `crypto::hidden::magic_gate` records that gap as a declared
+`NO_LEAK_OBSERVED`, and CI fails if it ever changes in either direction.
+
+See [docs/MILESTONE-07.md](docs/MILESTONE-07.md) for the measurements, and
+[docs/spikes/m7-coverage-feedback/](docs/spikes/m7-coverage-feedback/README.md)
+for the reproducible feasibility experiments.
 
 ### `native` — secret-dependency analysis of native code
 
@@ -767,6 +868,8 @@ crates/trace-check/
                                  around a real Cargo library function
   src/library_report.rs          contract verification text and JSON reporting
   src/generate.rs                deterministic typed input generation (M6)
+  src/coverage.rs                per-case LLVM coverage from the discovery artifact (M7)
+  src/explore.rs                 coverage-guided mutation, seed queue and selection (M7)
   src/dynamic_harness.rs         generating a std harness around a real library
                                  function, and batched Memcheck execution
   src/check.rs                   batching, failure isolation and shrinking
@@ -793,12 +896,15 @@ examples/external-library/       the same workflow for a crate outside this
 examples/legacy-branch-demo/     original proof of concept, kept for context
 docs/                            milestone plan, methodology, limitations
 docs/spikes/m6-generated-harness/ the recorded M6.1 feasibility spike
+docs/spikes/m7-coverage-feedback/ the recorded M7.1 feasibility spike
 ci/verify-m3-consumer.py         asserts the M3 consumer report, not its exit code
 ci/verify-m4-symbolic.py         asserts the M4 symbolic report, not its exit code
 ci/verify-m5-library.py          asserts the M5 contract report, not its exit code
 ci/verify-m6-generated.py        asserts the M6 generated report, not its exit code
+ci/verify-m7-explore.py          asserts the M7 coverage-guided report, not its exit code
+ci/benchmark-m7.py               M6-versus-M7 discovery benchmark and acceptance threshold
 ci/benchmark-m6.py               generated vs hand-written effectiveness benchmark
-.github/workflows/ci.yml         pinned Linux CI (M1-M3/M6 job + M4/M5 analyzer job)
+.github/workflows/ci.yml         pinned Linux CI (M1-M3/M6/M7 job + M4/M5 analyzer job)
 ```
 
 ## Development

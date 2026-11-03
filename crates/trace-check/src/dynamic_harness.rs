@@ -110,6 +110,16 @@ pub const PROFILE: &str = "release: opt-level=3, debug=true, lto=off, codegen-un
 /// Environment override for the path to `trace-check-test`.
 pub const TEST_CRATE_ENV: &str = "TRACE_CHECK_TEST_PATH";
 
+/// The LLVM profiling runtime's default output path.
+///
+/// Set for every instrumented build and run, so a profile written by something
+/// other than the harness's explicit [`write_profile`] -- an instrumented proc
+/// macro during compilation, or an early exit before the filename is set --
+/// lands in the run's scratch directory rather than in the developer's crate.
+///
+/// [`write_profile`]: self
+pub const PROFILE_FILE_ENV: &str = "LLVM_PROFILE_FILE";
+
 /// Stand-in path the generated package's own directory is remapped to, so an
 /// artifact hash does not depend on which temporary directory built it.
 ///
@@ -834,7 +844,8 @@ pub fn build(
     // Run from inside the generated package: Cargo discovers
     // `.cargo/config.toml` relative to the working directory, not to
     // `--manifest-path`, so the remapping above is only honored this way.
-    let output = Command::new("cargo")
+    let mut build = Command::new("cargo");
+    build
         .args([
             "build",
             "--release",
@@ -843,7 +854,25 @@ pub fn build(
         .arg("--target-dir")
         .arg(target_dir)
         .current_dir(&crate_dir)
-        .stdin(Stdio::null())
+        .stdin(Stdio::null());
+    if !harness.kind.marks_secrets() {
+        // `rustflags` reaches proc-macro crates too, so `trace-check-macros`
+        // is itself built instrumented -- and rustc *runs* it to expand the
+        // library's annotations, at which point the profiling runtime writes a
+        // profile to its default path. Without this, every `--explore` run
+        // scattered a quarter-megabyte `default_*.profraw` per expansion into
+        // whichever directory the developer invoked Cargo from.
+        //
+        // Redirecting the default path into the generated package keeps those
+        // writes where the rest of the run's scratch state lives. `%p` is the
+        // profiling runtime's pid substitution, so concurrent expansions do
+        // not race for one file.
+        build.env(
+            PROFILE_FILE_ENV,
+            crate_dir.join("build-%p.profraw").display().to_string(),
+        );
+    }
+    let output = build
         .output()
         .map_err(|e| DynamicError::Io(format!("cannot run cargo: {e}")))?;
     if !output.status.success() {

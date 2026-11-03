@@ -34,6 +34,12 @@ const MAGIC_GATE: &str = r#"{"schema_version":1,"function":"magic_gate","paramet
     {"name":"token","position":1,"role":"public","repr":"u32","rust_type":"u32"}],
     "returns":{"repr":"u8","rust_type":"u8"}}"#;
 
+/// `crypto::hidden::header_gate(key: u8, header: &[u8; 8])`.
+const HEADER_GATE: &str = r#"{"schema_version":1,"function":"header_gate","parameters":[
+    {"name":"key","position":0,"role":"secret","repr":"u8","rust_type":"u8"},
+    {"name":"header","position":1,"role":"public","repr":"ref-byte-array","length":8,"rust_type":"&[u8; 8]"}],
+    "returns":{"repr":"u8","rust_type":"u8"}}"#;
+
 fn descriptor(json: &str) -> Descriptor {
     Descriptor::parse(json).expect("the fixture descriptor parses")
 }
@@ -61,6 +67,20 @@ fn reaches_nested_leak(case: &[(String, Value)]) -> bool {
 fn reaches_threshold_leak(case: &[(String, Value)]) -> bool {
     let level = scalar(case, "level") as u32;
     level >= 0x1000_0000 && level - 0x1000_0000 < 64
+}
+
+/// The predicate guarding `header_gate`'s secret-indexed load.
+fn reaches_header_leak(case: &[(String, Value)]) -> bool {
+    let bytes = match case
+        .iter()
+        .find(|(parameter, _)| parameter == "header")
+        .map(|(_, value)| value)
+        .expect("`header` is a parameter")
+    {
+        Value::Bytes { bytes } => bytes.clone(),
+        other => panic!("`header` is a byte array, got {other:?}"),
+    };
+    bytes[0] >> 4 == 0x3 && bytes[1] & 0xf0 == 0xc0 && bytes[7] == 0x7f
 }
 
 fn settings(cases: usize, strategies: Vec<Strategy>) -> GenerateSettings {
@@ -224,5 +244,90 @@ fn boundaries_do_reach_the_threshold_window() {
             .any(|case| reaches_threshold_leak(&case.inputs)),
         "boundary generation is supposed to reach the threshold window; the fixture or the \
          generator changed"
+    );
+}
+
+/// `header_gate`'s three conditions are fields of **one** byte-array parameter,
+/// and boundary generation sets such a parameter to whole patterns. No single
+/// pattern satisfies all three, and the pairwise stage varies two *parameters*
+/// rather than two fields, so neither stage can reach it at any budget.
+#[test]
+fn boundaries_and_pairwise_cannot_reach_the_header_leak_at_any_budget() {
+    for cases in [64, 256, 2_048, 8_192] {
+        let corpus = generate::generate(
+            "crypto::hidden::header_gate",
+            &descriptor(HEADER_GATE),
+            &settings(cases, vec![Strategy::Boundaries, Strategy::Pairwise]),
+        )
+        .expect("generation succeeds");
+        assert!(
+            !corpus
+                .cases
+                .iter()
+                .any(|case| reaches_header_leak(&case.inputs)),
+            "a boundaries+pairwise corpus of {cases} cases reached the header leak; the M7 \
+             benchmark premise no longer holds and has to be restated"
+        );
+    }
+}
+
+/// Not one boundary pattern of an eight-byte array even satisfies the *first*
+/// of `header_gate`'s three conditions, which is what makes the conjunction
+/// unreachable rather than merely improbable.
+#[test]
+fn no_byte_array_boundary_pattern_satisfies_the_header_version_field() {
+    let corpus = generate::generate(
+        "crypto::hidden::header_gate",
+        &descriptor(HEADER_GATE),
+        &settings(512, vec![Strategy::Boundaries]),
+    )
+    .expect("generation succeeds");
+    for case in &corpus.cases {
+        let bytes = match &case.inputs[1].1 {
+            Value::Bytes { bytes } => bytes,
+            other => panic!("`header` is a byte array, got {other:?}"),
+        };
+        assert_ne!(
+            bytes[0] >> 4,
+            0x3,
+            "the boundary pattern {bytes:02x?} satisfies the version field"
+        );
+    }
+}
+
+/// M6's default generation, and an all-random budget ten times its default, do
+/// not reach the header leak for any seed tried: the conjunction has
+/// probability about 2⁻¹⁶ per case.
+#[test]
+fn m6_generation_does_not_reach_the_header_leak() {
+    let seeds = [generate::DEFAULT_SEED, 1, 2, 3, 12_345, 0xdead_beef];
+    let mut reached = 0;
+    for seed in seeds {
+        for strategies in [Strategy::defaults(), vec![Strategy::Random]] {
+            let corpus = generate::generate(
+                "crypto::hidden::header_gate",
+                &descriptor(HEADER_GATE),
+                &GenerateSettings {
+                    cases: 640,
+                    seed,
+                    strategies,
+                    ..GenerateSettings::default()
+                },
+            )
+            .expect("generation succeeds");
+            if corpus
+                .cases
+                .iter()
+                .any(|case| reaches_header_leak(&case.inputs))
+            {
+                reached += 1;
+            }
+        }
+    }
+    assert_eq!(
+        reached,
+        0,
+        "{reached} of {} M6 configurations reached the header leak",
+        seeds.len() * 2
     );
 }

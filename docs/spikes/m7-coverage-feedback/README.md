@@ -80,6 +80,19 @@ surfaces as an error rather than as an empty region set, which is the
 distinction the milestone requires: an empty set would read as "this input
 reached nothing new" and the candidate would be discarded as uninteresting.
 
+### A third hazard: instrumented proc macros
+
+`rustflags` reaches proc-macro crates too, so `trace-check-macros` is itself
+built instrumented — and rustc *runs* it to expand the library's annotations, at
+which point the profiling runtime writes a profile to its default path. Every
+instrumented build therefore drops a quarter-megabyte `default_*.profraw` per
+expansion into whichever directory Cargo was invoked from.
+
+Both this script and the real implementation set `LLVM_PROFILE_FILE` for the
+build so those writes land in scratch space. The implementation sets it for the
+*run* as well, because a case rejected by the decoders exits before the harness
+sets a filename.
+
 ### Instrumentation cannot be silently absent
 
 The harness calls `__llvm_profile_reset_counters`, `__llvm_profile_set_filename`
