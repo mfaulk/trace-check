@@ -32,6 +32,7 @@ pub mod census;
 pub mod compare;
 pub mod contract;
 pub mod experiment;
+pub mod generate;
 pub mod harness;
 pub mod library_report;
 pub mod memcheck;
