@@ -340,6 +340,19 @@ pub struct ExploreSettings {
     pub mutate_public: bool,
     pub mutate_secret: bool,
     pub dry_rounds: usize,
+    /// Wall-clock safety limit, checked at **round boundaries**.
+    ///
+    /// Deliberately a soft, round-granular limit rather than a hard bound: its
+    /// job is to stop a search that is taking too long, not to bound wall clock
+    /// precisely. A round already in flight when the limit passes runs to
+    /// completion, so the real bound is roughly `time_limit` plus one round —
+    /// and because the budget is checked first, a run that spends its whole
+    /// candidate budget reports [`Termination::BudgetExhausted`] even if it
+    /// overran, since the search it was asked to perform did finish.
+    ///
+    /// That is only defensible if the overrun is visible, so
+    /// [`Exploration::overran_time_limit`] is reported either way. For a bound
+    /// on a *single* discovery subprocess, see [`crate::native::Limits`].
     pub time_limit: Duration,
 }
 
@@ -393,6 +406,16 @@ pub struct Exploration {
     pub mutation_mix: MutationMix,
     pub termination: Termination,
     pub elapsed_ms: u128,
+    /// The wall-clock safety limit this run was given.
+    pub time_limit_ms: u128,
+    /// Whether the run took longer than that limit.
+    ///
+    /// Reported independently of [`Exploration::termination`], because the two
+    /// answer different questions. A run that spent its whole budget did the
+    /// work it was asked to do and is complete; it may still have taken three
+    /// times as long as the limit allowed, and a reader comparing two runs has
+    /// to be able to see that without inferring it from the timings.
+    pub overran_time_limit: bool,
     /// Candidates whose coverage could not be used, with the reason.
     pub failures: Vec<CandidateFailure>,
     /// Every retained candidate, in discovery order. Includes the baseline.
@@ -522,7 +545,10 @@ pub fn explore(
         let run = collector.observe(&staged, &ids, &profile_dir, &map.id)?;
         state.rounds += 1;
         state.absorb_baseline(&entries, &run.observations);
-        if let Some(detail) = fatal(&run.observations) {
+        // Run-level evidence first. A process that did not finish makes the
+        // whole round untrustworthy, including the observations that look
+        // fine, so it stops the search rather than costing one candidate.
+        if let Some(detail) = run.run_level_failure().or_else(|| fatal(&run.observations)) {
             state.termination = Some(Termination::DiscoveryFailed { detail });
             break;
         }
@@ -561,7 +587,7 @@ pub fn explore(
         state.attempted += batch.len();
 
         let found = state.absorb(&batch, &run.observations);
-        if let Some(detail) = fatal(&run.observations) {
+        if let Some(detail) = run.run_level_failure().or_else(|| fatal(&run.observations)) {
             state.termination = Some(Termination::DiscoveryFailed { detail });
             break;
         }
@@ -600,6 +626,8 @@ pub fn explore(
         mutation_mix: state.mix,
         termination,
         elapsed_ms: started.elapsed().as_millis(),
+        time_limit_ms: settings.time_limit.as_millis(),
+        overran_time_limit: started.elapsed() > settings.time_limit,
         failures: state.failures,
         candidates: state.candidates,
     })
@@ -1303,12 +1331,18 @@ fn stage_entries(
     Ok(path)
 }
 
-/// Whether a round failed badly enough that continuing is pointless.
+/// Whether a round's *per-case* results failed badly enough that continuing is
+/// pointless.
 ///
-/// One unreadable profile is recorded and tolerated — it costs one candidate.
-/// A round in which *nothing* could be measured means the artifact or the tools
+/// One unreadable profile is recorded and tolerated — it costs one candidate,
+/// and [`Exploration::complete`] already refuses to call the run finished. A
+/// round in which *nothing* could be measured means the artifact or the tools
 /// have stopped working, and generating more candidates would be inventing
 /// inputs no one can evaluate.
+///
+/// Run-*level* evidence is [`crate::coverage::DiscoveryRun::run_level_failure`]
+/// and is checked first; this only covers the case where the process finished
+/// correctly and every profile it wrote was still unusable.
 fn fatal(observations: &[CoverageObservation]) -> Option<String> {
     if observations.is_empty() {
         return Some("a discovery round produced no observations at all".to_string());
@@ -1998,6 +2032,24 @@ mod tests {
         assert!(fatal(&[]).is_some());
     }
 
+    /// An overrun is reported independently of the termination reason, so a
+    /// run that spent its whole budget slowly is visible as such rather than
+    /// being either hidden or miscalled incomplete.
+    #[test]
+    fn an_overrun_is_reported_separately_from_the_termination() {
+        let mut exploration = exploration_of(vec![candidate(0, true, &[1])]);
+        exploration.elapsed_ms = 9_000;
+        exploration.time_limit_ms = 1_000;
+        exploration.overran_time_limit = true;
+        // The budget was spent, so the search finished the work it was asked
+        // to do: that is a complete exploration, and the overrun is a separate
+        // fact about how long it took.
+        assert_eq!(exploration.termination, Termination::BudgetExhausted);
+        assert!(exploration.complete());
+        assert!(exploration.overran_time_limit);
+        assert!(exploration.elapsed_ms > exploration.time_limit_ms);
+    }
+
     /// A time limit or a failing discovery artifact is not a complete
     /// exploration, so a CI job that required one is not satisfied.
     #[test]
@@ -2079,6 +2131,8 @@ mod tests {
             mutation_mix: MutationMix::default(),
             termination: Termination::BudgetExhausted,
             elapsed_ms: 0,
+            time_limit_ms: 1,
+            overran_time_limit: false,
             failures: Vec::new(),
             candidates,
         }

@@ -177,7 +177,75 @@ def discovery(report):
     return None
 
 
-def measure(name, flags, strategies, multiplier, selected, warm):
+# Terminations that mean the search finished the work it was asked to do.
+FINISHED = {"budget-exhausted", "converged", "queue-empty"}
+
+
+def invalid(contract, report):
+    """Why a measurement cannot support a conclusion, or None.
+
+    A measurement is only evidence if the analysis behind it completed. This is
+    checked on *every* run, warm included -- an earlier revision recorded these
+    diagnostics only on the cold run while the acceptance comparison used the
+    warm one, so discovery failures were collected and then ignored by the
+    decision they existed to inform.
+
+    Note what is deliberately *not* checked: the process exit code and the
+    policy outcome. The vulnerable fixtures are held to the property here
+    rather than declared as analyzer regressions, so finding their planted
+    leaks is exactly what makes them exit 1. Requiring exit 0 would reject the
+    successful measurements.
+    """
+    problems = []
+    for entry in report.get("contracts", []):
+        name = entry.get("contract", contract)
+        check = entry.get("check", {})
+
+        # The security analysis has to have run to completion under both
+        # controls, or its outcome says nothing either way.
+        if check.get("calibration") != "confirmed":
+            problems.append(f"{name}: calibration {check.get('calibration')}")
+        if check.get("binding") != "confirmed":
+            problems.append(f"{name}: secret binding {check.get('binding')}")
+        planned = check.get("cases_planned")
+        completed = check.get("cases_completed")
+        if not planned or completed != planned:
+            problems.append(f"{name}: {completed} of {planned} case(s) completed")
+        if check.get("outcome") not in {"LEAK_DETECTED", "NO_LEAK_OBSERVED"}:
+            problems.append(
+                f"{name}: outcome {check.get('outcome')} -- {check.get('message', '')[:100]}"
+            )
+        # An INCONCLUSIVE entry is caught above; a policy of `incomplete` can
+        # also arise from an unmet expectation, which is a configuration
+        # problem rather than a measurement problem, so it is named but the
+        # outcome check is what decides.
+        if entry.get("policy") == "incomplete":
+            problems.append(f"{name}: policy incomplete -- {entry.get('policy_detail', '')[:100]}")
+
+        evidence = entry.get("discovery")
+        if evidence is None:
+            continue
+        if evidence.get("failures"):
+            problems.append(
+                f"{name}: {len(evidence['failures'])} candidate(s) produced no usable "
+                f"coverage: {evidence['failures'][:2]}"
+            )
+        if evidence.get("termination") not in FINISHED:
+            problems.append(
+                f"{name}: exploration stopped as {evidence.get('termination')} -- "
+                f"{evidence.get('termination_detail', '')[:100]}"
+            )
+        # A run that overran its wall-clock limit still did the work, but it
+        # makes a *timing* comparison unfair, and timing is half the metric.
+        if evidence.get("overran_time_limit"):
+            problems.append(
+                f"{name}: exploration overran its wall-clock limit "
+                f"({evidence.get('elapsed_ms')} ms against {evidence.get('time_limit_ms')} ms)"
+            )
+    return "; ".join(problems) if problems else None
+
+
+def measure(name, flags, strategies, multiplier, selected):
     config = temp_config(selected, strategies, multiplier)
     total_seconds = 0.0
     found = set()
@@ -195,6 +263,9 @@ def measure(name, flags, strategies, multiplier, selected, warm):
                 f"{contract}: no JSON report ({completed.stderr.strip()[:160]})"
             )
             continue
+        reason = invalid(contract, report)
+        if reason is not None:
+            incomplete.append(reason)
         found_here = sites(report)
         found |= found_here
         if found_here:
@@ -208,8 +279,6 @@ def measure(name, flags, strategies, multiplier, selected, warm):
         evidence = discovery(report)
         if evidence:
             explored_ms += evidence.get("elapsed_ms", 0)
-            if not warm and evidence.get("failures"):
-                incomplete.append(f"{contract}: {len(evidence['failures'])} unmeasured candidate(s)")
     leaky_total = sum(1 for entry in selected if entry[2])
     return {
         "name": name,
@@ -258,7 +327,7 @@ def main():
 
     if not arguments.skip_cold:
         print("Cold run (M7, including both artifact builds per contract):")
-        cold = measure("m7-explore-cold", ["--explore"], None, 1, selected, warm=False)
+        cold = measure("m7-explore-cold", ["--explore"], None, 1, selected)
         print(f"  {cold['seconds']:.1f} s end to end, "
               f"{cold['explore_seconds']:.1f} s of it exploring")
         print()
@@ -268,14 +337,14 @@ def main():
     # every configuration below needs -- warming each of them separately was
     # doubling the benchmark's runtime for nothing.
     print("Warming (building both artifacts for each fixture)...", flush=True)
-    measure("warm", ["--explore"], None, 1, selected, warm=True)
+    measure("warm", ["--explore"], None, 1, selected)
 
     print()
     print("Warm runs:", flush=True)
     results = []
     for name, flags, strategies in CONFIGURATIONS:
         multiplier = 10 if name == "m6-random-10x" else 1
-        result = measure(name, flags, strategies, multiplier, selected, warm=True)
+        result = measure(name, flags, strategies, multiplier, selected)
         results.append(result)
         efficiency = result["sites"] / result["seconds"] if result["seconds"] else 0.0
         print(f"  {name:16s} {result['seconds']:7.1f} s  "
@@ -308,8 +377,11 @@ def main():
     )
     print(f"  threshold (>= 2 additional, none lost, no false positives, "
           f"nothing unmeasured): {'MET' if met else 'NOT MET'}")
+    for result in results:
+        for note in result["incomplete"]:
+            print(f"  INVALID [{result['name']}] {note}")
     if explored["incomplete"] or baseline["incomplete"]:
-        print("  a fixture was not measured, so the comparison is void, not merely weaker")
+        print("  a measurement did not complete, so the comparison is void, not merely weaker")
     print()
     print("Coverage is not a metric here. What is reported above is confirmed leakage")
     print("sites from the uninstrumented Memcheck artifact; the region counts in each")

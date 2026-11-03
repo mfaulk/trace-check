@@ -635,6 +635,7 @@ fn explore_contract(
         &artifact.path,
         &artifact.sha256,
         Path::new(&library.manifest_path),
+        &contract.module,
         &contract.function,
         native::Limits::default(),
     );
@@ -681,6 +682,8 @@ fn explore_contract(
             .incompleteness()
             .unwrap_or_else(|| exploration.termination.describe()),
         elapsed_ms: exploration.elapsed_ms,
+        time_limit_ms: exploration.time_limit_ms,
+        overran_time_limit: exploration.overran_time_limit,
         failures: exploration
             .failures
             .iter()

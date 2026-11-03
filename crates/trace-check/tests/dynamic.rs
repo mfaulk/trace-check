@@ -761,16 +761,35 @@ fn a_forged_marker_and_an_early_exit_are_not_completion() {
     );
 }
 
+/// Copies a directory tree.
+///
+/// Recursive, because the library's `src` is not flat: a module declared as a
+/// directory (`src/shadow/`) made a flat `read_dir` + `copy` fail with "the
+/// source path is neither a regular file nor a symlink to a regular file",
+/// which is an unhelpful way to learn that a test helper constrained the
+/// library's layout.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap_or_else(|e| panic!("{}: {e}", to.display()));
+    for entry in std::fs::read_dir(from).unwrap_or_else(|e| panic!("{}: {e}", from.display())) {
+        let entry = entry.expect("dir entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target)
+                .unwrap_or_else(|e| panic!("{}: {e}", entry.path().display()));
+        }
+    }
+}
+
 /// Copies the example library into `root`, rewriting its workspace-inherited
 /// manifest keys and relative path dependencies so the copy builds standalone.
 fn stage_library(root: &Path) -> PathBuf {
     let copy = root.join("crypto-library");
-    std::fs::create_dir_all(copy.join("src")).expect("src dir");
-    let source_dir = workspace_root().join("examples/crypto-library/src");
-    for entry in std::fs::read_dir(&source_dir).expect("read src") {
-        let entry = entry.expect("dir entry");
-        std::fs::copy(entry.path(), copy.join("src").join(entry.file_name())).expect("copy source");
-    }
+    copy_tree(
+        &workspace_root().join("examples/crypto-library/src"),
+        &copy.join("src"),
+    );
 
     let absolute = |relative: &str| {
         workspace_root()

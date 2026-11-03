@@ -31,6 +31,7 @@ pub mod controls;
 pub mod hidden;
 pub mod lookup;
 pub mod reduce;
+pub mod shadow;
 pub mod tag;
 
 #[cfg(test)]
@@ -39,7 +40,7 @@ mod tests {
 
     // `#[ct_test(target = "tag::verify_tag")]` resolves the contract's paths
     // relative to this module, so the modules have to be in scope here.
-    use crate::{controls, hidden, lookup, reduce, tag};
+    use crate::{controls, hidden, lookup, reduce, shadow, tag};
 
     /// A tag built at run time. A compile-time constant would let the
     /// optimizer pass an immediate and never read the marked storage, which is
@@ -231,6 +232,21 @@ mod tests {
     fn nested_modes_clean_is_constant_time() {
         let produced = hidden::nested_modes_clean_ct(secret_index(), 0x0a, 0x30, 0x5a);
         assert_eq!(produced, lookup::substitute(secret_index() ^ 0x0f));
+    }
+
+    /// The safe half of the same-name attribution control.
+    #[ct_test(target = "shadow::left::probe")]
+    fn shadow_left_probe_is_constant_time() {
+        let produced = shadow::left::probe_ct(secret_index());
+        assert_eq!(produced, lookup::substitute(secret_index()));
+    }
+
+    /// The vulnerable half, which must be detected while the one above stays
+    /// clean. Two functions named `probe`, two different verdicts.
+    #[ct_test(target = "shadow::right::probe")]
+    fn shadow_right_probe_leaks() {
+        let produced = shadow::right::probe_ct(secret_index());
+        assert_eq!(produced, lookup::substitute_indexed(secret_index()));
     }
 
     /// `assert_constant_time!` still works without a contract, for a secret

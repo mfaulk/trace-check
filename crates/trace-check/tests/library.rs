@@ -651,6 +651,27 @@ fn each_contract_has_its_own_artifact() {
     assert_eq!(hashes.len(), distinct, "two contracts share one artifact");
 }
 
+/// Copies a directory tree.
+///
+/// Recursive, because the library's `src` is not flat: a module declared as a
+/// directory (`src/shadow/`) made a flat `read_dir` + `copy` fail with "the
+/// source path is neither a regular file nor a symlink to a regular file",
+/// which is an unhelpful way to learn that a test helper constrained the
+/// library's layout.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap_or_else(|e| panic!("{}: {e}", to.display()));
+    for entry in std::fs::read_dir(from).unwrap_or_else(|e| panic!("{}: {e}", from.display())) {
+        let entry = entry.expect("dir entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target)
+                .unwrap_or_else(|e| panic!("{}: {e}", entry.path().display()));
+        }
+    }
+}
+
 /// Copies the library into `root`, with a self-contained manifest.
 ///
 /// The bundled manifest inherits `version`, `edition` and `license` from the
@@ -658,11 +679,7 @@ fn each_contract_has_its_own_artifact() {
 /// copy pins them and declares itself a workspace root.
 fn stage_library(root: &Path) -> PathBuf {
     let copy = root.join("crypto-library");
-    std::fs::create_dir_all(copy.join("src")).expect("src dir");
-    for entry in std::fs::read_dir(library_dir().join("src")).expect("read src") {
-        let entry = entry.expect("dir entry");
-        std::fs::copy(entry.path(), copy.join("src").join(entry.file_name())).expect("copy source");
-    }
+    copy_tree(&library_dir().join("src"), &copy.join("src"));
     std::fs::copy(library_dir().join(CONFIG_FILE), copy.join(CONFIG_FILE)).expect("copy config");
 
     let manifest = std::fs::read_to_string(manifest()).expect("manifest");

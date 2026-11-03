@@ -55,6 +55,23 @@ runtime check something could bypass.
 its own `ExecutionStatus`, is reported, retains its triggering input for
 diagnosis, and contributes no coverage.
 
+**Run-level and per-case evidence are separate, and both are consulted.** One
+unreadable profile costs one candidate, is recorded, and leaves the round's
+other observations good. A process that did not *finish* makes the whole round
+untrustworthy — including the observations that look fine, because nothing rules
+out the process having died partway and the surviving profiles describing a
+different set of cases than the markers suggest. So a round is refused when the
+baseline profile is missing, the run-completion marker is absent, the completed
+count or the completed *set* disagrees with the batch, or the process exited
+abnormally.
+
+That split had to be corrected: an earlier revision computed all of it in
+`DiscoveryRun::complete()` and then never called it, so a discovery process that
+marked every case and died before its final marker was accepted as a finished
+search. Per-case markers do not rule out a death immediately after the last one
+— which is the entire reason M6 has a separate run-completion marker — and the
+discovery side now applies the same discipline.
+
 **A clean discovery run means nothing.** The discovery artifact marks zero bytes
 and the report prints that number, so a reader meets the coverage figures already
 knowing what produced them.
@@ -141,7 +158,7 @@ Approach 1 is retained as the correctness baseline the per-case attribution is
 tested against ([`Collector::decode`]), because it has no shared-process state to
 get wrong.
 
-Two hazards the persistent approach has:
+Three hazards this approach has, all three found by running it:
 
 * **The at-exit write.** The profiling runtime writes the profile once more at
   process exit, to whatever filename is current — appending a second, stale
@@ -153,6 +170,26 @@ Two hazards the persistent approach has:
   check costs no subprocess and catches the doubling exactly.
 * **Stale profiles.** A profile left behind by an earlier round would be read as
   this round's coverage, so the per-case paths are removed before each run.
+* **A replaced executable.** `llvm-cov export` needs *the exact executable that
+  produced a profile*, and Cargo's target directory is shared so the library and
+  its dependencies are not rebuilt per contract — which makes the executable
+  path shared mutable state. Two runs of one contract produce the same package
+  name and the same output path, and a later `cargo build` relinks over it while
+  an earlier run is still using it. Cargo's lock serializes the builds; it does
+  not keep the previous build's output alive.
+
+  This surfaced as a CI failure on this very branch:
+  `failed to load coverage: …/tc-explore-crypto-hidden-nested_modes: No such
+  file or directory`. The fail-closed decode reported it as unusable evidence
+  rather than as zero coverage, so it failed a test instead of quietly shrinking
+  a search — which is the behaviour that rule exists for.
+
+  The fix is to **copy the executable out** of the target directory into the
+  run's own work directory, verify the copy byte-for-byte, and use the copy for
+  everything downstream. Dependency-build caching is kept; the analyzed artifact
+  becomes something nothing else can replace. It applies to the security
+  artifact too, where the same race would have meant Valgrind re-running a
+  different binary during isolation or shrinking.
 
 ### Comparison guidance: deferred, with the measurement
 
@@ -496,10 +533,20 @@ Measured on this development machine (128 cores, rustc 1.97.0, LLVM 22.1.6),
 
 | Configuration | Wall clock | Sites | Fixtures found | Detection efficiency |
 |---|---|---|---|---|
-| `m6-boundaries` | 45.0 s | 1 | 1/4 | 0.022 site/s |
-| `m6-default` | 44.9 s | 1 | 1/4 | 0.022 site/s |
-| `m6-random-10x` | 121.3 s | 1 | 1/4 | 0.008 site/s |
-| **`m7-explore`** | **86.2 s** | **3** | **3/4** | **0.035 site/s** |
+| `m6-boundaries` | 40.7 s | 1 | 1/4 | 0.025 site/s |
+| `m6-default` | 40.3 s | 1 | 1/4 | 0.025 site/s |
+| `m6-random-10x` | 117.2 s | 1 | 1/4 | 0.009 site/s |
+| **`m7-explore`** | **78.6 s** | **3** | **3/4** | **0.038 site/s** |
+
+Timings vary by roughly 10 % between runs on this machine; the ordering and the
+fixture counts do not. Every measurement above is validated before it is used:
+the benchmark refuses to report a threshold as met if any run's security
+analysis did not complete under both controls, if any candidate's coverage was
+unusable, if exploration did not finish, or if it overran its wall-clock limit.
+Those checks run identically on warm and cold measurements — an earlier revision
+collected them only on the cold run while the acceptance comparison used the
+warm one, so they were gathered and then ignored by the decision they existed to
+inform.
 
 M7 wins on both metrics at once, which is the result worth having: a higher
 proportion of planted vulnerabilities found *and* a higher detection efficiency,
@@ -546,6 +593,15 @@ a vulnerability class M6 cannot reach at any budget.
 * **Region coverage, not edges or comparisons.** Branch coverage and comparison
   tracing need a nightly toolchain. An exact 32-bit equality is unreachable by
   this search, measured and recorded in §3.
+* **The limit on exploration time is round-granular.** `time_limit_seconds` is a
+  soft safety limit checked between rounds, so a round already in flight when it
+  passes runs to completion and the real bound is roughly the limit plus one
+  round. The candidate budget is checked first, so a run that spends its whole
+  budget reports `budget-exhausted` even if it overran — the search it was asked
+  to perform did finish. That is only defensible because the overrun is
+  reported: `overran_time_limit` appears in the JSON and as an `OVERRAN:` line
+  in the text, independently of the termination reason. A bound on a *single*
+  discovery subprocess is a different setting (`native::Limits`).
 * **Region identities are per-artifact.** Stable across re-runs of one build,
   and deliberately not assumed stable across compiler versions or source edits.
   The coverage-map identity is recorded so a changed map is visible rather than
@@ -579,10 +635,10 @@ a vulnerability class M6 cannot reach at any budget.
 | File | Covers |
 |---|---|
 | `crates/trace-check/tests/baseline.rs` | the benchmark premise: what M6's generator can and cannot reach, as pure generator tests |
-| `crates/trace-check/tests/coverage.rs` | per-case attribution, the coverage gradient, harness and dependency exclusion, rejection of damaged evidence, the at-exit drain |
+| `crates/trace-check/tests/coverage.rs` | per-case attribution, the coverage gradient, harness and dependency exclusion, rejection of damaged evidence, the at-exit drain, concurrent explorations of one contract, a private immutable artifact, module-qualified attribution |
 | `crates/trace-check/tests/explore.rs` | reaching both hidden paths, reproducibility, baseline preservation, the magic-value gap, time-limit reporting, reported granularity |
 | `crates/cargo-trace-check/tests/explore.rs` | the CLI: the M6-versus-M7 comparison, the three report sections, CI failure on a security-contract leak, backend-ordering, refused settings, an out-of-workspace library, replay |
-| unit tests in `coverage.rs` | novelty as set difference, region identity, export-schema validation, target matching under both manglings, scope |
+| unit tests in `coverage.rs` | novelty as set difference, region identity, export-schema validation, target matching under both manglings and across modules, scope, run-level completion (missing marker, wrong case set, abnormal exit, signal death) |
 | unit tests in `explore.rs` | role-preserving mutations, representation preservation, determinism, the mutation mix, selection and set cover |
 | `ci/verify-m7-explore.py` | the report's own claims, rather than the exit code |
 | `ci/benchmark-m7.py` | the acceptance threshold |
@@ -618,6 +674,27 @@ or if the security result carries a coverage number.
 drives `examples/external-library` — its own lockfile, not a workspace member,
 contracts declared `dynamic = false` — through the real binary.
 
+### Attribution is qualified by module
+
+A coverage record is matched against the contract's **whole module path plus
+function**, as a sequence of length-prefixed mangled components:
+`crypto::hidden::nested_modes` becomes `6crypto6hidden12nested_modes`, which
+appears verbatim in both Rust manglings.
+
+Two narrower tests were tried and are both wrong. A bare substring of the
+function name matches `substitute_indexed` for the contract `substitute`. The
+length-prefixed function component alone fixes that but still ignores module
+identity, so `crypto::authentication::verify` and `crypto::encoding::verify`
+are indistinguishable — both records count as the target, and coverage from the
+wrong function can be attributed to the contract.
+
+`crypto::shadow::left::probe` and `crypto::shadow::right::probe` are the
+control: same name, same mangled component, one a full-table scan and the other
+a secret-indexed load. `target_attribution_is_scoped_to_the_contracts_module`
+builds one artifact for `left`, and checks that each collector sees exactly one
+target record and that only the function actually called reports
+`target_invoked`.
+
 ---
 
 ## 14. Definition of done
@@ -648,7 +725,15 @@ contracts declared `dynamic = false` — through the real binary.
 - [x] Missing or malformed coverage evidence cannot produce a misleading
       success: each failure mode is its own status, contributes no coverage, and
       a required exploration that did not finish turns satisfied into
-      incomplete.
+      incomplete. Run-level evidence — baseline, completion marker, completed
+      set, exit status — is checked separately from per-case evidence and is
+      actually consulted by both exploration loops.
+- [x] The analyzed executable is private to its run, so a concurrent build
+      cannot replace the binary a profile must be decoded against.
+- [x] Coverage is attributed by qualified module path, so two same-named
+      functions in different modules cannot be confused.
+- [x] The benchmark refuses to report a threshold as met when any measurement
+      behind it did not complete, checked identically on warm and cold runs.
 - [x] Reports distinguish discovery coverage, security-analysis execution and
       contract coverage, and the CI decision restates no coverage number.
 - [x] The CLI works against a separate out-of-workspace library

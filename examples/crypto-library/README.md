@@ -129,6 +129,18 @@ not verified symbolically:
 | `hidden::threshold_window` | a leak above a power-of-two threshold | M6 boundaries, and M7 must not lose it |
 | `hidden::secret_gated` | a leak reachable only for some secret values | keeps secret mutation honest |
 
+The `shadow` module is an **attribution** control rather than a vulnerability
+class. `shadow::left::probe` and `shadow::right::probe` have the same name, the
+same length-prefixed mangled component, and opposite behaviour — a full-table
+scan and a secret-indexed load. A coverage or finding match that ignored the
+module path would conflate them, which is the difference between a clean result
+and a leak, so they carry opposite declared outcomes:
+
+| Contract | What it is | Declared |
+| --- | --- | --- |
+| `shadow::left::probe` | the safe `probe` | security contract, `NO_LEAK_OBSERVED` |
+| `shadow::right::probe` | the vulnerable `probe` in a sibling module | analyzer regression, `LEAK_DETECTED` |
+
 ### Two of these are findings about the compiler, not about the source
 
 `verify_tag_early_exit` is written with a per-byte branch on the secret. At
