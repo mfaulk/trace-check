@@ -759,6 +759,35 @@ struct Captured {
     exit_code: Option<i32>,
 }
 
+/// What a bounded process run produced.
+#[derive(Debug, Clone)]
+pub struct ProcessRun {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: Option<i32>,
+}
+
+/// Runs a program under this module's limits, for a backend that is not
+/// Valgrind.
+///
+/// M7's discovery harness needs the same discipline the Valgrind path already
+/// has — argument arrays rather than a shell string, both pipes drained
+/// concurrently, a wall-clock limit, and an output cap — and reimplementing it
+/// would mean two places to get a deadlock or an unbounded read wrong.
+pub fn run_process(
+    program: &Path,
+    args: &[String],
+    limits: Limits,
+) -> Result<ProcessRun, NativeError> {
+    let rendered = render(program, args);
+    let captured = run_bounded_with_env(program, args, &[], limits, &rendered)?;
+    Ok(ProcessRun {
+        stdout: captured.stdout,
+        stderr: captured.stderr,
+        exit_code: captured.exit_code,
+    })
+}
+
 fn render(program: &Path, args: &[String]) -> String {
     let mut rendered = program.display().to_string();
     for arg in args {
