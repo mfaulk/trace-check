@@ -1,0 +1,31 @@
+[package]
+name = "tc-spike-coverage"
+description = "M7.1 feasibility spike: per-input LLVM source coverage from a real library function"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "tc-spike-coverage"
+path = "src/main.rs"
+
+[dependencies]
+# The real library, as an ordinary path dependency. Nothing in it is modified
+# for this spike.
+crypto = { package = "crypto-library", path = "../../../examples/crypto-library" }
+
+# The same profile the M7 discovery artifact uses: optimized, with debug info,
+# because llvm-cov needs the coverage map and a region without a source
+# location is not reportable.
+[profile.release]
+opt-level = 3
+debug = true
+panic = "unwind"
+codegen-units = 1
+lto = false
+incremental = false
+strip = false
+
+# Its own workspace root, so the spike is never absorbed into the repository's
+# workspace and cannot be built by an ordinary `cargo build` at the top level.
+[workspace]

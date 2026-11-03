@@ -1,5 +1,8 @@
 [toolchain]
 channel = "1.97.0"
-components = ["rustfmt", "clippy"]
+# `llvm-tools` supplies the `llvm-profdata` and `llvm-cov` that M7's coverage
+# feedback reads. They must come from this toolchain: a system LLVM of another
+# version cannot read this compiler's profiles.
+components = ["rustfmt", "clippy", "llvm-tools"]
 targets = ["wasm32-unknown-unknown"]
 profile = "minimal"
