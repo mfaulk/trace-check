@@ -19,7 +19,15 @@ the formal noninterference property, and the roadmap.
 | M3 | Rust developer API — annotations, assertions, CI | complete |
 | M4 | Bounded relational verification (BINSEC symbolic execution) | complete, experimental |
 | M5 | Verifying the real functions in a Cargo library | complete, experimental |
-| M6 | Hardware-oriented validation — statistical timing | future |
+| M6 | Generated constant-time testing and CI enforcement | in progress — feasibility spike complete |
+| M7 | Coverage-guided leakage discovery | future |
+| M8 | Compiler and build-profile regression analysis | future |
+| M9 | Hardware-oriented validation — statistical timing | future |
+
+M6 is in progress: its plan, the recorded feasibility results, and the
+limitations it accepts are in
+[docs/MILESTONE-06.md](docs/MILESTONE-06.md). Nothing below describes M6 —
+`cargo trace-check check` does not exist yet.
 
 `trace-check` turns that idea into reproducible analysis, from four directions:
 
