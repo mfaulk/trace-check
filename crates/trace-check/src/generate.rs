@@ -176,19 +176,31 @@ impl GeneratedCase {
 
 /// What one strategy was asked for and what it actually contributed.
 ///
-/// Both numbers are reported. `emitted < planned` means the budget ran out or
-/// the cases collided with ones already present, and a reader is entitled to
-/// know which.
+/// Three numbers, because `emitted < planned` has two very different causes. A
+/// case dropped as a **duplicate** of one already in the corpus costs no
+/// coverage: the value is there, contributed by an earlier strategy or by this
+/// one's own shared base case. A case dropped because the **budget** ran out
+/// does cost coverage, and only that is truncation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StrategyCoverage {
     pub strategy: Strategy,
     pub planned: usize,
     pub emitted: usize,
+    /// Cases this strategy produced that were already in the corpus.
+    pub duplicates: usize,
 }
 
 impl StrategyCoverage {
+    /// Whether every planned case was either emitted or already present.
     pub fn complete(&self) -> bool {
-        self.emitted >= self.planned
+        self.emitted + self.duplicates >= self.planned
+    }
+
+    /// Cases lost to the budget rather than to deduplication.
+    pub fn dropped_for_budget(&self) -> usize {
+        self.planned
+            .saturating_sub(self.emitted)
+            .saturating_sub(self.duplicates)
     }
 }
 
@@ -482,6 +494,27 @@ fn boundaries(parameter: &Parameter) -> Result<Vec<Value>, GenerateError> {
     }
 }
 
+/// Distinct cases the boundary stage emits for these parameters.
+///
+/// One-at-a-time generation sweeps each parameter's values against a *shared*
+/// base case, so parameter `i` contributes `|B_i|` cases of which one is that
+/// base: `1 + sum(|B_i| - 1)` distinct cases in total.
+///
+/// `max(|B_i|)` understates this by roughly the parameter count. Two `u32`
+/// parameters have 94 boundary values each and produce 187 distinct cases, so a
+/// budget of 94 was accepted for a run that could cover barely half of them.
+/// The per-strategy report did say `TRUNCATED`, so nothing was silent — but the
+/// floor is documented as a hard guarantee and has to be one.
+fn boundary_floor(per_parameter: &[Vec<Value>]) -> usize {
+    if per_parameter.is_empty() {
+        return 1;
+    }
+    1 + per_parameter
+        .iter()
+        .map(|values| values.len().saturating_sub(1))
+        .sum::<usize>()
+}
+
 fn dedup_scalars(raw: Vec<u64>, bits: u32) -> Vec<Value> {
     let mut seen = BTreeSet::new();
     raw.into_iter()
@@ -523,6 +556,33 @@ fn random_value(parameter: &Parameter, rng: &mut Rng) -> Result<Value, GenerateE
     }
 }
 
+/// Why a case was or was not added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Push {
+    Added,
+    /// Already in the corpus; costs no coverage.
+    Duplicate,
+    /// The budget is spent; this one does cost coverage.
+    BudgetSpent,
+}
+
+/// Running counts for one strategy.
+#[derive(Debug, Clone, Copy, Default)]
+struct Tally {
+    emitted: usize,
+    duplicates: usize,
+}
+
+impl Tally {
+    fn record(&mut self, push: Push) {
+        match push {
+            Push::Added => self.emitted += 1,
+            Push::Duplicate => self.duplicates += 1,
+            Push::BudgetSpent => {}
+        }
+    }
+}
+
 /// Accumulates cases, enforcing the budget and deduplicating.
 struct Builder<'a> {
     parameters: &'a [Parameter],
@@ -548,10 +608,10 @@ impl<'a> Builder<'a> {
     }
 
     /// Adds a case unless it duplicates one already present or the budget is
-    /// spent. Returns whether it was added.
-    fn push(&mut self, strategy: Strategy, values: Vec<Value>) -> bool {
+    /// spent, reporting which.
+    fn push(&mut self, strategy: Strategy, values: Vec<Value>) -> Push {
         if self.full() {
-            return false;
+            return Push::BudgetSpent;
         }
         let inputs: Vec<(String, Value)> = self
             .parameters
@@ -565,17 +625,18 @@ impl<'a> Builder<'a> {
             inputs,
         };
         if !self.seen.insert(case.key()) {
-            return false;
+            return Push::Duplicate;
         }
         self.cases.push(case);
-        true
+        Push::Added
     }
 
-    fn record(&mut self, strategy: Strategy, planned: usize, emitted: usize) {
+    fn record(&mut self, strategy: Strategy, planned: usize, tally: Tally) {
         self.coverage.push(StrategyCoverage {
             strategy,
             planned,
-            emitted,
+            emitted: tally.emitted,
+            duplicates: tally.duplicates,
         });
     }
 }
@@ -601,12 +662,18 @@ pub fn generate(
         .map(|values| values[0].clone())
         .collect();
 
-    let minimum = per_parameter.iter().map(Vec::len).max().unwrap_or(1);
-    if settings.cases < minimum {
-        return Err(GenerateError::BudgetTooSmall {
-            requested: settings.cases,
-            minimum,
-        });
+    // Only a run that asked for boundary coverage can fail to afford it: a
+    // corpus of replayed regressions alone has no floor. The regressions
+    // themselves are counted, because they are replayed ahead of the boundary
+    // stage and spend the same budget.
+    if settings.strategies.contains(&Strategy::Boundaries) {
+        let minimum = boundary_floor(&per_parameter) + settings.regressions.len();
+        if settings.cases < minimum {
+            return Err(GenerateError::BudgetTooSmall {
+                requested: settings.cases,
+                minimum,
+            });
+        }
     }
 
     let mut builder = Builder::new(parameters, settings.cases);
@@ -616,36 +683,32 @@ pub fn generate(
     // persisted regressions are replayed ahead of generation and can never be
     // crowded out by the budget.
     let planned = settings.regressions.len();
-    let mut emitted = 0;
+    let mut tally = Tally::default();
     for replayed in &settings.regressions {
         let values = align_regression(parameters, replayed)?;
-        if builder.push(Strategy::Regression, values) {
-            emitted += 1;
-        }
+        tally.record(builder.push(Strategy::Regression, values));
     }
     if planned > 0 {
-        builder.record(Strategy::Regression, planned, emitted);
+        builder.record(Strategy::Regression, planned, tally);
     }
 
     for strategy in &settings.strategies {
         match strategy {
             Strategy::Boundaries => {
                 let planned: usize = per_parameter.iter().map(Vec::len).sum();
-                let mut emitted = 0;
+                let mut tally = Tally::default();
                 for (index, values) in per_parameter.iter().enumerate() {
                     for value in values {
                         let mut case = base.clone();
                         case[index] = value.clone();
-                        if builder.push(Strategy::Boundaries, case) {
-                            emitted += 1;
-                        }
+                        tally.record(builder.push(Strategy::Boundaries, case));
                     }
                 }
-                builder.record(Strategy::Boundaries, planned, emitted);
+                builder.record(Strategy::Boundaries, planned, tally);
             }
             Strategy::Pairwise => {
                 let mut planned = 0;
-                let mut emitted = 0;
+                let mut tally = Tally::default();
                 for first in 0..parameters.len() {
                     for second in (first + 1)..parameters.len() {
                         for left in &per_parameter[first] {
@@ -654,18 +717,30 @@ pub fn generate(
                                 let mut case = base.clone();
                                 case[first] = left.clone();
                                 case[second] = right.clone();
-                                if builder.push(Strategy::Pairwise, case) {
-                                    emitted += 1;
-                                }
+                                tally.record(builder.push(Strategy::Pairwise, case));
                             }
                         }
                     }
                 }
-                builder.record(Strategy::Pairwise, planned, emitted);
+                builder.record(Strategy::Pairwise, planned, tally);
             }
             Strategy::Relationships => {
-                let planned = settings.relationships.len() * RelationshipKind::all().len();
-                let mut emitted = 0;
+                // Counted from what the loop below actually produces: one
+                // case per byte-array boundary pattern of the left parameter,
+                // per declared relationship. Multiplying by the number of
+                // relationship *kinds* counted something the generator never
+                // does — a 16-byte array has 13 seed patterns, not 5 — and
+                // because it under-counted, `emitted >= planned` reported the
+                // strategy complete while candidates were dropped for budget.
+                let mut planned = 0;
+                for relationship in &settings.relationships {
+                    let (left, _) = relationship_positions(parameters, relationship)?;
+                    planned += per_parameter[left]
+                        .iter()
+                        .filter(|value| matches!(value, Value::Bytes { .. }))
+                        .count();
+                }
+                let mut tally = Tally::default();
                 for relationship in &settings.relationships {
                     let (left, right) = relationship_positions(parameters, relationship)?;
                     let length = match &parameters[left].repr {
@@ -682,18 +757,16 @@ pub fn generate(
                             bytes: bytes.clone(),
                         };
                         case[right] = Value::Bytes { bytes: partner };
-                        if builder.push(Strategy::Relationships, case) {
-                            emitted += 1;
-                        }
+                        tally.record(builder.push(Strategy::Relationships, case));
                     }
                 }
-                builder.record(Strategy::Relationships, planned, emitted);
+                builder.record(Strategy::Relationships, planned, tally);
             }
             Strategy::Random => {
                 // Random fills whatever the budget has left, so it is the one
                 // strategy whose plan is defined by the remainder.
                 let planned = settings.cases.saturating_sub(builder.cases.len());
-                let mut emitted = 0;
+                let mut tally = Tally::default();
                 // Bounded attempts: a tiny domain such as a single `bool`
                 // exhausts its distinct values quickly, and retrying forever
                 // would hang rather than report.
@@ -705,11 +778,9 @@ pub fn generate(
                         .iter()
                         .map(|parameter| random_value(parameter, &mut rng))
                         .collect::<Result<_, _>>()?;
-                    if builder.push(Strategy::Random, values) {
-                        emitted += 1;
-                    }
+                    tally.record(builder.push(Strategy::Random, values));
                 }
-                builder.record(Strategy::Random, planned, emitted);
+                builder.record(Strategy::Random, planned, tally);
             }
             Strategy::Regression => {
                 // Replayed above, ahead of every generated strategy.
@@ -1037,7 +1108,9 @@ mod tests {
         // 30 is above the boundary minimum for two `u8` parameters and below
         // what pairwise would want, so the cap is doing work.
         let settings = GenerateSettings {
-            cases: 30,
+            // Above the corrected boundary floor for two `u8` parameters
+            // (43) and below what pairwise wants, so the cap does work.
+            cases: 50,
             ..Default::default()
         };
         let corpus = generate(
@@ -1046,7 +1119,7 @@ mod tests {
             &settings,
         )
         .unwrap();
-        assert!(corpus.cases.len() <= 30, "{}", corpus.cases.len());
+        assert!(corpus.cases.len() <= 50, "{}", corpus.cases.len());
         let mut keys: Vec<String> = corpus.cases.iter().map(|case| case.key()).collect();
         let before = keys.len();
         keys.sort();
@@ -1057,6 +1130,154 @@ mod tests {
         for (index, case) in corpus.cases.iter().enumerate() {
             assert_eq!(case.id, index);
         }
+    }
+
+    /// The boundary floor is the number of cases the boundary stage actually
+    /// emits, not the largest single parameter's boundary count.
+    ///
+    /// The regression: `max(|B_i|)` understated the floor by roughly the
+    /// parameter count, so a budget that could cover barely half of a
+    /// two-parameter sweep was accepted. Asserted against the generator's own
+    /// output, so the floor and the emission cannot drift apart.
+    #[test]
+    fn the_boundary_floor_is_what_the_boundary_stage_emits() {
+        for json in [SUBSTITUTE_MODE, VERIFY_TAG] {
+            let descriptor = descriptor(json);
+            let per: Vec<Vec<Value>> = descriptor
+                .parameters
+                .iter()
+                .map(|parameter| boundaries(parameter).unwrap())
+                .collect();
+            let floor = boundary_floor(&per);
+
+            // Generated with boundaries alone and an effectively unlimited
+            // budget, so nothing is dropped and the count is the real one.
+            let settings = GenerateSettings {
+                cases: 100_000,
+                strategies: vec![Strategy::Boundaries],
+                ..Default::default()
+            };
+            let corpus = generate("c::f", &descriptor, &settings).unwrap();
+            assert_eq!(
+                corpus.cases.len(),
+                floor,
+                "the floor must equal what the boundary stage emits"
+            );
+            // And it is strictly larger than the old `max(|B_i|)` estimate for
+            // any contract with more than one parameter.
+            let largest = per.iter().map(Vec::len).max().unwrap();
+            assert!(
+                floor > largest,
+                "floor {floor} must exceed the largest single parameter's {largest}"
+            );
+            // One case below the floor is refused.
+            let short = GenerateSettings {
+                cases: floor - 1,
+                strategies: vec![Strategy::Boundaries],
+                ..Default::default()
+            };
+            let error = generate("c::f", &descriptor, &short).expect_err("refused");
+            assert!(
+                matches!(error, GenerateError::BudgetTooSmall { minimum, .. } if minimum == floor),
+                "{error}"
+            );
+            // Exactly the floor is accepted, and covers every boundary value.
+            let exact = GenerateSettings {
+                cases: floor,
+                strategies: vec![Strategy::Boundaries],
+                ..Default::default()
+            };
+            let corpus = generate("c::f", &descriptor, &exact).unwrap();
+            assert!(
+                corpus.truncated().is_empty(),
+                "the floor must be enough to avoid truncation: {:?}",
+                corpus.coverage
+            );
+        }
+    }
+
+    /// Deduplication is not truncation. The boundary stage shares one base case
+    /// across every parameter's sweep, so that case is produced once per
+    /// parameter — and reporting the repeats as lost coverage made a fully
+    /// covered contract print a TRUNCATED line.
+    #[test]
+    fn deduplication_is_not_truncation() {
+        let descriptor = descriptor(SUBSTITUTE_MODE);
+        let settings = GenerateSettings {
+            cases: 1_000,
+            strategies: vec![Strategy::Boundaries],
+            ..Default::default()
+        };
+        let corpus = generate("c::substitute_mode", &descriptor, &settings).unwrap();
+        let boundaries = &corpus.coverage[0];
+        // One duplicate: the shared base case, swept twice.
+        assert_eq!(boundaries.duplicates, 1, "{boundaries:?}");
+        assert_eq!(boundaries.dropped_for_budget(), 0, "{boundaries:?}");
+        assert!(boundaries.complete(), "{boundaries:?}");
+        assert!(
+            corpus.truncated().is_empty(),
+            "deduplication was reported as truncation: {:?}",
+            corpus.coverage
+        );
+    }
+
+    /// Relationship coverage counts the candidates the strategy really
+    /// produces, so exhausting the budget partway through is reported as
+    /// truncation rather than concealed.
+    ///
+    /// The regression: `planned` was the number of relationship *kinds* (5)
+    /// rather than the number of seed patterns (13 for a 16-byte array), so
+    /// `emitted >= planned` marked the strategy complete while candidates were
+    /// being dropped.
+    #[test]
+    fn relationship_coverage_counts_real_candidates() {
+        let descriptor = descriptor(VERIFY_TAG);
+        let relationship = Relationship {
+            left: "expected".into(),
+            right: "supplied".into(),
+            kind: RelationshipKind::Equal,
+        };
+        let patterns = boundaries(&descriptor.parameters[0])
+            .unwrap()
+            .iter()
+            .filter(|value| matches!(value, Value::Bytes { .. }))
+            .count();
+        assert!(patterns > RelationshipKind::all().len(), "{patterns}");
+
+        // Enough budget: planned equals the candidate count and the strategy is
+        // complete.
+        let roomy = GenerateSettings {
+            cases: 100,
+            strategies: vec![Strategy::Relationships],
+            relationships: vec![relationship.clone()],
+            ..Default::default()
+        };
+        let corpus = generate("c::verify_tag", &descriptor, &roomy).unwrap();
+        let coverage = &corpus.coverage[0];
+        assert_eq!(coverage.strategy, Strategy::Relationships);
+        assert_eq!(coverage.planned, patterns);
+        assert_eq!(coverage.emitted, patterns);
+        assert!(coverage.complete());
+        assert!(corpus.truncated().is_empty());
+
+        // Budget exhausted partway through: the shortfall is reported.
+        let tight = GenerateSettings {
+            cases: 8,
+            strategies: vec![Strategy::Relationships],
+            relationships: vec![relationship],
+            ..Default::default()
+        };
+        let corpus = generate("c::verify_tag", &descriptor, &tight).unwrap();
+        let coverage = &corpus.coverage[0];
+        assert_eq!(coverage.planned, patterns);
+        assert_eq!(coverage.emitted, 8);
+        assert!(
+            !coverage.complete(),
+            "{} of {} candidates were dropped and must not read as complete",
+            patterns - coverage.emitted,
+            patterns
+        );
+        assert!(!corpus.truncated().is_empty());
     }
 
     /// A budget too small to cover the boundaries is refused rather than
@@ -1082,7 +1303,8 @@ mod tests {
     fn truncation_is_reported_per_strategy() {
         let descriptor = descriptor(VERIFY_TAG);
         let settings = GenerateSettings {
-            cases: 15,
+            // Above the floor for two 16-byte arrays (25), below pairwise.
+            cases: 30,
             ..Default::default()
         };
         let corpus = generate("c::verify_tag", &descriptor, &settings).unwrap();
@@ -1261,7 +1483,7 @@ mod tests {
     fn the_wire_form_is_line_oriented_and_positional() {
         let descriptor = descriptor(SUBSTITUTE_MODE);
         let settings = GenerateSettings {
-            cases: 25,
+            cases: 50,
             strategies: vec![Strategy::Boundaries],
             ..Default::default()
         };
@@ -1309,7 +1531,7 @@ mod tests {
     #[test]
     fn the_corpus_hash_covers_what_the_harness_consumed() {
         let settings = GenerateSettings {
-            cases: 30,
+            cases: 50,
             ..Default::default()
         };
         let corpus = generate(
