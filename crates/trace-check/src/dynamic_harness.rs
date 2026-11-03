@@ -7,6 +7,22 @@
 //! is what consumes it, so there is nothing to gain from freestanding code and a
 //! `std` library to lose.
 //!
+//! # Two artifacts from one generator
+//!
+//! M7 added a second [`HarnessKind`]. The security harness marks the declared
+//! secrets and runs under Memcheck; the discovery harness marks nothing, writes
+//! one LLVM coverage profile per case, and exists only to find interesting
+//! inputs ([`crate::coverage`]).
+//!
+//! They come from the same generator rather than from two, because the part
+//! that must not diverge is the part a shared generator cannot diverge in: the
+//! decoders, the compile-time descriptor check, and the positional argument
+//! mapping. An input selected in one artifact is only worth running in the
+//! other if it means the same thing in both. Everything that *should* differ —
+//! marking, calibration, instrumentation, the dependency on
+//! `trace-check-test` — differs structurally, so neither artifact can be
+//! argued into having done the other's job.
+//!
 //! # What keeps the result about the real function
 //!
 //! **The harness contains no algorithm.** It decodes a generated corpus, marks
@@ -68,6 +84,25 @@ pub const CASE_MARKER: &str = "trace-check-case:";
 /// abandoned one.
 pub const RUN_COMPLETE_MARKER: &str = "trace-check-run-complete:";
 
+/// Printed once by a discovery harness, before any case runs.
+///
+/// Carries the status of the baseline profile write. A discovery run whose
+/// baseline could not be written has no reference length to validate the
+/// per-case profiles against, so its observations are refused.
+pub const DISCOVERY_MODE_MARKER: &str = "trace-check-discovery:";
+
+/// Profile written after the first counter reset and before any case.
+///
+/// Its byte length is the expected length of every per-case profile for this
+/// artifact, which is how a profile carrying a duplicate record — the hazard
+/// the M7.1 spike found in the persistent-process approach — is detected
+/// without a second subprocess per case.
+pub const BASELINE_PROFILE: &str = "baseline.profraw";
+
+/// Where the profiling runtime's at-exit write is sent, so it cannot append a
+/// stale record to the last case's profile.
+pub const DRAIN_PROFILE: &str = "at-exit.profraw";
+
 /// Compilation settings for the analysis artifact, recorded because a result
 /// describes one build rather than the library in general.
 pub const PROFILE: &str = "release: opt-level=3, debug=true, lto=off, codegen-units=1";
@@ -77,16 +112,81 @@ pub const TEST_CRATE_ENV: &str = "TRACE_CHECK_TEST_PATH";
 
 /// Stand-in path the generated package's own directory is remapped to, so an
 /// artifact hash does not depend on which temporary directory built it.
+///
+/// It also gives the harness's own coverage regions a fixed, recognizable
+/// source path, which is what lets M7 exclude them from target feedback by
+/// file identity rather than by guessing.
 pub const REMAPPED_HARNESS_DIR: &str = "/trace-check/generated";
+
+/// Compilation settings for the **discovery** artifact.
+pub const DISCOVERY_PROFILE: &str =
+    "release: opt-level=3, debug=true, lto=off, codegen-units=1, -C instrument-coverage";
+
+/// The instrumentation flag the discovery artifact is built with.
+///
+/// Written without a space because each `rustflags` array element is one argv
+/// entry: `"-C instrument-coverage"` would reach rustc as a single argument
+/// whose value has a leading space.
+pub const INSTRUMENT_FLAG: &str = "-Cinstrument-coverage";
+
+/// Which of the two artifacts a harness is for.
+///
+/// The milestone's central constraint, made unrepresentable rather than
+/// documented: a discovery harness marks nothing, so it cannot produce the
+/// evidence a security conclusion is drawn from, and a security harness writes
+/// no coverage profile, so it cannot be mistaken for a discovery run.
+///
+/// What the two share is the part that must not differ — the decoders, the
+/// compile-time descriptor check, and the positional argument mapping — because
+/// an input has to mean the same thing in both artifacts for a candidate
+/// selected by one to be worth running in the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessKind {
+    /// Marks the declared secrets and runs under Memcheck. Produces security
+    /// evidence and no coverage.
+    Security,
+    /// Writes one LLVM profile per case and marks nothing. Produces coverage
+    /// feedback and no security evidence whatsoever.
+    Discovery,
+}
+
+impl HarnessKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HarnessKind::Security => "security",
+            HarnessKind::Discovery => "discovery",
+        }
+    }
+
+    /// Whether this kind marks secrets. Only a marking harness can produce
+    /// evidence about secret dependence.
+    pub fn marks_secrets(self) -> bool {
+        matches!(self, HarnessKind::Security)
+    }
+
+    /// The compilation settings a report records for this artifact.
+    pub fn profile(self) -> &'static str {
+        match self {
+            HarnessKind::Security => PROFILE,
+            HarnessKind::Discovery => DISCOVERY_PROFILE,
+        }
+    }
+}
 
 /// A generated dynamic harness.
 #[derive(Debug, Clone, Serialize)]
 pub struct DynamicHarness {
+    pub kind: HarnessKind,
     pub source: String,
     pub source_sha256: String,
     /// Declared secrets, in positional order.
+    ///
+    /// Recorded for both kinds, because a report has to be able to say that the
+    /// discovery artifact knew the roles and still marked nothing.
     pub secret_parameters: Vec<String>,
-    /// Bytes marked per case, summed over the declared secrets.
+    /// Bytes marked per case, summed over the declared secrets. Always zero for
+    /// [`HarnessKind::Discovery`].
     pub marked_bytes: u64,
 }
 
@@ -134,6 +234,25 @@ pub fn test_crate_path() -> Result<PathBuf, DynamicError> {
 /// Deterministic: the same contract and library produce the same bytes, which
 /// is what makes [`DynamicHarness::source_sha256`] provenance rather than noise.
 pub fn generate(contract: &Contract) -> Result<DynamicHarness, DynamicError> {
+    generate_kind(contract, HarnessKind::Security)
+}
+
+/// Generates the **discovery** harness for one contract.
+///
+/// Accepts exactly the contracts [`generate`] accepts, deliberately. A
+/// contract that cannot be analyzed is rejected before anything is built, so a
+/// developer is never told about a coverage tool when the problem is their
+/// annotation — and an exploration run can never be the only thing that
+/// succeeded.
+pub fn generate_discovery(contract: &Contract) -> Result<DynamicHarness, DynamicError> {
+    generate_kind(contract, HarnessKind::Discovery)
+}
+
+/// Generates the harness source for one contract and one artifact kind.
+pub fn generate_kind(
+    contract: &Contract,
+    kind: HarnessKind,
+) -> Result<DynamicHarness, DynamicError> {
     let descriptor = &contract.descriptor;
     if descriptor.secrets().next().is_none() {
         return Err(DynamicError::Contract(ContractError::Unsupported {
@@ -165,16 +284,21 @@ pub fn generate(contract: &Contract) -> Result<DynamicHarness, DynamicError> {
         }
     }
 
-    let source = render_source(contract)?;
+    let source = render_source(contract, kind)?;
     let secret_parameters: Vec<String> = descriptor
         .secrets()
         .map(|parameter| parameter.name.clone())
         .collect();
-    let marked_bytes = descriptor
-        .secrets()
-        .filter_map(|parameter| parameter.repr.bytes())
-        .sum();
+    let marked_bytes = if kind.marks_secrets() {
+        descriptor
+            .secrets()
+            .filter_map(|parameter| parameter.repr.bytes())
+            .sum()
+    } else {
+        0
+    };
     Ok(DynamicHarness {
+        kind,
         source_sha256: format!("{:x}", Sha256::digest(source.as_bytes())),
         source,
         secret_parameters,
@@ -233,17 +357,63 @@ fn decode_bytes(field: &str, len: usize) -> Result<Vec<u8>, String> {
 }
 "#;
 
-fn render_source(contract: &Contract) -> Result<String, DynamicError> {
+/// The LLVM profiling-runtime entry points a discovery harness calls.
+///
+/// Declaring them makes instrumentation a **link-time** requirement: without
+/// `-C instrument-coverage` the profiling runtime is not linked and the
+/// discovery artifact does not build. An uninstrumented discovery binary — one
+/// that would run every candidate and report no coverage at all — is therefore
+/// not something this pipeline can accidentally produce.
+const PROFILE_RUNTIME: &str = r#"
+extern "C" {
+    fn __llvm_profile_reset_counters();
+    fn __llvm_profile_set_filename(name: *const std::os::raw::c_char);
+    fn __llvm_profile_write_file() -> std::os::raw::c_int;
+}
+
+/// Points the profiling runtime at `path` and writes the current counters.
+///
+/// Returns the runtime's own status, which the caller reports rather than
+/// assumes: a profile that was not written must not be read as a case that
+/// covered nothing.
+fn write_profile(path: &str) -> i32 {
+    let encoded = match std::ffi::CString::new(path) {
+        Ok(encoded) => encoded,
+        Err(_) => return -1,
+    };
+    // SAFETY: both are the profiling runtime's documented entry points, linked
+    // in by `-C instrument-coverage`. `set_filename` copies the string, so the
+    // CString may be dropped afterwards.
+    unsafe {
+        __llvm_profile_set_filename(encoded.as_ptr());
+        __llvm_profile_write_file() as i32
+    }
+}
+"#;
+
+fn render_source(contract: &Contract, kind: HarnessKind) -> Result<String, DynamicError> {
     let descriptor = &contract.descriptor;
     let parameters = &descriptor.parameters;
+    let discovery = kind == HarnessKind::Discovery;
     let mut out = String::new();
 
     out.push_str(&format!(
         "// Generated by trace-check for `{}`. Not written into any source tree,\n\
-         // not edited by hand, and containing no copy of the library's implementation:\n\
-         // it decodes generated inputs, marks the declared secret, calls the real\n\
-         // function, and declassifies the result.\n\n",
-        contract.id
+         // not edited by hand, and containing no copy of the library's implementation.\n\
+         //\n\
+         // Artifact kind: {}.\n\
+         {}\n",
+        contract.id,
+        kind.as_str(),
+        if discovery {
+            "// It decodes generated inputs, calls the real function, and writes one LLVM\n\
+             // coverage profile per case. It marks NO secret and makes NO security claim:\n\
+             // this artifact exists to discover interesting inputs, and a clean run of it\n\
+             // says nothing whatsoever about constant-time behavior."
+        } else {
+            "// It decodes generated inputs, marks the declared secret, calls the real\n\
+             // function, and declassifies the result."
+        }
     ));
 
     // Bound at compile time to the descriptor this harness was generated from,
@@ -272,20 +442,32 @@ fn render_source(contract: &Contract) -> Result<String, DynamicError> {
         contract.descriptor_const()
     ));
     out.push_str(DECODERS);
+    if discovery {
+        out.push_str(PROFILE_RUNTIME);
+    }
 
-    // One case: decode, mark, call, declassify.
+    // One case: decode, then (security) mark, call, declassify — or
+    // (discovery) reset counters, call, write the profile.
     out.push_str(&format!(
         "\n/// Runs one generated case.\n\
          ///\n\
-         /// Nothing is decoded, formatted or compared while a value is marked:\n\
-         /// those operations would produce findings belonging to the harness.\n\
-         fn run_case(nonce: &str, id: usize, fields: &[&str]) -> Result<(), String> {{\n\
+         /// {}\n\
+         fn run_case({}nonce: &str, id: usize, fields: &[&str]) -> Result<(), String> {{\n\
          \x20   if fields.len() != {} {{\n\
          \x20       return Err(format!(\n\
          \x20           \"case {{id}} has {{}} input(s), but `{}` declares {}\",\n\
          \x20           fields.len()\n\
          \x20       ));\n\
          \x20   }}\n",
+        if discovery {
+            "Decoding happens before the counters are reset, so the harness's own input\n\
+             /// handling is not part of the measured coverage. It is excluded a second time\n\
+             /// by source-file identity when the profile is read."
+        } else {
+            "Nothing is decoded, formatted or compared while a value is marked:\n\
+             /// those operations would produce findings belonging to the harness."
+        },
+        if discovery { "profile_dir: &str, " } else { "" },
         parameters.len(),
         contract.id,
         parameters.len()
@@ -323,36 +505,54 @@ fn render_source(contract: &Contract) -> Result<String, DynamicError> {
         }
     }
 
-    // Launder before marking. `#[inline(never)]` would not stop interprocedural
-    // constant propagation from specializing on a known value and never reading
-    // the marked storage.
-    for parameter in descriptor.secrets() {
-        out.push_str(&format!(
-            "\x20   // Laundered before marking: the optimizer must not be able to\n\
-             \x20   // use an immediate and bypass the marked storage.\n\
-             \x20   let {0} = ::trace_check_test::launder({0});\n",
-            parameter.name
-        ));
-    }
-    for parameter in descriptor.secrets() {
-        out.push_str(&format!(
-            "\x20   let __guard_{0} = ::trace_check_test::mark(&{0});\n",
-            parameter.name
-        ));
-    }
-    // The binding control, over the bytes the call is about to receive.
-    for parameter in descriptor.secrets() {
-        let bytes = match &parameter.repr {
-            Repr::ByteArray(_) | Repr::RefByteArray(_) => format!("&{}[..]", parameter.name),
-            // Reading the marked scalar to build its bytes is itself the
-            // evidence: the copy is undefined only if the storage was.
-            _ => format!("&{}.to_le_bytes()[..]", parameter.name),
-        };
-        out.push_str(&format!(
-            "\x20   // Proves *this* secret's storage is marked at the call site, which\n\
-             \x20   // calibration cannot: it marks its own byte and passes either way.\n\
-             \x20   ::trace_check_test::calibration::confirm_binding({bytes});\n"
-        ));
+    if discovery {
+        // Laundered for the same reason the security harness launders: a value
+        // the optimizer can see through may be folded into the call and change
+        // which regions the library executes. Discovery has to execute the
+        // same code the security artifact will be asked about.
+        for parameter in parameters {
+            out.push_str(&format!(
+                "\x20   let {0} = std::hint::black_box({0});\n",
+                parameter.name
+            ));
+        }
+        out.push_str(
+            "\x20   // Reset last, so nothing above this line is attributed to the case.\n\
+             \x20   // SAFETY: the profiling runtime's documented entry point.\n\
+             \x20   unsafe { __llvm_profile_reset_counters() };\n",
+        );
+    } else {
+        // Launder before marking. `#[inline(never)]` would not stop
+        // interprocedural constant propagation from specializing on a known
+        // value and never reading the marked storage.
+        for parameter in descriptor.secrets() {
+            out.push_str(&format!(
+                "\x20   // Laundered before marking: the optimizer must not be able to\n\
+                 \x20   // use an immediate and bypass the marked storage.\n\
+                 \x20   let {0} = ::trace_check_test::launder({0});\n",
+                parameter.name
+            ));
+        }
+        for parameter in descriptor.secrets() {
+            out.push_str(&format!(
+                "\x20   let __guard_{0} = ::trace_check_test::mark(&{0});\n",
+                parameter.name
+            ));
+        }
+        // The binding control, over the bytes the call is about to receive.
+        for parameter in descriptor.secrets() {
+            let bytes = match &parameter.repr {
+                Repr::ByteArray(_) | Repr::RefByteArray(_) => format!("&{}[..]", parameter.name),
+                // Reading the marked scalar to build its bytes is itself the
+                // evidence: the copy is undefined only if the storage was.
+                _ => format!("&{}.to_le_bytes()[..]", parameter.name),
+            };
+            out.push_str(&format!(
+                "\x20   // Proves *this* secret's storage is marked at the call site, which\n\
+                 \x20   // calibration cannot: it marks its own byte and passes either way.\n\
+                 \x20   ::trace_check_test::calibration::confirm_binding({bytes});\n"
+            ));
+        }
     }
 
     let arguments: Vec<String> = parameters
@@ -370,41 +570,121 @@ fn render_source(contract: &Contract) -> Result<String, DynamicError> {
         .map(|parameter| format!("__guard_{}", parameter.name))
         .collect();
 
-    match descriptor.returns {
-        Repr::Unit => {
-            out.push_str(&format!(
+    if discovery {
+        // The call, then the profile, then the marker. The marker comes last so
+        // a case credited as complete is one whose coverage was already on
+        // disk: the ordering is what makes "completed" and "observed" the same
+        // set rather than two sets that happen to agree.
+        match descriptor.returns {
+            Repr::Unit => out.push_str(&format!(
                 "\x20   {}({});\n\
-                 \x20   drop(({},));\n\
-                 \x20   println!(\"{CASE_MARKER} {{nonce}} {{id}} produced=unit\");\n",
+                 \x20   let written = write_profile(&format!(\"{{profile_dir}}/case-{{id}}.profraw\"));\n\
+                 \x20   println!(\"{CASE_MARKER} {{nonce}} {{id}} produced=unit written={{written}}\");\n",
                 contract.call_path(),
-                arguments.join(", "),
-                guards.join(", ")
-            ));
-        }
-        _ => {
-            out.push_str(&format!(
+                arguments.join(", ")
+            )),
+            _ => out.push_str(&format!(
                 "\x20   let produced = {}({});\n\
-                 \x20   drop(({},));\n\
-                 \x20   // Declassified before it is formatted, so printing the value cannot\n\
-                 \x20   // produce findings inside `core::fmt`.\n\
-                 \x20   let produced = ::trace_check_test::finish(produced);\n\
-                 \x20   println!(\"{CASE_MARKER} {{nonce}} {{id}} produced={{}}\", produced as u64);\n",
+                 \x20   let written = write_profile(&format!(\"{{profile_dir}}/case-{{id}}.profraw\"));\n\
+                 \x20   // Consumed through a barrier so the call cannot be elided as dead.\n\
+                 \x20   let produced = std::hint::black_box(produced);\n\
+                 \x20   println!(\"{CASE_MARKER} {{nonce}} {{id}} produced={{}} written={{written}}\", produced as u64);\n",
                 contract.call_path(),
-                arguments.join(", "),
-                guards.join(", ")
-            ));
+                arguments.join(", ")
+            )),
+        }
+    } else {
+        match descriptor.returns {
+            Repr::Unit => {
+                out.push_str(&format!(
+                    "\x20   {}({});\n\
+                     \x20   drop(({},));\n\
+                     \x20   println!(\"{CASE_MARKER} {{nonce}} {{id}} produced=unit\");\n",
+                    contract.call_path(),
+                    arguments.join(", "),
+                    guards.join(", ")
+                ));
+            }
+            _ => {
+                out.push_str(&format!(
+                    "\x20   let produced = {}({});\n\
+                     \x20   drop(({},));\n\
+                     \x20   // Declassified before it is formatted, so printing the value cannot\n\
+                     \x20   // produce findings inside `core::fmt`.\n\
+                     \x20   let produced = ::trace_check_test::finish(produced);\n\
+                     \x20   println!(\"{CASE_MARKER} {{nonce}} {{id}} produced={{}}\", produced as u64);\n",
+                    contract.call_path(),
+                    arguments.join(", "),
+                    guards.join(", ")
+                ));
+            }
         }
     }
     out.push_str("\x20   Ok(())\n}\n");
 
     // The driver: read the corpus, select the requested cases, run them in the
     // order given.
+    let (destructure, usage) = if discovery {
+        (
+            "[_, corpus_path, selection, nonce, profile_dir]",
+            "usage: <harness> <corpus-path> all|<id>[,<id>...] <nonce> <profile-dir>",
+        )
+    } else {
+        (
+            "[_, corpus_path, selection, nonce]",
+            "usage: <harness> <corpus-path> all|<id>[,<id>...] <nonce>",
+        )
+    };
+    // Security: announce the run mode, refuse an uninstrumented process, and
+    // calibrate. Discovery: write the post-reset baseline profile, whose byte
+    // length is the expected length of every per-case profile and so is how a
+    // profile with a duplicate record is caught.
+    let preamble = if discovery {
+        format!(
+            r#"    // SAFETY: the profiling runtime's documented entry point.
+    unsafe {{ __llvm_profile_reset_counters() }};
+    let baseline = write_profile(&format!("{{profile_dir}}/{BASELINE_PROFILE}"));
+    println!("{DISCOVERY_MODE_MARKER} {{nonce}} baseline={{baseline}}");
+"#
+        )
+    } else {
+        format!(
+            r#"    // The structured run-mode line the runner requires. A clean result from an
+    // uninstrumented process is rejected rather than believed.
+    println!(
+        "{RUN_MODE_MARKER} run_mode={{}}",
+        ::trace_check_test::run_mode()
+    );
+    ::trace_check_test::require_instrumentation("{}");
+    // Calibration once per process: marking reaches compiled code here.
+    ::trace_check_test::calibration::run();
+"#,
+            contract.id
+        )
+    };
+    // Discovery: the profiling runtime writes the profile once more at exit, to
+    // whatever filename is current — which would append a second, stale record
+    // to the last case's file and silently double its counters. Draining it to
+    // a scratch path makes the last case no different from the others.
+    let epilogue = if discovery {
+        format!(
+            "    let drained = write_profile(&format!(\"{{profile_dir}}/{DRAIN_PROFILE}\"));\n\
+             \x20   let _ = drained;\n"
+        )
+    } else {
+        String::new()
+    };
+    let call = if discovery {
+        "run_case(profile_dir, nonce, *id, &borrowed)"
+    } else {
+        "run_case(nonce, *id, &borrowed)"
+    };
     out.push_str(&format!(
         r#"
 fn main() {{
     let argv: Vec<String> = std::env::args().collect();
-    let [_, corpus_path, selection, nonce] = argv.as_slice() else {{
-        eprintln!("usage: <harness> <corpus-path> all|<id>[,<id>...] <nonce>");
+    let {destructure} = argv.as_slice() else {{
+        eprintln!("{usage}");
         std::process::exit(2);
     }};
     let text = match std::fs::read_to_string(corpus_path) {{
@@ -450,16 +730,7 @@ fn main() {{
         std::process::exit(2);
     }}
 
-    // The structured run-mode line the runner requires. A clean result from an
-    // uninstrumented process is rejected rather than believed.
-    println!(
-        "{RUN_MODE_MARKER} run_mode={{}}",
-        ::trace_check_test::run_mode()
-    );
-    ::trace_check_test::require_instrumentation("{}");
-    // Calibration once per process: marking reaches compiled code here.
-    ::trace_check_test::calibration::run();
-
+{preamble}
     let mut completed = 0usize;
     for id in &selected {{
         let Some((_, fields)) = cases.iter().find(|(case_id, _)| case_id == id) else {{
@@ -467,7 +738,7 @@ fn main() {{
             std::process::exit(2);
         }};
         let borrowed: Vec<&str> = fields.iter().map(String::as_str).collect();
-        if let Err(error) = run_case(nonce, *id, &borrowed) {{
+        if let Err(error) = {call} {{
             // An invalid input is refused before analysis rather than bound to
             // the wrong width.
             eprintln!("case {{id}} was rejected: {{error}}");
@@ -475,10 +746,9 @@ fn main() {{
         }}
         completed += 1;
     }}
-    println!("{RUN_COMPLETE_MARKER} {{nonce}} cases={{completed}}");
+{epilogue}    println!("{RUN_COMPLETE_MARKER} {{nonce}} cases={{completed}}");
 }}
-"#,
-        contract.id
+"#
     ));
 
     Ok(out)
@@ -492,37 +762,69 @@ pub fn build(
     work_dir: &Path,
     target_dir: &Path,
 ) -> Result<Artifact, DynamicError> {
-    let crate_dir = work_dir.join("dynamic-harness");
-    let package = format!("tc-check-{}", contract.replace("::", "-"));
+    let crate_dir = work_dir.join(match harness.kind {
+        HarnessKind::Security => "dynamic-harness",
+        // A separate directory, so the two artifacts never share a generated
+        // source file, a lockfile or a build cache entry. They are different
+        // programs and a report names both.
+        HarnessKind::Discovery => "discovery-harness",
+    });
+    let package = format!(
+        "{}-{}",
+        match harness.kind {
+            HarnessKind::Security => "tc-check",
+            HarnessKind::Discovery => "tc-explore",
+        },
+        contract.replace("::", "-")
+    );
     std::fs::create_dir_all(crate_dir.join("src"))
         .map_err(|e| DynamicError::Io(format!("{}: {e}", crate_dir.display())))?;
 
-    let test_crate = test_crate_path()?;
+    // Only the security harness needs the marking API. The discovery harness
+    // deliberately does not depend on it at all: a harness that cannot call
+    // `mark` cannot be argued into having marked anything.
+    let test_dependency = if harness.kind.marks_secrets() {
+        format!(
+            "[dependencies.trace-check-test]\npath = {:?}\n\n",
+            test_crate_path()?.display().to_string()
+        )
+    } else {
+        String::new()
+    };
     // `[workspace]` makes the generated package its own root, so it is never
     // absorbed into whatever workspace the temporary directory sits inside.
     //
     // `debug = true` and `strip = false` because a finding without a source
     // location is not actionable; `lto = false` so the target keeps a frame the
-    // finding can be attributed to.
+    // finding can be attributed to. The discovery artifact keeps the same
+    // settings so the two builds differ in exactly one documented respect.
     let manifest = format!(
         "[package]\nname = {package:?}\nversion = \"0.0.0\"\nedition = \"2021\"\n\
          publish = false\n\n[[bin]]\nname = {package:?}\npath = \"src/main.rs\"\n\n\
-         {}\n[dependencies.trace-check-test]\npath = {:?}\n\n\
+         {}\n{test_dependency}\
          [profile.release]\nopt-level = 3\ndebug = true\npanic = \"unwind\"\n\
          codegen-units = 1\nlto = false\nincremental = false\nstrip = false\n\n\
          [workspace]\n",
         library.dependency_stanza(),
-        test_crate.display().to_string()
     );
     // The work directory is random, and `debug = true` bakes the generated
     // source's absolute path into the artifact — so without remapping, two runs
     // of the same contract produce different hashes and `--replay` could never
     // report that it ran against the same build. Remapping makes the hash a
     // function of the inputs rather than of the temporary directory.
+    //
+    // For the discovery artifact it does a second job: the harness's own
+    // coverage regions get the fixed `REMAPPED_HARNESS_DIR` path, so excluding
+    // them from target feedback is an exact comparison rather than a heuristic.
     std::fs::create_dir_all(crate_dir.join(".cargo"))
         .map_err(|e| DynamicError::Io(format!("{}: {e}", crate_dir.display())))?;
+    let instrumentation = if harness.kind.marks_secrets() {
+        String::new()
+    } else {
+        format!(", {INSTRUMENT_FLAG:?}")
+    };
     let cargo_config = format!(
-        "[build]\nrustflags = [\"--remap-path-prefix\", {:?}]\n",
+        "[build]\nrustflags = [\"--remap-path-prefix\", {:?}{instrumentation}]\n",
         format!("{}={REMAPPED_HARNESS_DIR}", crate_dir.display())
     );
     write(&crate_dir.join(".cargo/config.toml"), &cargo_config)?;
@@ -716,11 +1018,14 @@ pub fn run_batch(
 
 /// A value the code under analysis cannot know.
 ///
+/// Public because the discovery backend needs the same evidence discipline for
+/// its completion markers.
+///
 /// It is compiled before this runs, and the nonce never reaches it as an input
 /// — only as an argument the generated harness echoes. That is what makes a
 /// completion marker evidence rather than a string anything in the process
 /// could print.
-fn run_nonce() -> String {
+pub fn run_nonce() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()

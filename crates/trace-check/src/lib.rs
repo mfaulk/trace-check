@@ -33,6 +33,7 @@ pub mod check;
 pub mod check_report;
 pub mod compare;
 pub mod contract;
+pub mod coverage;
 pub mod dynamic_harness;
 pub mod experiment;
 pub mod generate;
