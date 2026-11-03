@@ -94,6 +94,7 @@ fn run(contract_id: &str, settings: &ExploreSettings, cases: usize) -> (Contract
         &artifact.path,
         &artifact.sha256,
         &library_manifest(),
+        &contract.module,
         &contract.function,
         Limits::default(),
     );

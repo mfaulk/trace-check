@@ -240,13 +240,27 @@ impl DiscoveryRun {
 
     /// Whether every requested case produced usable coverage.
     pub fn complete(&self) -> bool {
-        self.run_complete == Some(self.requested.len())
-            && self.baseline_written
-            && self.observations.iter().all(|o| o.status.usable())
+        self.run_level_failure().is_none() && self.observations.iter().all(|o| o.status.usable())
     }
 
-    /// Why this run was not complete, when it was not.
-    pub fn incompleteness(&self) -> Option<String> {
+    /// Evidence that the *process* finished the batch it was given, or why not.
+    ///
+    /// Kept separate from per-case evidence, because the two have different
+    /// consequences. One unreadable profile costs one candidate, is recorded,
+    /// and the round's other observations are still good. A process that did
+    /// not finish makes the **whole round** untrustworthy — including the
+    /// observations that look fine, because nothing rules out the process
+    /// having died partway and the surviving profiles describing a different
+    /// set of cases than the markers suggest.
+    ///
+    /// This is the same discipline M6's security backend applies, for the same
+    /// reason: per-case markers do not rule out the process dying immediately
+    /// after printing one, which is why there is a separate run-completion
+    /// marker at all. An earlier revision of this module computed all of this
+    /// and then never consulted it, so a discovery process that marked every
+    /// case and then died before its final marker was accepted as a finished
+    /// search.
+    pub fn run_level_failure(&self) -> Option<String> {
         if !self.baseline_written {
             return Some(
                 "the discovery harness did not report writing its baseline profile, so there is \
@@ -257,8 +271,9 @@ impl DiscoveryRun {
         match self.run_complete {
             None => {
                 return Some(format!(
-                    "the discovery harness never printed its run-completion marker; {} of {} \
-                     case(s) reported completing",
+                    "the discovery harness never printed its run-completion marker, so nothing \
+                     establishes that it finished rather than dying after the last case it \
+                     marked; {} of {} case(s) reported completing",
                     self.completed.len(),
                     self.requested.len()
                 ))
@@ -270,6 +285,41 @@ impl DiscoveryRun {
                 ))
             }
             Some(_) => {}
+        }
+        // The *set* of cases that reported completing has to be the set that
+        // was requested. A matching count over different ids would mean the
+        // profiles on disk do not belong to the cases they are named for.
+        let mut marked: Vec<usize> = self.completed.clone();
+        marked.sort_unstable();
+        marked.dedup();
+        let mut asked: Vec<usize> = self.requested.clone();
+        asked.sort_unstable();
+        asked.dedup();
+        if marked != asked {
+            return Some(format!(
+                "the discovery harness marked case(s) {marked:?} complete for a batch of \
+                 {asked:?}, so a profile may not belong to the case it is named for"
+            ));
+        }
+        // The harness exits 0 on success and 2 on a usage or decode error.
+        // Anything else is a crash, and a crash is not a measurement.
+        match self.exit_code {
+            Some(0) => None,
+            Some(code) => Some(format!(
+                "the discovery harness exited {code}; stderr: {}",
+                first_line(&self.stderr)
+            )),
+            None => Some(format!(
+                "the discovery harness was terminated by a signal; stderr: {}",
+                first_line(&self.stderr)
+            )),
+        }
+    }
+
+    /// Why this run was not complete, when it was not.
+    pub fn incompleteness(&self) -> Option<String> {
+        if let Some(failure) = self.run_level_failure() {
+            return Some(failure);
         }
         let failed: Vec<String> = self
             .observations
@@ -373,19 +423,25 @@ pub struct Collector<'a> {
     /// generated harness, `std`, third-party dependencies — is excluded from
     /// target feedback.
     scope: PathBuf,
-    /// The contract's bare function name, for `target_invoked`.
-    function: String,
+    /// The mangled component sequence identifying the contract's function, for
+    /// `target_invoked`. See [`Collector::matches_target`].
+    target_components: String,
+    /// The contract's qualified identity, for error messages.
+    target: String,
     /// Concurrent decode workers.
     workers: usize,
     limits: Limits,
 }
 
 impl<'a> Collector<'a> {
+    /// `module` is the crate-qualified module the annotation expanded in, e.g.
+    /// `crypto::hidden`; `function` is the bare function name.
     pub fn new(
         tools: &'a LlvmTools,
         artifact: &Path,
         artifact_sha256: &str,
         library_manifest: &Path,
+        module: &str,
         function: &str,
         limits: Limits,
     ) -> Collector<'a> {
@@ -400,7 +456,8 @@ impl<'a> Collector<'a> {
             artifact: artifact.to_path_buf(),
             artifact_sha256: artifact_sha256.to_string(),
             scope,
-            function: function.to_string(),
+            target_components: mangled_components(module, function),
+            target: format!("{module}::{function}"),
             workers: decode_workers(),
             limits,
         }
@@ -446,7 +503,7 @@ impl<'a> Collector<'a> {
         }
         if target_records == 0 {
             return Err(CoverageError::TargetNotInMap {
-                function: self.function.clone(),
+                function: self.target.clone(),
                 artifact: self.artifact.display().to_string(),
             });
         }
@@ -796,21 +853,44 @@ impl<'a> Collector<'a> {
 
     /// Whether a coverage record belongs to the contract's function.
     ///
-    /// Both Rust manglings length-prefix each path component — `_ZN…12nested_
-    /// modesE` and `_RNvNt…12nested_modes` alike — so the prefixed component is
-    /// an exact test in either. A bare substring test is **not**: for the
-    /// contract `crypto::lookup::substitute` it would also match
-    /// `substitute_indexed`, and `target_invoked` would report that the
-    /// function under study ran when a different one did.
+    /// Matched on the **whole module path plus the function**, as a sequence of
+    /// length-prefixed mangled components: `crypto::hidden::nested_modes`
+    /// becomes `6crypto6hidden12nested_modes`, which appears verbatim in both
+    /// Rust manglings (`_ZN6crypto6hidden12nested_modes17h…E` and
+    /// `_RNvNtCs…_6crypto6hidden12nested_modes`).
+    ///
+    /// Two narrower tests were tried and are both wrong:
+    ///
+    /// * A bare substring of the function name matches
+    ///   `substitute_indexed` for the contract `substitute`.
+    /// * The length-prefixed *function component alone* fixes that but still
+    ///   ignores module identity, so `crypto::authentication::verify` and
+    ///   `crypto::encoding::verify` are indistinguishable — both records would
+    ///   count as the target and coverage from the wrong function could be
+    ///   attributed to the contract.
     ///
     /// When no record matches, [`Collector::map`] refuses the artifact rather
     /// than falling back to something looser.
     fn matches_target(&self, record: &str) -> bool {
-        record.contains(&format!("{}{}", self.function.len(), self.function))
+        record.contains(&self.target_components)
             // A demangled name, should a future llvm-cov emit one. Still an
-            // exact component test, not a substring.
-            || record.ends_with(&format!("::{}", self.function))
+            // exact qualified-path test, not a substring.
+            || record.ends_with(&self.target)
     }
+}
+
+/// The mangled component sequence for a qualified path.
+///
+/// Both Rust manglings length-prefix each path component, so
+/// `crypto::hidden::nested_modes` becomes `6crypto6hidden12nested_modes` and
+/// appears verbatim in either scheme's symbol for that function.
+fn mangled_components(module: &str, function: &str) -> String {
+    let mut out = String::new();
+    for component in module.split("::").filter(|part| !part.is_empty()) {
+        out.push_str(&format!("{}{}", component.len(), component));
+    }
+    out.push_str(&format!("{}{}", function.len(), function));
+    out
 }
 
 /// How many decode workers to use.
@@ -1167,16 +1247,68 @@ mod tests {
             Path::new("/nonexistent/artifact"),
             "sha",
             Path::new("/lib/Cargo.toml"),
+            "crypto::lookup",
             "substitute",
             Limits::default(),
         );
-        // v0 and legacy mangling both length-prefix the component.
+        // v0 and legacy mangling both length-prefix every component.
         assert!(collector.matches_target("_RNvNtCs123_6crypto6lookup10substitute"));
         assert!(collector.matches_target("_ZN6crypto6lookup10substitute17h0123456789abcdefE"));
         // `substitute_indexed` *contains* `substitute`, and must not match: its
         // component is prefixed 18, not 10.
         assert!(!collector.matches_target("_RNvNtCs123_6crypto6lookup18substitute_indexed"));
         assert!(!collector.matches_target("_RNvNtCs123_6crypto6lookup19substitute_unrelated"));
+        // A same-named function in a *different* module must not match either.
+        // This is the attribution bug the module path fixes: without it, both
+        // `crypto::lookup::substitute` and `crypto::encoding::substitute`
+        // counted as the target.
+        assert!(!collector.matches_target("_RNvNtCs123_6crypto8encoding10substitute"));
+        assert!(!collector.matches_target("_ZN6crypto8encoding10substitute17h0123456789abcdefE"));
+        // And a demangled name is an exact qualified-path test.
+        assert!(collector.matches_target("crypto::lookup::substitute"));
+        assert!(!collector.matches_target("crypto::encoding::substitute"));
+    }
+
+    /// Two same-named functions in different modules are distinguished, in both
+    /// directions, so coverage cannot be attributed to the wrong contract.
+    #[test]
+    fn same_named_functions_in_different_modules_are_distinguished() {
+        let tools = LlvmTools {
+            profdata: PathBuf::from("/nonexistent"),
+            cov: PathBuf::from("/nonexistent"),
+            version: "test".to_string(),
+        };
+        let collector = |module: &str| {
+            Collector::new(
+                &tools,
+                Path::new("/nonexistent/artifact"),
+                "sha",
+                Path::new("/lib/Cargo.toml"),
+                module,
+                "verify",
+                Limits::default(),
+            )
+        };
+        let authentication = "_RNvNtCs123_6crypto14authentication6verify";
+        let encoding = "_RNvNtCs123_6crypto8encoding6verify";
+
+        assert!(collector("crypto::authentication").matches_target(authentication));
+        assert!(!collector("crypto::authentication").matches_target(encoding));
+        assert!(collector("crypto::encoding").matches_target(encoding));
+        assert!(!collector("crypto::encoding").matches_target(authentication));
+    }
+
+    /// The component sequence is the length-prefixed module path plus the
+    /// function, which is what appears verbatim in both manglings.
+    #[test]
+    fn mangled_components_prefix_every_path_component() {
+        assert_eq!(
+            mangled_components("crypto::hidden", "nested_modes"),
+            "6crypto6hidden12nested_modes"
+        );
+        assert_eq!(mangled_components("crypto", "verify"), "6crypto6verify");
+        // A deeply nested module keeps every component.
+        assert_eq!(mangled_components("a::bb::ccc", "d"), "1a2bb3ccc1d");
     }
 
     /// Scope is a path prefix test against the library's package directory.
@@ -1192,6 +1324,7 @@ mod tests {
             Path::new("/nonexistent/artifact"),
             "sha",
             Path::new("/work/examples/crypto-library/Cargo.toml"),
+            "crypto::lookup",
             "substitute",
             Limits::default(),
         );
@@ -1211,6 +1344,121 @@ mod tests {
         assert!(!baseline_ok(&good, "other"));
         let failed = format!("{DISCOVERY_MODE_MARKER} abc123 baseline=-1");
         assert!(!baseline_ok(&failed, "abc123"));
+    }
+
+    /// A run with usable per-case observations but no run-completion marker is
+    /// refused.
+    ///
+    /// The gap this closes: per-case markers do not rule out the process dying
+    /// immediately after printing the last one, which is the whole reason there
+    /// is a separate run-completion marker. An earlier revision computed this
+    /// and never consulted it.
+    fn run_with(
+        run_complete: Option<usize>,
+        exit_code: Option<i32>,
+        completed: Vec<usize>,
+    ) -> DiscoveryRun {
+        let observed = |id: usize| CoverageObservation {
+            case_id: id,
+            artifact_sha256: "sha".to_string(),
+            coverage_map_id: "map".to_string(),
+            covered_regions: [region("a.rs", 1)].into_iter().collect(),
+            covered_functions: BTreeSet::new(),
+            target_invoked: true,
+            status: ExecutionStatus::Observed,
+        };
+        DiscoveryRun {
+            requested: vec![0, 1],
+            completed,
+            run_complete,
+            baseline_written: true,
+            exit_code,
+            stdout: String::new(),
+            stderr: "the harness died".to_string(),
+            observations: vec![observed(0), observed(1)],
+        }
+    }
+
+    #[test]
+    fn a_run_without_its_completion_marker_is_refused() {
+        let run = run_with(None, Some(0), vec![0, 1]);
+        // Every observation is usable, which is exactly what makes this the
+        // dangerous case.
+        assert!(run.observations.iter().all(|o| o.status.usable()));
+        assert!(!run.complete());
+        let failure = run
+            .run_level_failure()
+            .expect("a run without its marker explains itself");
+        assert!(failure.contains("run-completion marker"), "{failure}");
+        assert!(failure.contains("dying"), "{failure}");
+    }
+
+    /// A completion count that disagrees with the batch size is refused.
+    #[test]
+    fn a_mismatched_completion_count_is_refused() {
+        let run = run_with(Some(1), Some(0), vec![0, 1]);
+        assert!(!run.complete());
+        assert!(run
+            .run_level_failure()
+            .expect("explains itself")
+            .contains("1 completed case(s) for a batch of 2"));
+    }
+
+    /// A matching *count* over the wrong case ids is refused: a profile would
+    /// not belong to the case it is named for.
+    #[test]
+    fn completing_the_wrong_cases_is_refused() {
+        let run = run_with(Some(2), Some(0), vec![0, 7]);
+        assert!(!run.complete());
+        assert!(run
+            .run_level_failure()
+            .expect("explains itself")
+            .contains("may not belong to the case it is named for"));
+    }
+
+    /// An abnormal exit is refused even when every profile is readable, and a
+    /// signal death is distinguished from a non-zero status.
+    #[test]
+    fn an_abnormal_exit_is_refused() {
+        let crashed = run_with(Some(2), Some(134), vec![0, 1]);
+        assert!(!crashed.complete());
+        let failure = crashed.run_level_failure().expect("explains itself");
+        assert!(failure.contains("exited 134"), "{failure}");
+        assert!(failure.contains("the harness died"), "{failure}");
+
+        let signalled = run_with(Some(2), None, vec![0, 1]);
+        assert!(!signalled.complete());
+        assert!(signalled
+            .run_level_failure()
+            .expect("explains itself")
+            .contains("terminated by a signal"));
+    }
+
+    /// A clean run is accepted, so the checks above are not vacuous.
+    #[test]
+    fn a_clean_run_is_accepted() {
+        let run = run_with(Some(2), Some(0), vec![0, 1]);
+        assert!(run.run_level_failure().is_none());
+        assert!(run.complete());
+        assert!(run.incompleteness().is_none());
+    }
+
+    /// Run-level and per-case evidence are separate: a finished process with
+    /// one unusable profile is incomplete for a different, reported reason.
+    #[test]
+    fn one_bad_profile_is_not_a_run_level_failure() {
+        let mut run = run_with(Some(2), Some(0), vec![0, 1]);
+        run.observations[1].status = ExecutionStatus::ProfileMissing;
+        run.observations[1].covered_regions = RegionSet::new();
+        assert!(
+            run.run_level_failure().is_none(),
+            "one bad profile must not be read as the process failing"
+        );
+        assert!(!run.complete());
+        assert!(run
+            .incompleteness()
+            .expect("explains itself")
+            .contains("no usable coverage"));
     }
 
     /// A run missing its baseline is incomplete, and says why.

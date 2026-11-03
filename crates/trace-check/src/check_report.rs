@@ -170,6 +170,13 @@ pub struct DiscoveryEvidence {
     pub termination: String,
     pub termination_detail: String,
     pub elapsed_ms: u128,
+    pub time_limit_ms: u128,
+    /// Whether the search took longer than its wall-clock safety limit.
+    ///
+    /// Not a failure, and not folded into `termination`: a run that spent its
+    /// whole candidate budget finished the work it was asked to do even if it
+    /// overran. It is reported so a reader never has to infer it.
+    pub overran_time_limit: bool,
     /// Candidates whose coverage could not be used, with the reason. Non-empty
     /// means the reported exploration is not the exploration performed.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -609,6 +616,14 @@ impl CheckReport {
                     discovery.termination,
                     discovery.termination_detail
                 );
+                if discovery.overran_time_limit {
+                    line!(
+                        "  OVERRAN:  {} ms against a {} ms wall-clock limit, which is checked at \
+                         round boundaries rather than enforced mid-round",
+                        discovery.elapsed_ms,
+                        discovery.time_limit_ms
+                    );
+                }
                 for failure in discovery.failures.iter().take(4) {
                     line!("  UNMEASURED: {failure}");
                 }

@@ -177,8 +177,16 @@ jobs:
           set -e
           test "$code" = "1" || { echo "expected exit 1 (leak detected), got $code"; exit 1; }
 
-      # M6: generated constant-time testing. No hand-written #[ct_test] and no
-      # container -- the annotation and the signature are the whole input.
+      # M6 and M7: generated constant-time testing, with coverage-guided
+      # exploration where the library's configuration enables it. No
+      # hand-written #[ct_test] and no container -- the annotation and the
+      # signature are the whole input.
+      #
+      # One authoritative run, two validators checking different properties of
+      # it: verify-m6-generated.py checks the controls, the corpus
+      # fingerprint, boundary coverage and every declared outcome;
+      # verify-m7-explore.py checks the discovery-specific evidence. Running
+      # the command twice would have measured the same thing twice.
       #
       # Exits 0 with the library's own configuration: its clean contracts are
       # security contracts that pass, and its deliberately vulnerable ones are
@@ -192,6 +200,8 @@ jobs:
             --all-configured --ci --format json \
             > "$GITHUB_WORKSPACE/m6-generated.json"
           python3 "$GITHUB_WORKSPACE/ci/verify-m6-generated.py" \
+            "$GITHUB_WORKSPACE/m6-generated.json"
+          python3 "$GITHUB_WORKSPACE/ci/verify-m7-explore.py" \
             "$GITHUB_WORKSPACE/m6-generated.json"
 
       # The policy split, asserted rather than assumed. The *same* function
@@ -265,22 +275,6 @@ jobs:
           grep -q 'hidden.rs:63' "$GITHUB_WORKSPACE/m7-with.txt"
           grep -q 'input from:' "$GITHUB_WORKSPACE/m7-with.txt"
 
-      # Every configured contract, with exploration where the configuration
-      # enables it. The validator checks the report's own claims rather than
-      # the exit code: that the two artifacts are distinct, that the discovery
-      # one marked nothing, that no candidate was silently unmeasurable, that
-      # every M6 case survived into the analyzed corpus, and that the clean
-      # control was reached as deeply as the vulnerable fixture and still found
-      # clean.
-      - name: Every configured contract is checked, with coverage-guided inputs
-        working-directory: examples/crypto-library
-        run: |
-          cargo run --locked --release -p cargo-trace-check -- check \
-            --all-configured --ci --format json \
-            > "$GITHUB_WORKSPACE/m7-explore.json"
-          python3 "$GITHUB_WORKSPACE/ci/verify-m7-explore.py" \
-            "$GITHUB_WORKSPACE/m7-explore.json"
-
       # A run asked to explore that cannot explore must fail. Falling back to
       # M6 generation would report a search it did not perform.
       - name: Missing coverage tools fail the run rather than falling back
@@ -350,7 +344,6 @@ jobs:
             mac-compare-screen.json
             native-memcheck.json
             m6-generated.json
-            m7-explore.json
 
   # M4: bounded relational verification. A separate job because its backend is
   # a container image rather than a package, and because it must not be able to

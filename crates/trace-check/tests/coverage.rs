@@ -20,6 +20,7 @@ use trace_check::harness::{self, Library, Workspace};
 use trace_check::native::Limits;
 
 const NESTED: &str = "crypto::hidden::nested_modes";
+const LEFT: &str = "crypto::shadow::left::probe";
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -109,6 +110,7 @@ impl Discovery {
             &self.artifact,
             &self.artifact_sha256,
             &library_manifest(),
+            &self.contract.module,
             &self.contract.function,
             Limits::default(),
         )
@@ -390,6 +392,86 @@ fn the_target_is_reported_as_invoked() {
     }
 }
 
+/// Coverage attribution is scoped to the contract's module, not its bare
+/// function name.
+///
+/// `crypto::shadow::left::probe` and `crypto::shadow::right::probe` have the
+/// same name, the same length-prefixed mangled component, and opposite
+/// behaviour -- one is a full-table scan, the other a secret-indexed load. A
+/// match on the function name alone, or on its component alone, counts both as
+/// the target.
+#[test]
+fn target_attribution_is_scoped_to_the_contracts_module() {
+    let Some(tools) = llvm_tools() else { return };
+    let library = Library::resolve(&library_manifest(), &[]).expect("the library resolves");
+    let workspace = Workspace::ephemeral().expect("a work directory");
+    let (work_dir, _) = workspace.directories_for(LEFT).expect("directories");
+    let target_dir = shared_target_dir();
+
+    // One artifact, built for the *left* contract, so only `left::probe` is
+    // ever called. `right::probe` still has a coverage record, because records
+    // are emitted before optimization for every function in the crate.
+    let left = harness::probe_contract(&library, LEFT, &work_dir, &target_dir)
+        .expect("the left contract resolves");
+    let generated = dynamic_harness::generate_discovery(&left).expect("a discovery harness");
+    let artifact = dynamic_harness::build(&library, &generated, LEFT, &work_dir, &target_dir)
+        .expect("the discovery artifact builds");
+    let corpus = generate::verbatim(
+        LEFT,
+        &left.descriptor,
+        &[vec![(
+            "key".to_string(),
+            Value::Scalar { bits: 8, value: 7 },
+        )]],
+    )
+    .expect("the case fits the contract");
+    let corpus_path =
+        dynamic_harness::stage_corpus(&corpus, &work_dir).expect("the corpus is staged");
+    let profile_dir = work_dir.join("profiles");
+
+    let collector = |module: &str| {
+        Collector::new(
+            &tools,
+            &artifact.path,
+            &artifact.sha256,
+            &library_manifest(),
+            module,
+            "probe",
+            Limits::default(),
+        )
+    };
+
+    // Each collector sees exactly one target record -- its own.
+    let for_left = collector("crypto::shadow::left");
+    let (left_map, left_run) = for_left
+        .probe_map(&corpus_path, 0, &profile_dir)
+        .expect("the coverage map is readable");
+    assert_eq!(
+        left_map.target_records, 1,
+        "the left contract matched {} record(s); a same-named sibling is being counted",
+        left_map.target_records
+    );
+
+    let for_right = collector("crypto::shadow::right");
+    let (right_map, right_run) = for_right
+        .probe_map(&corpus_path, 0, &profile_dir)
+        .expect("the coverage map is readable");
+    assert_eq!(right_map.target_records, 1);
+    // The same artifact, so the same map.
+    assert_eq!(left_map.id, right_map.id);
+
+    // And only the contract that actually ran reports its target invoked.
+    assert!(
+        left_run.observations[0].target_invoked,
+        "the called function must report being invoked"
+    );
+    assert!(
+        !right_run.observations[0].target_invoked,
+        "`right::probe` was never called, so attributing an invocation to it means a \
+         same-named sibling is being matched"
+    );
+}
+
 /// Damaged, missing and unvalidatable coverage evidence is each reported as
 /// its own status, and none of them contributes coverage.
 ///
@@ -525,6 +607,101 @@ fn the_last_case_profile_is_not_doubled() {
     );
 }
 
+/// Two concurrent explorations of the *same* contract both complete, each
+/// reading the artifact it built.
+///
+/// The regression this pins was a real CI failure. The Cargo target directory
+/// is shared so the library and its dependencies are not rebuilt per contract,
+/// but two runs of one contract produce the same package name and so the same
+/// output path — and a later `cargo build` relinks over it while an earlier run
+/// is still using it. Cargo's lock serializes the builds; it does not keep the
+/// previous build's output alive.
+///
+/// `llvm-cov export` needs *the exact executable that produced a profile*, so
+/// the symptom was `failed to load coverage: ...: No such file or directory`.
+/// The fail-closed decode reported that as unusable evidence rather than as
+/// zero coverage, which is why it surfaced as a test failure instead of a
+/// quietly shrunken search.
+#[test]
+fn concurrent_explorations_of_one_contract_do_not_disturb_each_other() {
+    let Some(tools) = llvm_tools() else { return };
+    // Built outside the threads, so the shared target directory is already
+    // populated and what the threads race on is the executable itself.
+    let _warm = prepare(NESTED, &ladder());
+
+    let outcomes: Vec<(String, usize, Option<String>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                scope.spawn(|| {
+                    let discovery = prepare(NESTED, &ladder());
+                    let collector = discovery.collector(&tools);
+                    let (map, _) = collector
+                        .probe_map(&discovery.corpus_path, 0, &discovery.profile_dir)
+                        .expect("the coverage map is readable");
+                    let run = collector
+                        .observe(
+                            &discovery.corpus_path,
+                            &[0, 1, 2, 3],
+                            &discovery.profile_dir,
+                            &map.id,
+                        )
+                        .expect("the batch runs");
+                    // Each thread reports the hash it built and the hash every
+                    // observation was attributed to, so a swapped artifact is
+                    // visible rather than merely survivable.
+                    for observation in &run.observations {
+                        assert_eq!(
+                            observation.artifact_sha256, discovery.artifact_sha256,
+                            "an observation was attributed to a different artifact"
+                        );
+                    }
+                    (
+                        discovery.artifact_sha256.clone(),
+                        run.observations.len(),
+                        run.incompleteness(),
+                    )
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("no thread panicked"))
+            .collect()
+    });
+
+    for (hash, observed, incompleteness) in &outcomes {
+        assert_eq!(*observed, 4, "a concurrent run lost observations");
+        assert!(
+            incompleteness.is_none(),
+            "a concurrent run was incomplete: {incompleteness:?}"
+        );
+        assert!(!hash.is_empty());
+    }
+    // The same source built twice is the same bytes, which is what makes the
+    // per-run copy a safety measure rather than a change of subject.
+    assert_eq!(
+        outcomes[0].0, outcomes[1].0,
+        "two builds of one contract produced different artifacts"
+    );
+}
+
+/// The analyzed executable is a private copy, not the one Cargo left in the
+/// shared target directory.
+#[test]
+fn the_analyzed_artifact_is_private_to_the_run() {
+    let discovery = prepare(NESTED, &ladder());
+    assert!(
+        !discovery.artifact.starts_with(shared_target_dir()),
+        "the analyzed artifact is still inside the shared target directory: {}",
+        discovery.artifact.display()
+    );
+    assert!(discovery.artifact.is_file());
+    // And its bytes are the ones the recorded hash describes.
+    let bytes = std::fs::read(&discovery.artifact).expect("the artifact is readable");
+    let hash = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(&bytes));
+    assert_eq!(hash, discovery.artifact_sha256);
+}
+
 /// The discovery harness marks no secret and does not depend on the marking
 /// crate, so it cannot be the source of a security claim.
 #[test]
@@ -605,6 +782,7 @@ fn the_security_artifact_has_no_coverage_map() {
         &artifact.path,
         &artifact.sha256,
         &library_manifest(),
+        &contract.module,
         &contract.function,
         Limits::default(),
     );

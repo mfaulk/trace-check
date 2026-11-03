@@ -506,6 +506,14 @@ vulnerability class and a strategy that never varied the secret could not reach
 the region behind one. A seed changes which values are tried; it can never
 change which parameter is secret.
 
+**Attribution is qualified.** A coverage record is matched against the
+contract's whole module path plus function, as length-prefixed mangled
+components. Matching the bare name would confuse `substitute` with
+`substitute_indexed`; matching the function component alone still ignores module
+identity, so two same-named functions in different modules would both count as
+the target. `crypto::shadow::left::probe` and `crypto::shadow::right::probe`
+are the control — same name, opposite verdicts.
+
 **What it will not find.** The available feedback is LLVM *source regions* —
 branch coverage, edge coverage and comparison tracing all need a nightly
 toolchain, and the report says so in those words rather than implying a finer

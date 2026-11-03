@@ -253,3 +253,20 @@ expected_outcome = "LEAK_DETECTED"
 enabled = true
 candidate_budget = 1500
 security_case_budget = 128
+
+# ---------------------------------------------------------------------------
+# Attribution controls: two functions named `probe` in different modules, one
+# safe and one vulnerable. A coverage or finding match that ignored the module
+# path would conflate them, which is the difference between a clean result and
+# a leak.
+# ---------------------------------------------------------------------------
+
+[check."crypto::shadow::left::probe"]
+description = "attribution control: the safe `probe`"
+rationale = "must stay NO_LEAK_OBSERVED even though a function with the same bare name, and the same length-prefixed mangled component, performs a secret-indexed load in a sibling module"
+
+[check."crypto::shadow::right::probe"]
+description = "attribution control: the vulnerable `probe`"
+rationale = "the same name as the entry above, in a sibling module, with the opposite verdict"
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"

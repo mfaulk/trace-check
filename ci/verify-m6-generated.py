@@ -23,17 +23,50 @@ CLEAN = {
     "crypto::controls::public_branch",
     "crypto::reduce::reduce_once",
     "crypto::reduce::reduce_once_masked",
+    # M7's false-positive control: the same three-predicate shape as
+    # `hidden::nested_modes` guarding a *safe* region. Exploration reaches it
+    # just as deeply and must still find nothing.
+    "crypto::hidden::nested_modes_clean",
+    # M7's attribution control: a `probe` that is safe, beside a `probe` in a
+    # sibling module that is not.
+    "crypto::shadow::left::probe",
 }
 
 # Contracts the library contains on purpose so trace-check can be held to
 # detecting them. Each must be declared as an analyzer regression, never as a
 # security contract with a convenient expectation.
+#
+# Four of these are reached only because the library's configuration enables
+# coverage-guided exploration for them: `hidden::nested_modes` and
+# `hidden::header_gate` are unreachable by M6's generator at any budget (proved
+# in crates/trace-check/tests/baseline.rs), so with `--no-explore` they
+# honestly report NO_LEAK_OBSERVED and their declared outcome goes unmet. This
+# validator therefore describes a run made with the library's own
+# configuration, which is what CI produces.
 VULNERABLE = {
     "crypto::tag::verify_tag_early_exit",
     "crypto::tag::verify_tag_volatile_early_exit",
     "crypto::lookup::substitute_indexed",
     "crypto::lookup::substitute_mode",
     "crypto::controls::tail_byte_probe",
+    "crypto::hidden::nested_modes",
+    "crypto::hidden::header_gate",
+    "crypto::hidden::threshold_window",
+    "crypto::hidden::secret_gated",
+    "crypto::shadow::right::probe",
+}
+
+# Contracts that are vulnerable but that this toolchain's analysis is **not
+# expected to reach**, declared so the gap is asserted rather than left
+# implicit. `hidden::magic_gate` hides its leak behind an exact 32-bit
+# equality, and LLVM source-region feedback offers no gradient toward one
+# constant -- measured in docs/spikes/m7-coverage-feedback.
+#
+# A third category rather than a special case in the second: "we detect this"
+# and "we have recorded that we do not detect this" are different claims, and
+# collapsing them would let a real regression hide as a declared limitation.
+RECORDED_GAP = {
+    "crypto::hidden::magic_gate",
 }
 
 
@@ -53,7 +86,10 @@ def main():
         fail(f"unexpected backend {report.get('backend')!r}")
 
     entries = {entry["contract"]: entry for entry in report["contracts"]}
-    expected = CLEAN | VULNERABLE
+    overlap = (CLEAN & VULNERABLE) | (CLEAN & RECORDED_GAP) | (VULNERABLE & RECORDED_GAP)
+    if overlap:
+        fail(f"these contracts are classified twice by this validator: {sorted(overlap)}")
+    expected = CLEAN | VULNERABLE | RECORDED_GAP
     missing = expected - entries.keys()
     if missing:
         fail(f"these contracts were not checked: {sorted(missing)}")
@@ -120,7 +156,29 @@ def main():
                     "boundary floor is supposed to make that impossible"
                 )
 
-        if name in CLEAN:
+        if name in RECORDED_GAP:
+            # A declared limitation. It must be an analyzer regression -- a
+            # security contract cannot declare that a leak is acceptable -- and
+            # it must still produce the outcome it declares. If it starts being
+            # detected that is good news, and it requires
+            # docs/MILESTONE-07.md and the configuration to be revised rather
+            # than silently absorbed.
+            if entry["expectation"] != "analyzer-regression":
+                fail(
+                    f"{name} records a known gap and must be an analyzer regression, not "
+                    f"{entry['expectation']!r}"
+                )
+            if check["outcome"] == "LEAK_DETECTED":
+                fail(
+                    f"{name} was detected. That is an improvement, not a pass: this validator, "
+                    "examples/crypto-library/trace-check.toml and the comparison-guidance "
+                    "analysis in docs/MILESTONE-07.md all have to be updated"
+                )
+            if check["outcome"] != "NO_LEAK_OBSERVED":
+                fail(f"{name}: expected NO_LEAK_OBSERVED, got {check['outcome']}")
+            if entry["policy"] != "satisfied":
+                fail(f"{name}: {entry['policy']} -- {entry['policy_detail']}")
+        elif name in CLEAN:
             if entry["expectation"] != "security-contract":
                 fail(
                     f"{name} is constant-time and must be checked as a security "
@@ -176,7 +234,8 @@ def main():
 
     print(
         f"verify-m6-generated: {len(entries)} contract(s) checked, "
-        f"{len(CLEAN)} clean and {len(VULNERABLE)} detected as declared"
+        f"{len(CLEAN)} clean, {len(VULNERABLE)} detected and "
+        f"{len(RECORDED_GAP)} recorded gap(s), all as declared"
     )
     return 0
 

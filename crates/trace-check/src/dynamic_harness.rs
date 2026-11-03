@@ -893,14 +893,59 @@ pub fn build(
             stderr: "cargo reported no executable for the generated harness".to_string(),
         })?;
 
+    // The analyzed executable is **copied out** of the target directory, and
+    // everything downstream uses the copy.
+    //
+    // Cargo's target directory is shared on purpose — rebuilding the library
+    // and its dependencies per contract dominates an otherwise slow run — but
+    // that makes the executable path shared mutable state. Two runs of the same
+    // contract produce the same package name and so the same output path, and a
+    // later `cargo build` *relinks over* it while an earlier run is still using
+    // it. Cargo's lock serializes the builds; it does not keep the previous
+    // build's output alive.
+    //
+    // For the security artifact that would mean Valgrind re-running a different
+    // binary during isolation or shrinking. For the discovery artifact it is
+    // worse, because `llvm-cov export` needs *the exact executable that
+    // produced a profile* to read its coverage map — observed in CI as
+    // `failed to load coverage: ...: No such file or directory`, which the
+    // fail-closed decode correctly reported as unusable evidence rather than as
+    // zero coverage.
+    //
+    // The copy lives in the run's own work directory, so an artifact hash
+    // describes a file nothing else can replace for as long as it is needed.
     let bytes =
         std::fs::read(&path).map_err(|e| DynamicError::Io(format!("{}: {e}", path.display())))?;
+    let private = crate_dir.join(path.file_name().ok_or_else(|| DynamicError::Build {
+        stderr: format!("cargo reported {} as an executable", path.display()),
+    })?);
+    // `copy` preserves the permission bits, so the copy stays executable.
+    std::fs::copy(&path, &private).map_err(|e| {
+        DynamicError::Io(format!(
+            "cannot copy the built artifact to {}: {e}",
+            private.display()
+        ))
+    })?;
+    // Read back and compare: a truncated or concurrently-overwritten copy must
+    // not be analyzed under a hash describing different bytes.
+    let copied = std::fs::read(&private)
+        .map_err(|e| DynamicError::Io(format!("{}: {e}", private.display())))?;
+    if copied != bytes {
+        return Err(DynamicError::Build {
+            stderr: format!(
+                "the private copy of the built artifact at {} does not match the {} bytes cargo \
+                 produced, so the executable changed while it was being copied",
+                private.display(),
+                bytes.len()
+            ),
+        });
+    }
     let lockfile_sha256 = std::fs::read(crate_dir.join("Cargo.lock"))
         .map(|bytes| format!("{:x}", Sha256::digest(&bytes)))
         .unwrap_or_else(|_| "unavailable".to_string());
     Ok(Artifact {
         sha256: format!("{:x}", Sha256::digest(&bytes)),
-        path,
+        path: private,
         lockfile_sha256,
     })
 }
