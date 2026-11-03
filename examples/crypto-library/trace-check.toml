@@ -241,3 +241,15 @@ cases = 200
 enabled = true
 candidate_budget = 1500
 security_case_budget = 128
+
+[check."crypto::hidden::header_gate"]
+description = "the second coverage-guidance test: a leak behind three fields of one public header"
+rationale = "harder for M6 than nested_modes: boundary generation sets a byte array to whole patterns, so one pattern would have to satisfy all three fields at once and none does, and the pairwise stage varies two parameters while all three conditions live in one. Coverage feedback sweeps byte positions and climbs the fields one at a time"
+cases = 64
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"
+
+[check."crypto::hidden::header_gate".explore]
+enabled = true
+candidate_budget = 1500
+security_case_budget = 128

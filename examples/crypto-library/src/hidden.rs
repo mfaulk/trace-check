@@ -135,3 +135,40 @@ pub fn nested_modes_clean(index: u8, stage: u8, gate: u8, trigger: u8) -> u8 {
     // full-table scan.
     substitute(index ^ 0x0f)
 }
+
+/// Vulnerable behind a public **header** that must match in three fields.
+///
+/// The same class as [`nested_modes`] in a different representation, which is
+/// why both are here: this one's conditions are fields of one `[u8; 8]`
+/// parameter rather than three separate scalars, so reaching it exercises the
+/// byte-array mutation operators and the per-position sweep instead of the
+/// scalar ones.
+///
+/// It is also *harder* for M6 than `nested_modes` is, for a structural reason.
+/// Boundary generation sets a byte array to whole patterns — all zeros, all
+/// ones, the two alternating phases, one-hot in the first and last byte, and a
+/// walking bit through the first — so a single pattern would have to satisfy
+/// all three fields at once, and none does. The pairwise stage cannot help
+/// either: it varies two *parameters*, and all three conditions live in one.
+///
+/// The shape is deliberately mundane — a version nibble, a flags nibble, and a
+/// trailing marker — because that is what real parsing code checks, and the
+/// point is that ordinary input validation is enough to hide a leak from
+/// generated inputs.
+#[constant_time(secret = "key")]
+pub fn header_gate(key: u8, header: &[u8; 8]) -> u8 {
+    // A version nibble.
+    if header[0] >> 4 != 0x3 {
+        return substitute(key);
+    }
+    // A flags nibble in a different byte.
+    if header[1] & 0xf0 != 0xc0 {
+        return substitute(key);
+    }
+    // A trailing marker, which is also what makes the *last* swept byte
+    // position load-bearing rather than decorative.
+    if header[7] != 0x7f {
+        return substitute(key);
+    }
+    substitute_indexed(key)
+}

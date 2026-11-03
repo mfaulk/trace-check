@@ -2260,6 +2260,42 @@ mod tests {
         assert!(selection.selected.contains(&11));
     }
 
+    /// A replayed reproducer keeps its priority under exploration.
+    ///
+    /// M6 replays persisted failures ahead of every generated strategy, so they
+    /// arrive as mandatory baseline cases carrying `Strategy::Regression`.
+    /// Selection must keep them, keep them first, and keep their label — a
+    /// known failure is worth more than a new guess, and a corpus that
+    /// relabelled one would lose that.
+    #[test]
+    fn a_replayed_reproducer_keeps_its_priority_and_its_label() {
+        let mut regression = candidate(0, true, &[1]);
+        regression.origin = Origin::Baseline {
+            strategy: Strategy::Regression,
+        };
+        let exploration = exploration_of(vec![
+            regression,
+            candidate(1, true, &[1]),
+            candidate(10, false, &[2]),
+        ]);
+        // A budget of zero explored cases, which is the hostile case: the
+        // reproducer must survive even when exploration gets nothing.
+        let selection = select(&exploration, 0);
+        assert_eq!(selection.selected.first(), Some(&0));
+        assert_eq!(selection.mandatory, 2);
+        assert_eq!(selection.by_coverage, 0);
+
+        let descriptor = descriptor(NESTED);
+        let corpus = security_corpus(NESTED, &descriptor, &exploration, &selection)
+            .expect("the selection converts");
+        assert_eq!(corpus.cases[0].id, 0);
+        assert_eq!(
+            corpus.cases[0].strategy,
+            Strategy::Regression,
+            "a replayed reproducer was relabelled on the way to the backend"
+        );
+    }
+
     /// A mandatory case with no coverage is still selected: it is M6's case,
     /// and its place in the corpus does not depend on a coverage measurement.
     #[test]

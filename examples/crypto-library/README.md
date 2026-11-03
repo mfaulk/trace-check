@@ -1,4 +1,4 @@
-# crypto-library — one implementation, three analyses
+# crypto-library — one implementation, several analyses
 
 An ordinary `no_std` Rust library. Nothing in it is a verification harness and
 nothing in it is written for an analyzer: each function is defined once, in
@@ -10,6 +10,9 @@ cargo trace-check test
 
 # M6: dynamic, under Valgrind Memcheck. Generates the inputs itself.
 cargo trace-check check --all-configured
+
+# M7: the same, with coverage feedback choosing which inputs to analyze.
+cargo trace-check check --contract crypto::hidden::nested_modes --explore
 
 # M5: symbolic, under BINSEC. Searches a declared domain for a secret
 # assignment that leaks.
@@ -38,6 +41,8 @@ correct ones, so a **full** run of either command exits nonzero by design.
 | `cargo trace-check verify --contract crypto::tag::verify_tag` | 0 | `VERIFIED_BOUNDED`, as declared |
 | `cargo trace-check check --all-configured --ci` | 0 | the clean contracts are security contracts that pass; the vulnerable ones are declared `analyzer-regression`, so detecting their planted leaks is those fixtures passing |
 | `cargo trace-check check --contract crypto::lookup::substitute_mode` | 0 | `LEAK_DETECTED`, as that fixture declares |
+| `cargo trace-check check --contract crypto::hidden::nested_modes --no-explore` | 2 | `NO_LEAK_OBSERVED`: the leak is real and on a path generated inputs cannot construct, so the fixture's declared `LEAK_DETECTED` goes unmet |
+| `cargo trace-check check --contract crypto::hidden::nested_modes --explore` | 0 | coverage feedback reaches it, and Memcheck confirms it |
 
 `verify` exits 0 on a reproduced `LEAK_DETECTED` because the declared
 expectation was met: the security of the function and the pass/fail of the
@@ -66,6 +71,36 @@ nothing — which is honest, and useless. `check` generates inputs from the
 annotation and reaches the other path without anyone naming it, then narrows the
 finding back to the single input that caused it.
 
+## The contract `--explore` exists for
+
+`substitute_mode` needs one public value, and M6's boundary stage supplies it.
+`hidden::nested_modes` needs **three** at once, and two of the three are not
+`u8` boundary values at all — so boundary generation, which moves one parameter
+away from base, and pairwise generation, which moves two, cannot construct a
+reaching input **at any budget**. `crates/trace-check/tests/baseline.rs` proves
+that rather than assuming it.
+
+Coverage feedback gets there because it does not have to satisfy all three at
+once: satisfying the first predicate reaches a region nothing else reached, so
+that input is kept as a seed and the search for the second starts from it. The
+conjunction is climbed one conjunct at a time.
+
+`hidden::nested_modes_clean` is the control that keeps this honest — the same
+three-predicate shape guarding a *safe* region. Exploration reaches it just as
+deeply and the security backend still reports `NO_LEAK_OBSERVED`.
+
+`hidden::header_gate` is the same class in a different representation, and
+harder: its three conditions are fields of a *single* byte-array parameter, and
+boundary generation sets such a parameter to whole patterns — so one pattern
+would have to satisfy all three at once, and none satisfies even the first. The
+pairwise stage varies two *parameters*, which does not help when all three
+conditions live in one.
+
+`hidden::magic_gate` is the recorded limit. Region coverage offers no gradient
+toward an exact 32-bit equality, so it is declared
+`expected_outcome = "NO_LEAK_OBSERVED"`: the gap is asserted rather than left
+implicit, and CI fails if it changes in either direction.
+
 ## The contracts
 
 | Contract | What it is | Symbolic outcome |
@@ -80,6 +115,19 @@ finding back to the single input that caused it.
 | `controls::public_branch` | branches on a public input only | `VERIFIED_BOUNDED` |
 | `reduce::reduce_once` | conditional subtraction over a `u32` secret, with a branch | `VERIFIED_BOUNDED` — the compiler used a conditional move |
 | `reduce::reduce_once_masked` | the same reduction with a mask | `VERIFIED_BOUNDED` |
+
+The `hidden` module is M7's benchmark corpus, written before the
+coverage-guided algorithm so the algorithm could not be tailored to it. It is
+not verified symbolically:
+
+| Contract | What it is | Reached by |
+| --- | --- | --- |
+| `hidden::nested_modes` | a leak behind three public predicates | coverage feedback only |
+| `hidden::header_gate` | a leak behind three fields of one `[u8; 8]` header | coverage feedback only |
+| `hidden::nested_modes_clean` | the same shape, safe region | false-positive control |
+| `hidden::magic_gate` | a leak behind `token == 0x5a17c0de` | neither strategy |
+| `hidden::threshold_window` | a leak above a power-of-two threshold | M6 boundaries, and M7 must not lose it |
+| `hidden::secret_gated` | a leak reachable only for some secret values | keeps secret mutation honest |
 
 ### Two of these are findings about the compiler, not about the source
 

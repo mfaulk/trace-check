@@ -39,7 +39,7 @@ mod tests {
 
     // `#[ct_test(target = "tag::verify_tag")]` resolves the contract's paths
     // relative to this module, so the modules have to be in scope here.
-    use crate::{controls, lookup, reduce, tag};
+    use crate::{controls, hidden, lookup, reduce, tag};
 
     /// A tag built at run time. A compile-time constant would let the
     /// optimizer pass an immediate and never read the marked storage, which is
@@ -170,6 +170,67 @@ mod tests {
 
     fn secret_value() -> u32 {
         u32::from_le_bytes([secret_tag()[0], secret_tag()[1], 0x10, 0x20])
+    }
+
+    // ----------------------------------------------------------------
+    // The `hidden` fixtures. Every declared contract needs a covering
+    // check, because a contract that quietly stops being accounted for is
+    // the failure mode this project exists to prevent -- so these exist
+    // even where the honest result is that they observe nothing.
+    //
+    // That is not a formality. `nested_modes_observes_nothing_...` below is
+    // the M7 analogue of `substitute_mode_observes_nothing_on_the_safe_path`:
+    // a hand-written check passes the inputs its author thought of, the leak
+    // is on a path those inputs do not reach, and the honest result is
+    // NO_LEAK_OBSERVED. `cargo trace-check check --explore` is what finds it.
+    // ----------------------------------------------------------------
+
+    /// Three public predicates guard the leak, and these inputs satisfy none:
+    /// nothing is observed, which is honest and useless.
+    #[ct_test(target = "hidden::nested_modes")]
+    fn nested_modes_observes_nothing_without_a_reaching_input() {
+        let produced = hidden::nested_modes_ct(secret_index(), 0, 0, 0);
+        assert_eq!(produced, lookup::substitute(secret_index()));
+    }
+
+    /// The same, for the header-shaped fixture: an all-zero header fails the
+    /// version field, so the leak is never reached.
+    #[ct_test(target = "hidden::header_gate")]
+    fn header_gate_observes_nothing_without_a_matching_header() {
+        let header = [0u8; 8];
+        let produced = hidden::header_gate_ct(secret_index(), &header);
+        assert_eq!(produced, lookup::substitute(secret_index()));
+    }
+
+    /// Guessing a 32-bit constant is not something a hand-written test does,
+    /// and neither coverage feedback nor random generation does it either.
+    #[ct_test(target = "hidden::magic_gate")]
+    fn magic_gate_observes_nothing_without_the_token() {
+        let produced = hidden::magic_gate_ct(secret_index(), 0);
+        assert_eq!(produced, lookup::substitute(secret_index()));
+    }
+
+    /// The window above the threshold *is* guessable, and this test guesses
+    /// it, so the leak is expected to be detected here.
+    #[ct_test(target = "hidden::threshold_window")]
+    fn threshold_window_leaks_inside_the_window() {
+        let produced = hidden::threshold_window_ct(secret_index(), hidden::THRESHOLD + 1);
+        assert_eq!(produced, lookup::substitute_indexed(secret_index()));
+    }
+
+    /// Reaching the secret-dependent branch needs both the public mode and a
+    /// secret with its two high bits set, so this test supplies both.
+    #[ct_test(target = "hidden::secret_gated")]
+    fn secret_gated_leaks_for_a_high_secret() {
+        let _ = hidden::secret_gated_ct(secret_index() | 0xc0, 2);
+    }
+
+    /// The false-positive control: the guarded region is safe, so no finding
+    /// is expected whether or not the predicates are satisfied.
+    #[ct_test(target = "hidden::nested_modes_clean")]
+    fn nested_modes_clean_is_constant_time() {
+        let produced = hidden::nested_modes_clean_ct(secret_index(), 0x0a, 0x30, 0x5a);
+        assert_eq!(produced, lookup::substitute(secret_index() ^ 0x0f));
     }
 
     /// `assert_constant_time!` still works without a contract, for a secret

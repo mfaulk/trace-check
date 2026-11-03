@@ -553,7 +553,15 @@ impl<'a> Collector<'a> {
             nonce.clone(),
             profile_dir.display().to_string(),
         ];
-        let run = native::run_process(&self.artifact, &args, self.limits)
+        // A case rejected by the decoders exits before the harness sets a
+        // filename, and the profiling runtime's at-exit write would then land
+        // in the developer's working directory. Pointing the default path into
+        // the profile directory keeps every write the run can make inside it.
+        let env = vec![(
+            dynamic_harness::PROFILE_FILE_ENV.to_string(),
+            profile_dir.join("default-%p.profraw").display().to_string(),
+        )];
+        let run = native::run_process(&self.artifact, &args, &env, self.limits)
             .map_err(|e| CoverageError::Run(e.to_string()))?;
 
         let completed = dynamic_harness::completed_cases(&run.stdout, &nonce);

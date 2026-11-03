@@ -9,8 +9,9 @@
 //! under `TRACE_CHECK_REQUIRE_BACKEND`, which CI sets.
 //!
 //! Nothing here asserts anything about constant-time behavior. Exploration
-//! selects inputs; `tests/dynamic.rs` and `tests/generated.rs` are where a leak
-//! is actually established, in the uninstrumented security artifact.
+//! selects inputs; `tests/dynamic.rs` and `crates/cargo-trace-check/tests/explore.rs`
+//! are where a leak is actually established, in the uninstrumented security
+//! artifact.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -25,6 +26,7 @@ use trace_check::native::Limits;
 
 const NESTED: &str = "crypto::hidden::nested_modes";
 const MAGIC: &str = "crypto::hidden::magic_gate";
+const HEADER: &str = "crypto::hidden::header_gate";
 const TAG: &str = "crypto::tag::verify_tag";
 
 fn workspace_root() -> PathBuf {
@@ -121,6 +123,20 @@ fn scalar(inputs: &[(String, Value)], name: &str) -> u64 {
     }
 }
 
+/// `header_gate`'s three header fields, which must hold together.
+fn reaches_header_leak(inputs: &[(String, Value)]) -> bool {
+    let bytes = match inputs
+        .iter()
+        .find(|(parameter, _)| parameter == "header")
+        .map(|(_, value)| value)
+        .expect("`header` is a parameter")
+    {
+        Value::Bytes { bytes } => bytes.clone(),
+        other => panic!("`header` is a byte array, got {other:?}"),
+    };
+    bytes[0] >> 4 == 0x3 && bytes[1] & 0xf0 == 0xc0 && bytes[7] == 0x7f
+}
+
 /// `nested_modes`' three-predicate conjunction, the path M6 cannot construct.
 fn reaches_nested_leak(inputs: &[(String, Value)]) -> bool {
     scalar(inputs, "stage") & 0x0f == 0x0a
@@ -177,6 +193,56 @@ fn exploration_reaches_the_leak_m6_cannot_construct() {
         "exploration was not complete: {:?}",
         exploration.incompleteness()
     );
+}
+
+/// The second hidden-path fixture, whose conditions are fields of one
+/// byte-array parameter rather than separate scalars.
+///
+/// A different mutation path from `nested_modes`: the per-position sweep over a
+/// `[u8; 8]` rather than the scalar operators. `tests/baseline.rs` proves no
+/// byte-array boundary pattern satisfies even the first of its three fields, so
+/// M6 cannot reach it at any budget.
+#[test]
+fn exploration_reaches_a_leak_behind_one_structured_parameter() {
+    if llvm_tools().is_none() {
+        return;
+    }
+    let settings = ExploreSettings {
+        candidate_budget: 1_500,
+        seed: 2_024,
+        ..ExploreSettings::default()
+    };
+    let (_, exploration) = run(HEADER, &settings, 64);
+
+    let reaching: Vec<&explore::Candidate> = exploration
+        .candidates
+        .iter()
+        .filter(|candidate| reaches_header_leak(&candidate.inputs))
+        .collect();
+    assert!(
+        !reaching.is_empty(),
+        "exploration attempted {} candidate(s) in {} round(s) and reached none of the three \
+         header fields together. Termination: {}. Regions: {} baseline, {} total",
+        exploration.candidates_attempted,
+        exploration.rounds,
+        exploration.termination.describe(),
+        exploration.baseline_regions,
+        exploration.regions_reached
+    );
+    assert!(
+        reaching
+            .iter()
+            .any(|candidate| matches!(candidate.origin, Origin::Mutated { .. })),
+        "the reaching candidate came from the baseline, which contradicts tests/baseline.rs"
+    );
+    // Every byte array still has its declared width.
+    for candidate in &exploration.candidates {
+        match &candidate.inputs[1].1 {
+            Value::Bytes { bytes } => assert_eq!(bytes.len(), 8),
+            other => panic!("`header` became {other:?}"),
+        }
+    }
+    assert!(exploration.complete(), "{:?}", exploration.incompleteness());
 }
 
 /// The same seed, artifact and budget produce an identical retained corpus.

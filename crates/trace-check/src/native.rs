@@ -777,10 +777,11 @@ pub struct ProcessRun {
 pub fn run_process(
     program: &Path,
     args: &[String],
+    env: &[(String, String)],
     limits: Limits,
 ) -> Result<ProcessRun, NativeError> {
     let rendered = render(program, args);
-    let captured = run_bounded_with_env(program, args, &[], limits, &rendered)?;
+    let captured = run_bounded_with_env(program, args, env, limits, &rendered)?;
     Ok(ProcessRun {
         stdout: captured.stdout,
         stderr: captured.stderr,

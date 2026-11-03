@@ -161,6 +161,13 @@ enum Command {
         /// conclusion still comes from the uninstrumented Memcheck artifact.
         #[arg(long, conflicts_with = "replay")]
         explore: bool,
+        /// Skip exploration even where trace-check.toml enables it.
+        ///
+        /// The flag a fair M6-versus-M7 comparison needs: the same contract,
+        /// the same budget, the same backend, and exploration as the only
+        /// difference.
+        #[arg(long, conflicts_with_all = ["replay", "explore"])]
+        no_explore: bool,
         /// Mutation candidates per contract. Implies --explore.
         #[arg(long, conflicts_with = "replay")]
         explore_cases: Option<usize>,
@@ -267,6 +274,7 @@ fn execute(cli: Cli) -> Result<u8, String> {
             batch_size,
             no_shrink,
             explore,
+            no_explore,
             explore_cases,
             security_cases,
             reproducer_dir,
@@ -287,10 +295,14 @@ fn execute(cli: Cli) -> Result<u8, String> {
                 // Absent unless the flag was passed, so a configured `shrink`
                 // is only ever overridden deliberately.
                 shrink: if no_shrink { Some(false) } else { None },
-                // `--explore` turns exploration on; its absence leaves the
-                // configuration alone rather than turning it off, so a
-                // contract that enabled it in trace-check.toml keeps it.
-                explore: if explore { Some(true) } else { None },
+                // Absent unless a flag was passed, so a contract that enabled
+                // exploration in trace-check.toml keeps it. `--no-explore`
+                // turns it off deliberately.
+                explore: match (explore, no_explore) {
+                    (true, _) => Some(true),
+                    (_, true) => Some(false),
+                    _ => None,
+                },
                 explore_cases,
                 security_cases,
             },
