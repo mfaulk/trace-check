@@ -325,3 +325,41 @@ Instrumentation changes code generation, so a region reached during discovery
 may be reached by different instructions, or not at all, in the optimized build.
 A finding stands regardless of how its input was chosen; a clean result never
 claims the discovery artifact's paths were verified.
+
+## Accounting for every declaration
+
+Milestone 8 does not add an analysis. It adds the guarantee that a declared
+requirement cannot escape the ones that exist, which is a different kind of
+property and has its own procedure.
+
+[docs/MILESTONE-08.md](MILESTONE-08.md) covers the inventory mechanism, the
+policy model and the limits. The procedure, in the order a run performs it:
+
+1. Build the library with `lto = off` in trace-check's own target directory, and
+   read every `#[constant_time]` record out of the resulting `rlib` by parsing
+   the archive and its ELF objects. Nothing is executed: the records are
+   ordinary object data emitted by a `#[used]` static.
+2. Refuse the inventory if anything could not be read. An archive with object
+   members but none readable — what an LTO build produces — is an error, never
+   an empty inventory, because "nothing declared" and "nothing read" would
+   otherwise be indistinguishable and the second would clear every contract it
+   failed to see.
+3. Resolve the policy against that inventory, before any backend runs, so an
+   unsupported signature, a missing analyzer, an unconfigured symbolic
+   requirement and an unselected contract are all reported up front. Every
+   required analysis gets a status here, so none can be absent from the
+   accounting later.
+4. Apply waivers at this point, where no analysis has run and no violation can
+   yet be known.
+5. Run the outstanding analyses and fold their evidence in. A detected leak
+   overwrites any status including a waiver; nothing overwrites a leak.
+6. Report inventory completeness, enforcement and evidence as three separate
+   things.
+
+The ordering in steps 4 and 5 is the whole design of waivers: a waiver can
+excuse *not looking*, and cannot excuse what looking found.
+
+The boundary to keep in mind is that this accounts for *declarations*. It says
+nothing about functions nobody declared, which is the one gap no amount of
+enforcement can close — only a human deciding that a function handles a secret
+can open it.

@@ -21,7 +21,7 @@ the formal noninterference property, and the roadmap.
 | M5 | Verifying the real functions in a Cargo library | complete, experimental |
 | M6 | Generated constant-time testing and CI enforcement | complete, experimental |
 | M7 | Coverage-guided leakage discovery | complete, experimental |
-| M8 | Compiler and build-profile regression analysis | future |
+| M8 | Complete contract coverage and enforcement | complete, experimental |
 | M9 | Hardware-oriented validation — statistical timing | future |
 
 `trace-check` turns that idea into reproducible analysis, from five directions:
@@ -65,6 +65,8 @@ the formal noninterference property, and the roadmap.
 cargo trace-check test                           # your own crate's checks (M3)
 cargo trace-check check --contract my_crate::verify_tag    # generated inputs (M6)
 cargo trace-check check --contract my_crate::verify_tag --explore  # coverage-guided (M7)
+cargo trace-check check --all-contracts --ci     # every declaration, enforced (M8)
+cargo trace-check coverage                       # which contracts owe what (M8)
 cargo trace-check verify --contract my_crate::verify_tag   # your real function (M5)
 cargo trace-check verify                         # bundled standalone cases (M4)
 cargo run -p trace-check -- native               # native, under Memcheck
@@ -327,6 +329,7 @@ Observed event counts for `early_exit_opaque`, by mismatch position:
 ```sh
 cargo trace-check check --contract crypto::lookup::substitute_mode
 cargo trace-check check --all-configured --ci
+cargo trace-check check --all-contracts --ci                        # M8
 cargo trace-check check --contract my_crate::verify_tag --cases 128 --seed 12345
 cargo trace-check check --contract my_crate::verify_tag --explore   # M7
 cargo trace-check check --replay failure.json
@@ -525,6 +528,112 @@ coverage. `crypto::hidden::magic_gate` records that gap as a declared
 See [docs/MILESTONE-07.md](docs/MILESTONE-07.md) for the measurements, and
 [docs/spikes/m7-coverage-feedback/](docs/spikes/m7-coverage-feedback/README.md)
 for the reproducible feasibility experiments.
+
+#### `--all-contracts` — enforce every declaration (M8)
+
+```sh
+cargo trace-check check --all-contracts --ci
+```
+
+`--all-configured` selects **configuration keys**. A contract with no
+`[check."…"]` entry was therefore not merely unchecked — it was *invisible*, and
+a run that never considered it reported success.
+
+`--all-contracts` selects **declarations**. `#[constant_time]` emits a record
+into the compiled library, and the inventory reads every record back, so a new
+annotation is enforced from the moment it compiles — no configuration entry, no
+test, no registry to remember.
+
+| Flag | Meaning |
+| --- | --- |
+| `--all-contracts` | every `#[constant_time]` declaration in the selected build |
+| `--all-configured` | every explicitly configured generated check (M6's meaning, unchanged) |
+
+The two stay distinct: reinterpreting the first would silently change what an
+existing CI job enforces, so `--all-contracts` emits its own schema-2 report.
+
+**Every contract is accounted for, even one the tool cannot analyze.** Each
+declaration gets an explicit status per required analysis:
+
+| Status | Meaning |
+| --- | --- |
+| `CHECKED` | the required analysis completed and passed |
+| `LEAK_DETECTED` | the required security property was violated |
+| `INCONCLUSIVE` | it ran and did not establish the required outcome |
+| `UNSUPPORTED` | the signature cannot be analyzed by that backend |
+| `NOT_SELECTED` | applicable, and left out of the run |
+| `NOT_ANALYZED` | required, runnable, and no backend reported a result |
+| `BACKEND_UNAVAILABLE` | the analyzer or instrumentation is absent |
+| `EXEMPTED` | an explicit, policy-approved waiver |
+
+A status is *not* a security outcome. It says whether a required analysis
+happened; what it observed is reported separately as evidence, in the backends'
+own vocabulary, so `NO_LEAK_OBSERVED` and `VERIFIED_BOUNDED` are never
+interchangeable and a generated run never discharges a symbolic requirement.
+
+Two read-only commands, because inspecting obligations is a different activity
+from enforcing them:
+
+```sh
+cargo trace-check list --contracts     # the compiler-derived inventory
+cargo trace-check coverage             # the matrix, running no analysis
+cargo trace-check coverage --format json
+```
+
+#### Assurance policy and waivers
+
+```toml
+[policy]
+mode = "strict"                   # or "advisory"
+default_required = ["generated"]  # symbolic is not required of everything
+allow_empty_inventory = false
+
+[policy.contracts."crypto::tag::verify_tag"]
+required = ["generated", "symbolic"]
+
+[[policy.exemptions]]
+contract = "crypto::legacy::operation"
+analyses = ["generated"]
+reason = "unsupported field-element parameter type"
+tracking = "https://github.com/example/project/issues/42"
+expires = "2027-03-01"
+```
+
+Absent a `[policy]` table the defaults apply, so an existing `trace-check.toml`
+gains enforcement without being edited.
+
+Waivers exist because the alternative is worse: a developer facing an
+unsupported signature otherwise has one way to make CI pass, which is to delete
+the annotation and the security requirement with it. They are deliberately
+awkward to write — an empty `analyses` list is refused rather than read as
+waiving everything, a missing `reason` is refused, strict mode wants an `expires`
+date or an explicit `never_expires`, a malformed date is a configuration error
+rather than a waiver that never lapses, and a waiver naming no active
+declaration is reported as stale.
+
+**A waiver waives the obligation to perform an analysis. It never waives or
+erases what an analysis found.** It is applied before anything runs, evidence is
+folded in afterwards, and a detected leak overwrites a waived status — never the
+reverse. Waived obligations are also excluded from the checked total, so a waiver
+cannot inflate the proportion actually checked.
+
+#### What a complete inventory does and does not mean
+
+It means every record was extracted from the selected compiled artifact. It does
+**not** mean every source file was compiled, every feature combination checked,
+every dependency inventoried, or any function constant-time. Discovery is scoped
+to one library target under one feature selection, and an inventory records which
+compilation it describes.
+
+M8 enforces *declared* obligations. It does not discover functions that ought to
+carry a declaration, and a function with no annotation is not accounted for at
+all. That sentence is in every report.
+
+See [docs/MILESTONE-08.md](docs/MILESTONE-08.md) for the method and its limits,
+and [docs/spikes/m8-contract-inventory/](docs/spikes/m8-contract-inventory/README.md)
+for the reproducible feasibility experiments — including the two findings that
+shaped the mechanism: `llvm-objcopy --dump-section` silently loses records, and
+an LTO rlib holds bitcode rather than ELF.
 
 ### `native` — secret-dependency analysis of native code
 
@@ -878,6 +987,9 @@ crates/trace-check/
   src/generate.rs                deterministic typed input generation (M6)
   src/coverage.rs                per-case LLVM coverage from the discovery artifact (M7)
   src/explore.rs                 coverage-guided mutation, seed queue and selection (M7)
+  src/inventory.rs               compiler-derived contract inventory, ar + ELF reader (M8)
+  src/enforcement.rs             required analyses, statuses, policy and waivers (M8)
+  src/coverage_report.rs         the contract matrix and the CI decision (M8)
   src/dynamic_harness.rs         generating a std harness around a real library
                                  function, and batched Memcheck execution
   src/check.rs                   batching, failure isolation and shrinking
@@ -905,14 +1017,17 @@ examples/legacy-branch-demo/     original proof of concept, kept for context
 docs/                            milestone plan, methodology, limitations
 docs/spikes/m6-generated-harness/ the recorded M6.1 feasibility spike
 docs/spikes/m7-coverage-feedback/ the recorded M7.1 feasibility spike
+docs/spikes/m8-contract-inventory/ the recorded M8.1 feasibility spike
 ci/verify-m3-consumer.py         asserts the M3 consumer report, not its exit code
 ci/verify-m4-symbolic.py         asserts the M4 symbolic report, not its exit code
 ci/verify-m5-library.py          asserts the M5 contract report, not its exit code
 ci/verify-m6-generated.py        asserts the M6 generated report, not its exit code
 ci/verify-m7-explore.py          asserts the M7 coverage-guided report, not its exit code
 ci/benchmark-m7.py               M6-versus-M7 discovery benchmark and acceptance threshold
+ci/verify-m8-contracts.py        asserts the M8 coverage report, not its exit code
+ci/benchmark-m8.py               contract-discovery overhead at 0/10/50/100 declarations
 ci/benchmark-m6.py               generated vs hand-written effectiveness benchmark
-.github/workflows/ci.yml         pinned Linux CI (M1-M3/M6/M7 job + M4/M5 analyzer job)
+.github/workflows/ci.yml         pinned Linux CI (M1-M3/M6-M8 job + M4/M5 analyzer job)
 ```
 
 ## Development

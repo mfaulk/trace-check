@@ -14,6 +14,9 @@ cargo trace-check check --all-configured
 # M7: the same, with coverage feedback choosing which inputs to analyze.
 cargo trace-check check --contract crypto::hidden::nested_modes --explore
 
+# M8: every declaration in the compiled library, discovered and enforced.
+cargo trace-check check --all-contracts --ci
+
 # M5: symbolic, under BINSEC. Searches a declared domain for a secret
 # assignment that leaks.
 cargo trace-check verify --all-contracts
@@ -43,6 +46,9 @@ correct ones, so a **full** run of either command exits nonzero by design.
 | `cargo trace-check check --contract crypto::lookup::substitute_mode` | 0 | `LEAK_DETECTED`, as that fixture declares |
 | `cargo trace-check check --contract crypto::hidden::nested_modes --no-explore` | 2 | `NO_LEAK_OBSERVED`: the leak is real and on a path generated inputs cannot construct, so the fixture's declared `LEAK_DETECTED` goes unmet |
 | `cargo trace-check check --contract crypto::hidden::nested_modes --explore` | 0 | coverage feedback reaches it, and Memcheck confirms it |
+| `cargo trace-check check --all-contracts --ci` | 0 | all 18 declarations discovered from the compiled library and enforced; the clean ones pass as security contracts, the vulnerable ones as declared analyzer regressions |
+| `cargo trace-check list --contracts` | 0 | the 18 declarations, their sites and their secrets, with nothing executed |
+| `cargo trace-check coverage` | 2 | the matrix with every requirement `NOT_ANALYZED`: read-only, so nothing has been established yet |
 
 `verify` exits 0 on a reproduced `LEAK_DETECTED` because the declared
 expectation was met: the security of the function and the pass/fail of the
