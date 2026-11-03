@@ -184,6 +184,8 @@ verification in M4; the rest remains out of scope for the project as a whole:
 * secret-taint analysis or automatic discovery of which inputs are secret,
 * exhaustive path coverage — *M7 searches for inputs that reach new code; it
   does not enumerate paths and does not bound what it missed*,
+* automatic security classification of unannotated functions — *M8 enforces
+  declared obligations and does not discover which functions should have one*,
 * instrumentation of arbitrary crates or full protocol integrations,
 * general-purpose constant-time certification.
 
@@ -242,6 +244,54 @@ What coverage guidance does change is which inputs get analyzed, and only that.
 Every security conclusion still comes from the uninstrumented Memcheck artifact
 under the same two positive controls, and a completed run is still
 `NO_LEAK_OBSERVED` over the inputs selected — better chosen, not exhaustive.
+
+## A complete contract inventory is not a security claim
+
+Milestone 8 added contract discovery, and "complete coverage" is a phrase worth
+being precise about, because it invites exactly the wrong reading.
+
+A **complete inventory** means every `#[constant_time]` record was successfully
+extracted from the selected compiled artifact. It does not mean:
+
+* every source file in the repository was compiled,
+* every Cargo feature combination was checked,
+* every dependency was inventoried,
+* every compiled function is constant-time,
+* or that any secret value was tested.
+
+**Enforcement coverage** is the proportion of *declared requirements* that were
+met, excluding waived ones from both sides of the ratio. It is not the
+proportion of secret inputs proven safe, and it says nothing about functions
+that carry no declaration. It is reported as absent rather than as 100 % when
+nothing was owed.
+
+An **enforcement status** is not a security outcome. `CHECKED` says a required
+analysis completed and passed; how strong that is depends entirely on which
+analysis it was, and a generated dynamic check is `NO_LEAK_OBSERVED` over the
+inputs it ran. Status and evidence are therefore separate fields in every
+report, and a requirement for one analysis is never discharged by another.
+
+Two scope limits are structural rather than incidental:
+
+* **Declared obligations only.** M8 enforces what someone declared. It does not
+  and cannot discover functions that *ought* to carry a declaration, so an
+  unannotated function handling a secret is invisible to all of this. Automatic
+  security classification of unannotated functions is an explicit non-goal.
+* **One compilation.** An inventory describes one library target under one
+  feature selection for one target triple. Another feature combination may
+  declare different contracts and compile the same contract to different
+  machine code, so inventories carry a build identity and nothing merges their
+  evidence.
+
+An **exemption** records that an obligation was waived. It establishes nothing
+whatsoever about the contract. It cannot suppress a detected leak: waivers are
+applied before any analysis runs, and evidence of a violation overwrites a
+waived status rather than the reverse.
+
+Finally, discovery is **ELF-specific**. The records are read from a `#[used]`
+static in a named section of the library's own `rlib`; Mach-O and COFF would
+each need their own section-table reading, and the supported platform is Linux
+x86-64.
 
 ## Reading the fixture's expectations
 

@@ -324,6 +324,118 @@ jobs:
       - name: Coverage-guided discovery beats M6 generation
         run: python3 ci/benchmark-m7.py --quick --skip-cold
 
+      # ------------------------------------------------------------------
+      # M8: complete contract coverage and enforcement.
+      # ------------------------------------------------------------------
+
+      # The inventory comes from the compiled library, so it finds contracts
+      # that no configuration names and that have no test adapter. Asserted
+      # against the out-of-workspace annotation-only library, which is the case
+      # M3's test-metadata discovery could not see at all.
+      - name: Contracts are discovered from the compiled library
+        run: |
+          set -euo pipefail
+          cargo run --locked --release -p cargo-trace-check -- list --contracts \
+            --manifest-path examples/external-library/Cargo.toml | tee /tmp/m8-external.txt
+          grep -q '3 contract declaration(s)' /tmp/m8-external.txt
+          grep -q 'external_library::digest_nibble' /tmp/m8-external.txt
+          # Annotation-only: no adapter, and still inventoried.
+          grep -q 'declared dynamic = false' /tmp/m8-external.txt
+
+      # Every declaration enforced, with the report's own claims validated
+      # rather than the exit code: the inventory complete and artifact-bound,
+      # every requirement carrying a status, nothing NOT_SELECTED, and no
+      # waiver covering a detected leak.
+      - name: Every declared contract is enforced
+        working-directory: examples/crypto-library
+        run: |
+          cargo run --locked --release -p cargo-trace-check -- check \
+            --all-contracts --ci --format json \
+            > "$GITHUB_WORKSPACE/m8-contracts.json"
+          python3 "$GITHUB_WORKSPACE/ci/verify-m8-contracts.py" \
+            "$GITHUB_WORKSPACE/m8-contracts.json" --expect-declared 18
+
+      # The milestone's defining property, asserted against the checkout rather
+      # than only inside the test binary: annotate a vulnerable function,
+      # change no configuration, and CI must fail.
+      - name: A new leaking annotation fails CI with no configuration change
+        run: |
+          set -euo pipefail
+          work=/tmp/m8-mutation
+          rm -rf "$work" && mkdir -p "$work/src"
+          sed "s#path = \"../../crates/trace-check-macros\"#path = \"$GITHUB_WORKSPACE/crates/trace-check-macros\"#" \
+            examples/enforcement-fixture/Cargo.toml > "$work/Cargo.toml"
+          cp examples/enforcement-fixture/src/lib.rs "$work/src/lib.rs"
+          test ! -f "$work/trace-check.toml"
+
+          # Clean to begin with.
+          cargo run --locked --release -p cargo-trace-check -- check \
+            --all-contracts --ci --manifest-path "$work/Cargo.toml" \
+            | tee /tmp/m8-before.txt
+          grep -q 'declared: 2 contract(s)' /tmp/m8-before.txt
+          grep -q 'Result: PASS' /tmp/m8-before.txt
+
+          # Annotate a secret-indexed load. Nothing else changes.
+          # The heredoc body sits at the YAML block's own indentation, which
+          # YAML strips, so the shell receives it unindented. A `sed` dedent
+          # afterwards would also reach the fixture's existing lines.
+          cat >> "$work/src/lib.rs" <<'RUST'
+
+          #[constant_time(secret = "index", dynamic = false)]
+          pub fn indexed(index: u8) -> u8 {
+              // SAFETY: the mask keeps the index inside the 16-byte table.
+              unsafe { core::ptr::read_volatile(&TABLE[(index & 15) as usize]) }
+          }
+          RUST
+          test ! -f "$work/trace-check.toml"
+
+          set +e
+          cargo run --locked --release -p cargo-trace-check -- check \
+            --all-contracts --ci --manifest-path "$work/Cargo.toml" \
+            > /tmp/m8-after.txt
+          code=$?
+          set -e
+          cat /tmp/m8-after.txt
+          test "$code" = "1" || {
+            echo "a newly annotated leaking function must exit 1, got $code"
+            exit 1; }
+          grep -q 'declared: 3 contract(s)' /tmp/m8-after.txt
+          grep -q 'fixture::indexed' /tmp/m8-after.txt
+          grep -q 'LEAK_DETECTED' /tmp/m8-after.txt
+          test ! -f "$work/trace-check.toml"
+
+      # An unanalyzable declaration is visible and fails, rather than passing
+      # because no harness could be built for it.
+      - name: An unsupported declaration fails as unsupported
+        run: |
+          set -euo pipefail
+          work=/tmp/m8-unsupported
+          rm -rf "$work" && mkdir -p "$work/src"
+          sed "s#path = \"../../crates/trace-check-macros\"#path = \"$GITHUB_WORKSPACE/crates/trace-check-macros\"#" \
+            examples/enforcement-fixture/Cargo.toml > "$work/Cargo.toml"
+          cp examples/enforcement-fixture/src/lib.rs "$work/src/lib.rs"
+          cat >> "$work/src/lib.rs" <<'RUST'
+
+          #[constant_time(secret = "flag", dynamic = false)]
+          pub fn over_bool(flag: bool) -> u8 {
+              if flag { 1 } else { 0 }
+          }
+          RUST
+          set +e
+          cargo run --locked --release -p cargo-trace-check -- check \
+            --all-contracts --ci --manifest-path "$work/Cargo.toml" > /tmp/m8-unsup.txt
+          code=$?
+          set -e
+          cat /tmp/m8-unsup.txt
+          test "$code" = "2" || { echo "expected exit 2 (unsupported), got $code"; exit 1; }
+          grep -q 'UNSUPPORTED' /tmp/m8-unsup.txt
+          grep -q 'secret `bool`' /tmp/m8-unsup.txt
+
+      # Discovery must stay a fixed cost rather than scaling with the number of
+      # annotations, or enforcing every contract becomes the reason not to.
+      - name: Contract discovery overhead is bounded
+        run: python3 ci/benchmark-m8.py
+
       - name: Reproduce the demonstration
         run: cargo run --locked --release -p trace-check -- demo mac-compare
 
@@ -344,6 +456,7 @@ jobs:
             mac-compare-screen.json
             native-memcheck.json
             m6-generated.json
+            m8-contracts.json
 
   # M4: bounded relational verification. A separate job because its backend is
   # a container image rather than a package, and because it must not be able to
