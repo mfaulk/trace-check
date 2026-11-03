@@ -20,6 +20,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::generate::{self, Relationship, Strategy};
 use crate::security::Outcome;
 use crate::symbolic::CheckFeature;
 
@@ -358,6 +359,201 @@ fn default_wall_timeout() -> u64 {
     900
 }
 
+/// What a `[check."…"]` entry is asserting.
+///
+/// This distinction is the whole of M6's CI policy. M4/M5 let a known-vulnerable
+/// fixture declare `expected_outcome = "LEAK_DETECTED"`, which is correct for
+/// testing trace-check against an example whose leak is the point — and exactly
+/// wrong as the default for a developer declaring their own function
+/// constant-time. Conflating the two would let a stray expectation turn a real
+/// leak into a passing build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Expectation {
+    /// The function must satisfy the property. A detected leak fails. The
+    /// default, because it is the answer that is safe when nobody thought about
+    /// it.
+    #[default]
+    SecurityContract,
+    /// The *analyzer* must produce a stated result on a stated example. Used by
+    /// this project's own fixtures, where detecting the planted leak is the
+    /// test passing.
+    AnalyzerRegression,
+}
+
+impl Expectation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Expectation::SecurityContract => "security-contract",
+            Expectation::AnalyzerRegression => "analyzer-regression",
+        }
+    }
+}
+
+/// Per-contract generated-testing settings from `trace-check.toml`.
+///
+/// Every field has a default: a minimally supported contract needs no `[check]`
+/// entry at all, because the annotation already says which parameters are
+/// secret and the signature supplies their types.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckSettings {
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub rationale: String,
+    /// Case budget. A hard cap, spent boundaries-first.
+    #[serde(default = "default_cases")]
+    pub cases: usize,
+    #[serde(default = "default_seed")]
+    pub seed: u64,
+    /// Generation strategies, in the order they are spent.
+    #[serde(default = "Strategy::defaults")]
+    pub strategies: Vec<Strategy>,
+    /// Declared relationships between equal-length byte-array parameters.
+    #[serde(default)]
+    pub relationships: Vec<Relationship>,
+    #[serde(default = "default_batch_size")]
+    pub batch_size: usize,
+    /// Whether to reduce a reproducing input after isolating it.
+    #[serde(default = "default_true")]
+    pub shrink: bool,
+    #[serde(default = "default_shrink_budget")]
+    pub shrink_budget: usize,
+    /// What this entry asserts; see [`Expectation`].
+    #[serde(default)]
+    pub expectation: Expectation,
+    /// The outcome an *analyzer regression* fixture is declared to produce.
+    ///
+    /// Refused for a security contract: a contract that declares its own
+    /// expected outcome could declare a leak acceptable, which is the failure
+    /// this split exists to prevent.
+    #[serde(default)]
+    pub expected_outcome: Option<String>,
+}
+
+fn default_cases() -> usize {
+    generate::DEFAULT_CASES
+}
+
+fn default_seed() -> u64 {
+    generate::DEFAULT_SEED
+}
+
+fn default_batch_size() -> usize {
+    crate::check::DEFAULT_BATCH_SIZE
+}
+
+fn default_shrink_budget() -> usize {
+    crate::check::DEFAULT_SHRINK_BUDGET
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for CheckSettings {
+    fn default() -> Self {
+        CheckSettings {
+            description: String::new(),
+            rationale: String::new(),
+            cases: default_cases(),
+            seed: default_seed(),
+            strategies: Strategy::defaults(),
+            relationships: Vec::new(),
+            batch_size: default_batch_size(),
+            shrink: true,
+            shrink_budget: default_shrink_budget(),
+            expectation: Expectation::default(),
+            expected_outcome: None,
+        }
+    }
+}
+
+impl CheckSettings {
+    /// Rejects settings that could not be run, or that would weaken the policy.
+    pub fn validate(&self, contract: &str) -> Result<(), ContractError> {
+        let reject = |detail: String| {
+            Err(ContractError::Config(format!(
+                "[check.\"{contract}\"]: {detail}"
+            )))
+        };
+        if self.cases == 0 {
+            return reject("`cases` is 0, and a run that checks nothing is not a pass".to_string());
+        }
+        if self.batch_size == 0 {
+            return reject("`batch_size` is 0, so no case would ever run".to_string());
+        }
+        if self.strategies.is_empty() && self.expectation == Expectation::SecurityContract {
+            return reject(
+                "`strategies` is empty, so no inputs would be generated; list them \
+                 explicitly, e.g. strategies = [\"boundaries\", \"pairwise\", \"random\"]"
+                    .to_string(),
+            );
+        }
+        if let Some(duplicate) = self
+            .strategies
+            .iter()
+            .enumerate()
+            .find(|(index, strategy)| self.strategies[..*index].contains(strategy))
+            .map(|(_, strategy)| *strategy)
+        {
+            return reject(format!("`strategies` lists {duplicate} twice"));
+        }
+        match (&self.expectation, &self.expected_outcome) {
+            (Expectation::SecurityContract, Some(declared)) => reject(format!(
+                "`expected_outcome = {declared:?}` is set on a security contract. A declared \
+                 outcome cannot decide whether a leak is acceptable -- that is what the \
+                 analyzer is for. If this entry exists to pin trace-check's own behavior on a \
+                 deliberately vulnerable example, set \
+                 `expectation = \"analyzer-regression\"`"
+            )),
+            (Expectation::AnalyzerRegression, None) => reject(
+                "`expectation = \"analyzer-regression\"` needs an `expected_outcome`, \
+                 otherwise it states nothing for the analyzer to be held to"
+                    .to_string(),
+            ),
+            (Expectation::AnalyzerRegression, Some(declared)) => {
+                if Outcome::parse(declared).is_none() {
+                    return reject(format!(
+                        "`expected_outcome` is {declared:?}; use LEAK_DETECTED, \
+                         NO_LEAK_OBSERVED or INCONCLUSIVE"
+                    ));
+                }
+                if declared == "VERIFIED_BOUNDED" {
+                    return reject(
+                        "`expected_outcome` is VERIFIED_BOUNDED, which only the symbolic \
+                         backend produces; a completed generated run is NO_LEAK_OBSERVED"
+                            .to_string(),
+                    );
+                }
+                Ok(())
+            }
+            (Expectation::SecurityContract, None) => Ok(()),
+        }
+    }
+
+    /// The generation settings this entry describes.
+    pub fn generation(&self) -> generate::GenerateSettings {
+        generate::GenerateSettings {
+            cases: self.cases,
+            seed: self.seed,
+            strategies: self.strategies.clone(),
+            relationships: self.relationships.clone(),
+            regressions: Vec::new(),
+        }
+    }
+
+    /// The execution budget this entry describes.
+    pub fn budget(&self) -> crate::check::CheckBudget {
+        crate::check::CheckBudget {
+            batch_size: self.batch_size,
+            shrink_budget: self.shrink_budget,
+            shrink: self.shrink,
+        }
+    }
+}
+
 /// A library's verification configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -367,6 +563,12 @@ pub struct VerifyConfig {
     pub description: String,
     #[serde(default)]
     pub verify: BTreeMap<String, ContractSettings>,
+    /// Generated-testing settings, keyed by qualified contract identity.
+    ///
+    /// Optional and additive: a configuration written for M5 has no `[check]`
+    /// table and keeps working unchanged.
+    #[serde(default)]
+    pub check: BTreeMap<String, CheckSettings>,
 }
 
 /// Default configuration file name, looked for beside the library's manifest.
@@ -387,7 +589,25 @@ impl VerifyConfig {
         for (contract, settings) in &config.verify {
             settings.validate(contract)?;
         }
+        for (contract, settings) in &config.check {
+            settings.validate(contract)?;
+        }
         Ok(config)
+    }
+
+    /// An empty configuration, for a library that has no `trace-check.toml`.
+    ///
+    /// Generated checking does not require one: the annotation already names
+    /// the secret and the signature supplies the types, so a file only ever
+    /// adds budgets, strategies and policy. Symbolic verification *does*
+    /// require one, which is why this is not a `Default` impl.
+    pub fn empty() -> VerifyConfig {
+        VerifyConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            description: String::new(),
+            verify: BTreeMap::new(),
+            check: BTreeMap::new(),
+        }
     }
 
     pub fn settings(&self, contract: &str) -> Option<&ContractSettings> {
@@ -422,6 +642,30 @@ impl VerifyConfig {
     /// Every configured contract, in a stable order.
     pub fn contracts(&self) -> Vec<&str> {
         self.verify.keys().map(String::as_str).collect()
+    }
+
+    /// Generated-testing settings for a contract, or the defaults.
+    ///
+    /// A contract with no `[check]` entry is still checkable: the annotation
+    /// already names the secret and the signature supplies the types, so an
+    /// entry only ever adds budgets, strategies and policy.
+    pub fn check_settings(&self, contract: &str) -> CheckSettings {
+        self.check.get(contract).cloned().unwrap_or_default()
+    }
+
+    /// Whether a contract has an explicit `[check]` entry.
+    pub fn is_check_configured(&self, contract: &str) -> bool {
+        self.check.contains_key(contract)
+    }
+
+    /// Contracts with a `[check]` entry, in a stable order.
+    ///
+    /// This is what `--all-configured` enumerates, and it is deliberately not
+    /// called "all contracts": it covers what the configuration names, not
+    /// every `#[constant_time]` annotation in the source tree. Claiming the
+    /// latter would be claiming coverage nothing has established.
+    pub fn checked_contracts(&self) -> Vec<&str> {
+        self.check.keys().map(String::as_str).collect()
     }
 }
 
@@ -1011,5 +1255,214 @@ expected_outcome = "VERIFIED_BOUNDED"
         assert!(!Repr::ByteArray(16).passed_by_reference());
         assert_eq!(Repr::Scalar(64).bytes(), Some(8));
         assert_eq!(Repr::Unsupported.bytes(), None);
+    }
+}
+
+#[cfg(test)]
+mod check_config_tests {
+    use super::*;
+
+    fn settings() -> CheckSettings {
+        CheckSettings::default()
+    }
+
+    /// A contract with no `[check]` entry is still checkable, on defaults.
+    #[test]
+    fn an_unconfigured_contract_uses_defaults() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join(CONFIG_FILE);
+        std::fs::write(&path, "schema_version = 1\n").expect("written");
+        let config = VerifyConfig::load(&path).expect("valid");
+        let defaults = config.check_settings("crypto::tag::verify_tag");
+        assert_eq!(defaults.cases, crate::generate::DEFAULT_CASES);
+        assert_eq!(defaults.seed, crate::generate::DEFAULT_SEED);
+        assert_eq!(defaults.strategies, Strategy::defaults());
+        assert_eq!(defaults.expectation, Expectation::SecurityContract);
+        assert!(defaults.expected_outcome.is_none());
+        assert!(defaults.shrink);
+        assert!(!config.is_check_configured("crypto::tag::verify_tag"));
+        assert!(config.checked_contracts().is_empty());
+    }
+
+    /// An M5 configuration with no `[check]` table keeps working, so adding
+    /// generated testing does not invalidate an existing file.
+    #[test]
+    fn a_configuration_without_a_check_table_still_loads() {
+        let text = r#"
+schema_version = 1
+
+[verify."crypto::tag::verify_tag"]
+max_depth = 4000
+checks = ["control-flow"]
+expected_outcome = "VERIFIED_BOUNDED"
+"#;
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join(CONFIG_FILE);
+        std::fs::write(&path, text).expect("written");
+        let config = VerifyConfig::load(&path).expect("valid");
+        assert_eq!(config.contracts(), vec!["crypto::tag::verify_tag"]);
+        assert!(config.check.is_empty());
+    }
+
+    /// A `[check]` table parses, and `--all-configured` enumerates exactly its
+    /// keys.
+    #[test]
+    fn a_check_table_parses_and_is_enumerable() {
+        let text = r#"
+schema_version = 1
+
+[check."crypto::lookup::substitute"]
+description = "the masked scan"
+cases = 128
+seed = 99
+strategies = ["boundaries", "random"]
+batch_size = 16
+
+[check."crypto::lookup::substitute_mode"]
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"
+rationale = "the leak behind a public mode is the point of this fixture"
+"#;
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join(CONFIG_FILE);
+        std::fs::write(&path, text).expect("written");
+        let config = VerifyConfig::load(&path).expect("valid");
+        assert_eq!(
+            config.checked_contracts(),
+            vec![
+                "crypto::lookup::substitute",
+                "crypto::lookup::substitute_mode"
+            ]
+        );
+        let scan = config.check_settings("crypto::lookup::substitute");
+        assert_eq!(scan.cases, 128);
+        assert_eq!(scan.seed, 99);
+        assert_eq!(
+            scan.strategies,
+            vec![Strategy::Boundaries, Strategy::Random]
+        );
+        assert_eq!(scan.batch_size, 16);
+        assert_eq!(scan.expectation, Expectation::SecurityContract);
+        let fixture = config.check_settings("crypto::lookup::substitute_mode");
+        assert_eq!(fixture.expectation, Expectation::AnalyzerRegression);
+        assert_eq!(fixture.expected_outcome.as_deref(), Some("LEAK_DETECTED"));
+    }
+
+    /// The policy split: a security contract may not declare its own expected
+    /// outcome, because that would let a configuration call a leak acceptable.
+    #[test]
+    fn a_security_contract_cannot_declare_an_expected_outcome() {
+        let mut config = settings();
+        config.expected_outcome = Some("LEAK_DETECTED".to_string());
+        let error = config.validate("crypto::f").expect_err("refused");
+        let message = error.to_string();
+        assert!(message.contains("security contract"), "{message}");
+        assert!(message.contains("analyzer-regression"), "{message}");
+    }
+
+    /// An analyzer-regression entry without an expected outcome states nothing.
+    #[test]
+    fn an_analyzer_regression_needs_an_expected_outcome() {
+        let mut config = settings();
+        config.expectation = Expectation::AnalyzerRegression;
+        let error = config.validate("crypto::f").expect_err("refused");
+        assert!(error.to_string().contains("states nothing"), "{error}");
+    }
+
+    /// `VERIFIED_BOUNDED` is the symbolic backend's vocabulary and is refused
+    /// here, so the two claims cannot be confused.
+    #[test]
+    fn the_symbolic_outcome_is_refused_as_a_generated_expectation() {
+        let mut config = settings();
+        config.expectation = Expectation::AnalyzerRegression;
+        config.expected_outcome = Some("VERIFIED_BOUNDED".to_string());
+        let error = config.validate("crypto::f").expect_err("refused");
+        assert!(error.to_string().contains("NO_LEAK_OBSERVED"), "{error}");
+
+        config.expected_outcome = Some("SOMETHING".to_string());
+        assert!(config.validate("crypto::f").is_err());
+    }
+
+    /// A zero budget or a zero batch size would check nothing.
+    #[test]
+    fn empty_budgets_are_refused() {
+        let mut config = settings();
+        config.cases = 0;
+        assert!(config.validate("c").is_err());
+
+        let mut config = settings();
+        config.batch_size = 0;
+        assert!(config.validate("c").is_err());
+    }
+
+    /// A security contract with no strategies would generate no inputs.
+    #[test]
+    fn a_security_contract_needs_at_least_one_strategy() {
+        let mut config = settings();
+        config.strategies.clear();
+        let error = config.validate("c").expect_err("refused");
+        assert!(error.to_string().contains("no inputs"), "{error}");
+    }
+
+    /// A duplicated strategy is refused rather than silently deduplicated.
+    #[test]
+    fn a_duplicate_strategy_is_refused() {
+        let mut config = settings();
+        config.strategies = vec![Strategy::Boundaries, Strategy::Random, Strategy::Boundaries];
+        let error = config.validate("c").expect_err("refused");
+        assert!(error.to_string().contains("twice"), "{error}");
+    }
+
+    /// Settings convert to the generation and execution budgets they describe.
+    #[test]
+    fn settings_become_generation_and_execution_budgets() {
+        let mut config = settings();
+        config.cases = 12;
+        config.seed = 7;
+        config.batch_size = 4;
+        config.shrink = false;
+        config.shrink_budget = 3;
+        let generation = config.generation();
+        assert_eq!(generation.cases, 12);
+        assert_eq!(generation.seed, 7);
+        assert!(generation.regressions.is_empty());
+        let budget = config.budget();
+        assert_eq!(budget.batch_size, 4);
+        assert!(!budget.shrink);
+        assert_eq!(budget.shrink_budget, 3);
+    }
+
+    /// An unknown key in a `[check]` entry is refused, so a typo in a budget
+    /// does not silently take the default.
+    #[test]
+    fn an_unknown_check_key_is_refused() {
+        let text = r#"
+schema_version = 1
+
+[check."crypto::f"]
+cases = 10
+csaes = 20
+"#;
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join(CONFIG_FILE);
+        std::fs::write(&path, text).expect("written");
+        assert!(VerifyConfig::load(&path).is_err());
+    }
+
+    /// An invalid `[check]` entry is caught when the file loads, not when the
+    /// contract is reached.
+    #[test]
+    fn an_invalid_check_entry_fails_the_load() {
+        let text = r#"
+schema_version = 1
+
+[check."crypto::f"]
+cases = 0
+"#;
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join(CONFIG_FILE);
+        std::fs::write(&path, text).expect("written");
+        let error = VerifyConfig::load(&path).expect_err("refused");
+        assert!(error.to_string().contains("not a pass"), "{error}");
     }
 }

@@ -110,6 +110,67 @@ enum Command {
         #[arg(long, value_parser = ["podman", "docker"])]
         container_runtime: Option<String>,
     },
+    /// Generate inputs for declared contracts and check them for
+    /// secret-dependent control flow and memory addressing.
+    ///
+    /// Unlike `test`, this needs no hand-written `#[ct_test]`: the annotation
+    /// already says which parameters are secret and the signature supplies
+    /// their types. Unlike `verify`, it needs no container -- it reuses the
+    /// Valgrind backend and so reaches `std` libraries.
+    ///
+    /// A clean result is NO_LEAK_OBSERVED over the inputs that were generated.
+    /// It is not a proof.
+    Check {
+        /// Check a declared `#[constant_time]` contract by its qualified
+        /// identity, e.g. `crypto::lookup::substitute_mode`. Repeatable.
+        #[arg(long, conflicts_with = "replay")]
+        contract: Vec<String>,
+        /// Check every contract with a [check."..."] entry in trace-check.toml.
+        ///
+        /// Deliberately not called --all-contracts: it covers what the
+        /// configuration names, not every annotation in the source tree.
+        #[arg(long, conflicts_with = "replay")]
+        all_configured: bool,
+        /// Library manifest to check contracts from. Defaults to ./Cargo.toml.
+        #[arg(long)]
+        manifest_path: Option<PathBuf>,
+        /// Configuration file. Defaults to trace-check.toml beside the
+        /// manifest. Optional: a contract with no entry is checked on defaults.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Cargo features to enable for the library build.
+        #[arg(long, value_delimiter = ',')]
+        features: Vec<String>,
+        /// Case budget per contract, overriding the configuration.
+        #[arg(long)]
+        cases: Option<usize>,
+        /// Generation seed, overriding the configuration. The same seed and
+        /// budget reproduce the same corpus.
+        #[arg(long)]
+        seed: Option<u64>,
+        /// Cases per Valgrind process, overriding the configuration.
+        #[arg(long)]
+        batch_size: Option<usize>,
+        /// Skip input reduction after a finding is isolated.
+        #[arg(long)]
+        no_shrink: bool,
+        /// Write a replayable reproducer per finding into this directory.
+        #[arg(long)]
+        reproducer_dir: Option<PathBuf>,
+        /// Replay a saved reproducer instead of generating inputs.
+        #[arg(long)]
+        replay: Option<PathBuf>,
+        /// Require that every configured contract was checked, so a CI job
+        /// cannot report success for a subset it happened to select.
+        #[arg(long)]
+        ci: bool,
+        /// Keep the generated harnesses and analyzed executables under this
+        /// directory instead of a private one removed after the run.
+        #[arg(long)]
+        artifact_dir: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = Format::Text)]
+        format: Format,
+    },
     /// List the discovered checks and contracts without running them.
     List {
         #[arg(long)]
@@ -178,6 +239,41 @@ fn execute(cli: Cli) -> Result<u8, String> {
             &features,
             format,
         ),
+        Command::Check {
+            contract,
+            all_configured,
+            manifest_path,
+            config,
+            features,
+            cases,
+            seed,
+            batch_size,
+            no_shrink,
+            reproducer_dir,
+            replay,
+            ci,
+            artifact_dir,
+            format,
+        } => check(CheckRequest {
+            selected: contract,
+            all_configured,
+            manifest_path,
+            config_path: config,
+            features,
+            overrides: trace_check::CheckOverrides {
+                cases,
+                seed,
+                batch_size,
+                // Absent unless the flag was passed, so a configured `shrink`
+                // is only ever overridden deliberately.
+                shrink: if no_shrink { Some(false) } else { None },
+            },
+            reproducer_dir,
+            replay,
+            ci,
+            artifact_dir,
+            format,
+        }),
         Command::Verify {
             contract,
             all_contracts,
@@ -228,6 +324,141 @@ fn execute(cli: Cli) -> Result<u8, String> {
             }
         }
     }
+}
+
+/// Everything `check` was asked for, grouped so the subcommand's options travel
+/// as one value rather than eleven positional arguments.
+struct CheckRequest {
+    selected: Vec<String>,
+    all_configured: bool,
+    manifest_path: Option<PathBuf>,
+    config_path: Option<PathBuf>,
+    features: Vec<String>,
+    overrides: trace_check::CheckOverrides,
+    reproducer_dir: Option<PathBuf>,
+    replay: Option<PathBuf>,
+    ci: bool,
+    artifact_dir: Option<PathBuf>,
+    format: Format,
+}
+
+/// Generated constant-time checking, and replay.
+fn check(request: CheckRequest) -> Result<u8, String> {
+    let CheckRequest {
+        selected,
+        all_configured,
+        manifest_path,
+        config_path,
+        features,
+        overrides,
+        reproducer_dir,
+        replay,
+        ci,
+        artifact_dir,
+        format,
+    } = request;
+    let manifest = manifest_path.unwrap_or_else(|| PathBuf::from("Cargo.toml"));
+    if !manifest.is_file() {
+        return Err(format!(
+            "{} is not a file; pass --manifest-path to name the library to check",
+            manifest.display()
+        ));
+    }
+    let library = Library::resolve(&manifest, &features).map_err(|e| e.to_string())?;
+    let workspace = match &artifact_dir {
+        Some(directory) => Workspace::kept_in(directory),
+        None => Workspace::ephemeral(),
+    }
+    .map_err(|e| e.to_string())?;
+
+    // Replay answers a different question and needs no configuration: the
+    // reproducer carries the contract, the inputs and the artifact it was found
+    // against.
+    if let Some(path) = &replay {
+        let record = trace_check::reproducer::Reproducer::load(path).map_err(|e| e.to_string())?;
+        let result = trace_check::replay_reproducer(&library, &record, &workspace)
+            .map_err(|e| e.to_string())?;
+        match format {
+            Format::Json => println!(
+                "{}",
+                serde_json::to_string_pretty(&result).expect("a replay result is serializable")
+            ),
+            Format::Text => {
+                println!("Replaying {}", record.contract);
+                println!("  inputs:   {}", record.describe());
+                println!("  finding:  {:?}", record.finding.classification);
+                println!(
+                    "  artifact: recorded {}, replayed {}",
+                    short(&result.recorded_artifact_sha256),
+                    short(&result.replayed_artifact_sha256)
+                );
+                println!("  {}", result.verdict.as_str());
+                println!("  {}", result.message);
+            }
+        }
+        // A finding that is still there fails; a run that established nothing
+        // is incomplete, never a pass.
+        return Ok(match result.verdict {
+            trace_check::reproducer::Verdict::Reproduced => report::EXIT_LEAK,
+            trace_check::reproducer::Verdict::NotReproduced if result.same_artifact => {
+                report::EXIT_INCOMPLETE
+            }
+            trace_check::reproducer::Verdict::NotReproduced => report::EXIT_OK,
+            trace_check::reproducer::Verdict::Inconclusive => report::EXIT_INCOMPLETE,
+        });
+    }
+
+    // The configuration is optional: a contract with no entry is checked on
+    // defaults. It is only required to resolve --all-configured.
+    let config_path = config_path.unwrap_or_else(|| {
+        manifest
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join(contract::CONFIG_FILE)
+    });
+    let config = if config_path.is_file() {
+        VerifyConfig::load(&config_path).map_err(|e| e.to_string())?
+    } else if all_configured {
+        return Err(format!(
+            "{} does not exist, so there is no configuration to enumerate; pass --contract \
+             <identity> instead",
+            config_path.display()
+        ));
+    } else {
+        VerifyConfig::empty()
+    };
+
+    let contracts: Vec<String> = if all_configured {
+        config
+            .checked_contracts()
+            .iter()
+            .map(|c| c.to_string())
+            .collect()
+    } else {
+        selected
+    };
+
+    let report = trace_check::run_generated_checks(
+        &library,
+        &config,
+        &contracts,
+        &workspace,
+        &overrides,
+        reproducer_dir.as_deref(),
+        ci,
+    )
+    .map_err(|e| e.to_string())?;
+
+    match format {
+        Format::Text => print!("{}", report.to_text()),
+        Format::Json => println!("{}", report.to_json()),
+    }
+    Ok(report.exit_code())
+}
+
+/// First twelve characters of a hash, for human-readable output.
+fn short(hash: &str) -> String {
+    hash.chars().take(12).collect()
 }
 
 fn test(

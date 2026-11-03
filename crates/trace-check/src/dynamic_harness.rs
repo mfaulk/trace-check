@@ -75,6 +75,10 @@ pub const PROFILE: &str = "release: opt-level=3, debug=true, lto=off, codegen-un
 /// Environment override for the path to `trace-check-test`.
 pub const TEST_CRATE_ENV: &str = "TRACE_CHECK_TEST_PATH";
 
+/// Stand-in path the generated package's own directory is remapped to, so an
+/// artifact hash does not depend on which temporary directory built it.
+pub const REMAPPED_HARNESS_DIR: &str = "/trace-check/generated";
+
 /// A generated dynamic harness.
 #[derive(Debug, Clone, Serialize)]
 pub struct DynamicHarness {
@@ -510,9 +514,24 @@ pub fn build(
         library.dependency_stanza(),
         test_crate.display().to_string()
     );
+    // The work directory is random, and `debug = true` bakes the generated
+    // source's absolute path into the artifact — so without remapping, two runs
+    // of the same contract produce different hashes and `--replay` could never
+    // report that it ran against the same build. Remapping makes the hash a
+    // function of the inputs rather than of the temporary directory.
+    std::fs::create_dir_all(crate_dir.join(".cargo"))
+        .map_err(|e| DynamicError::Io(format!("{}: {e}", crate_dir.display())))?;
+    let cargo_config = format!(
+        "[build]\nrustflags = [\"--remap-path-prefix\", {:?}]\n",
+        format!("{}={REMAPPED_HARNESS_DIR}", crate_dir.display())
+    );
+    write(&crate_dir.join(".cargo/config.toml"), &cargo_config)?;
     write(&crate_dir.join("Cargo.toml"), &manifest)?;
     write(&crate_dir.join("src/main.rs"), &harness.source)?;
 
+    // Run from inside the generated package: Cargo discovers
+    // `.cargo/config.toml` relative to the working directory, not to
+    // `--manifest-path`, so the remapping above is only honored this way.
     let output = Command::new("cargo")
         .args([
             "build",

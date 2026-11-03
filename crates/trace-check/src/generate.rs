@@ -348,7 +348,11 @@ pub enum GenerateError {
     /// A parameter the symbolic representation cannot describe concretely.
     UnsupportedParameter { parameter: String, repr: String },
     /// The budget cannot cover even one case per parameter boundary.
-    BudgetTooSmall { requested: usize, minimum: usize },
+    BudgetTooSmall {
+        contract: String,
+        requested: usize,
+        minimum: usize,
+    },
     /// A relationship named a parameter that does not exist or is not a byte
     /// array of matching length.
     Relationship { detail: String },
@@ -365,11 +369,15 @@ impl fmt::Display for GenerateError {
                  values can be generated. Supported: u8/u16/u32/u64, `bool`, and `[u8; N]` or \
                  `&[u8; N]` with a literal N"
             ),
-            GenerateError::BudgetTooSmall { requested, minimum } => write!(
+            GenerateError::BudgetTooSmall {
+                contract,
+                requested,
+                minimum,
+            } => write!(
                 f,
-                "a budget of {requested} case(s) cannot cover this contract's boundary values; \
-                 it needs at least {minimum}. Raise `cases`, because a run that silently skips \
-                 the boundaries is not the run that was asked for"
+                "a budget of {requested} case(s) cannot cover `{contract}`'s boundary values; it \
+                 needs at least {minimum}. Raise `cases` for it, because a run that silently \
+                 skips the boundaries is not the run that was asked for"
             ),
             GenerateError::Relationship { detail } => {
                 write!(f, "invalid input relationship: {detail}")
@@ -670,6 +678,7 @@ pub fn generate(
         let minimum = boundary_floor(&per_parameter) + settings.regressions.len();
         if settings.cases < minimum {
             return Err(GenerateError::BudgetTooSmall {
+                contract: contract.to_string(),
                 requested: settings.cases,
                 minimum,
             });
@@ -796,6 +805,63 @@ pub fn generate(
         strategies_requested: settings.strategies.clone(),
         coverage: builder.coverage,
         cases: builder.cases,
+    })
+}
+
+/// Builds a corpus from recorded cases **exactly** as given.
+///
+/// Ordinary generation deduplicates: two cases with identical inputs are one
+/// case, which is right when the goal is discovering inputs. It is wrong when
+/// the goal is re-executing a sequence. A leak that only appears on the second
+/// identical invocation has a reproducer of
+///
+/// ```text
+/// case 0: secret=42, public=1
+/// case 1: secret=42, public=1
+/// ```
+///
+/// and deduplicating it replays one call, which cannot reproduce anything. So
+/// replay comes through here instead: order, multiplicity and values are
+/// preserved, and the only thing kept from generation is the per-case
+/// validation against the contract, so a recorded value can still never be
+/// bound to the wrong width.
+pub fn verbatim(
+    contract: &str,
+    descriptor: &Descriptor,
+    cases: &[Vec<(String, Value)>],
+) -> Result<Corpus, GenerateError> {
+    if cases.is_empty() {
+        return Err(GenerateError::Regression {
+            detail: "no cases were given, so there is nothing to replay".to_string(),
+        });
+    }
+    let parameters = &descriptor.parameters;
+    let mut emitted = Vec::with_capacity(cases.len());
+    for (index, recorded) in cases.iter().enumerate() {
+        let values = align_regression(parameters, recorded)?;
+        emitted.push(GeneratedCase {
+            id: index,
+            strategy: Strategy::Regression,
+            inputs: parameters
+                .iter()
+                .map(|parameter| parameter.name.clone())
+                .zip(values)
+                .collect(),
+        });
+    }
+    Ok(Corpus {
+        schema_version: CORPUS_SCHEMA_VERSION,
+        contract: contract.to_string(),
+        seed: 0,
+        budget: emitted.len(),
+        strategies_requested: vec![Strategy::Regression],
+        coverage: vec![StrategyCoverage {
+            strategy: Strategy::Regression,
+            planned: emitted.len(),
+            emitted: emitted.len(),
+            duplicates: 0,
+        }],
+        cases: emitted,
     })
 }
 
@@ -1318,6 +1384,9 @@ mod tests {
             "{error}"
         );
         assert!(error.to_string().contains("at least"), "{error}");
+        // The message names the contract: a whole-run budget override that one
+        // contract cannot afford has to say which one.
+        assert!(error.to_string().contains("c::verify_tag"), "{error}");
     }
 
     /// Truncation is reported per strategy rather than hidden, so "64 cases
@@ -1343,6 +1412,10 @@ mod tests {
             .expect("pairwise was requested, so it must be accounted for");
         assert!(pairwise.planned > pairwise.emitted);
         assert!(!pairwise.complete());
+        assert!(
+            pairwise.dropped_for_budget() > 0,
+            "pairwise lost cases to the budget, not to deduplication: {pairwise:?}"
+        );
     }
 
     /// Every requested strategy is accounted for in the coverage report, even
@@ -1454,6 +1527,80 @@ mod tests {
         assert_eq!(corpus.cases[0].strategy, Strategy::Regression);
         assert_eq!(corpus.cases[0].inputs[0].1.describe(), "42");
         assert_eq!(corpus.cases[0].inputs[1].1.describe(), "1");
+    }
+
+    /// A verbatim corpus preserves order, multiplicity and values.
+    ///
+    /// The regression: replay routed recorded cases through ordinary
+    /// generation, which deduplicates by input value. A finding that only
+    /// appears on the second identical invocation had its reproducer collapsed
+    /// to one call and could never be reproduced — the exact category of
+    /// finding that sequence preservation exists for.
+    #[test]
+    fn a_verbatim_corpus_keeps_repeated_cases() {
+        let descriptor = descriptor(SUBSTITUTE_MODE);
+        let repeated = vec![
+            ("index".to_string(), Value::Scalar { bits: 8, value: 42 }),
+            ("mode".to_string(), Value::Scalar { bits: 8, value: 1 }),
+        ];
+        let other = vec![
+            ("index".to_string(), Value::Scalar { bits: 8, value: 7 }),
+            ("mode".to_string(), Value::Scalar { bits: 8, value: 0 }),
+        ];
+        let cases = vec![repeated.clone(), repeated.clone(), other, repeated];
+        let corpus = verbatim("c::substitute_mode", &descriptor, &cases).expect("accepted");
+
+        assert_eq!(corpus.cases.len(), 4, "multiplicity must survive");
+        assert_eq!(
+            corpus.cases.iter().map(|case| case.id).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3],
+            "ids must be dense so every case can be selected"
+        );
+        for (case, expected) in corpus.cases.iter().zip(&cases) {
+            assert_eq!(case.inputs, *expected, "order and values must survive");
+            assert_eq!(case.strategy, Strategy::Regression);
+        }
+        // And ordinary generation would have collapsed them, which is what
+        // makes this function necessary rather than a convenience.
+        let deduplicated = generate(
+            "c::substitute_mode",
+            &descriptor,
+            &GenerateSettings {
+                cases: 64,
+                strategies: Vec::new(),
+                regressions: cases,
+                ..Default::default()
+            },
+        )
+        .expect("accepted");
+        assert_eq!(
+            deduplicated.cases.len(),
+            2,
+            "ordinary generation deduplicates, so replay must not use it"
+        );
+    }
+
+    /// A verbatim corpus still validates every case against the contract, so
+    /// replay cannot bind a recorded value to the wrong width.
+    #[test]
+    fn a_verbatim_corpus_still_validates_its_cases() {
+        let descriptor = descriptor(SUBSTITUTE_MODE);
+        let wrong_width = vec![vec![
+            (
+                "index".to_string(),
+                Value::Scalar {
+                    bits: 32,
+                    value: 42,
+                },
+            ),
+            ("mode".to_string(), Value::Scalar { bits: 8, value: 1 }),
+        ]];
+        let error = verbatim("c::substitute_mode", &descriptor, &wrong_width).expect_err("refused");
+        assert!(error.to_string().contains("does not fit"), "{error}");
+
+        let empty: Vec<Vec<(String, Value)>> = Vec::new();
+        let error = verbatim("c::substitute_mode", &descriptor, &empty).expect_err("refused");
+        assert!(error.to_string().contains("nothing to replay"), "{error}");
     }
 
     /// A replayed case that does not fit the contract is refused rather than

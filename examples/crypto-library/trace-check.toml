@@ -86,3 +86,88 @@ rationale = "no branch to erase and no secret-dependent address; the borrow is b
 max_depth = 8000
 checks = ["control-flow", "memory-access"]
 expected_outcome = "VERIFIED_BOUNDED"
+
+# ---------------------------------------------------------------------------
+# Generated constant-time testing (M6).
+#
+# What is NOT here, again: which parameters are secret. The annotation decides
+# that, and the generator reads it off the descriptor.
+#
+# `expectation` is the part that matters. A `security-contract` entry asserts
+# that the *function* satisfies the property, and a detected leak fails the
+# build. An `analyzer-regression` entry asserts that *trace-check* produces a
+# stated result on a deliberately vulnerable example, so detecting the planted
+# leak is the fixture passing. A security contract may not declare an
+# `expected_outcome` at all, which is what stops a stray expectation from
+# turning a real leak into a green build.
+#
+# Every outcome below was measured, not intended.
+# ---------------------------------------------------------------------------
+
+[check."crypto::tag::verify_tag"]
+description = "constant-time tag comparison via subtle::ConstantTimeEq"
+# The relationship strategy earns its place here. Two random 16-byte arrays
+# essentially never match or share a prefix, so uniform generation would only
+# ever exercise the mismatching-on-byte-0 case.
+strategies = ["boundaries", "relationships", "pairwise", "random"]
+
+[[check."crypto::tag::verify_tag".relationships]]
+left = "expected"
+right = "supplied"
+kind = "equal"
+
+[[check."crypto::tag::verify_tag".relationships]]
+left = "expected"
+right = "supplied"
+kind = "differ-last-byte"
+
+[[check."crypto::tag::verify_tag".relationships]]
+left = "expected"
+right = "supplied"
+kind = "share-prefix"
+
+[check."crypto::tag::verify_tag_early_exit"]
+description = "educational: the naive early exit"
+rationale = "the symbolic backend reports VERIFIED_BOUNDED because its freestanding artifact vectorizes the per-byte branch away. This build is a different artifact and keeps the branch, so the dynamic backend finds it -- the same function, two honest answers about two compilations"
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"
+
+[check."crypto::tag::verify_tag_volatile_early_exit"]
+description = "vulnerable: an early exit the optimizer cannot vectorize"
+rationale = "the volatile read keeps the per-byte branch, so the number of comparisons depends on the secret"
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"
+
+[check."crypto::lookup::substitute"]
+description = "constant-time substitution: full-table scan with mask selection"
+
+[check."crypto::lookup::substitute_indexed"]
+description = "vulnerable: the secret selects a load address"
+rationale = "every secret value executes the same instructions, so only an address-aware analysis sees this"
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"
+
+[check."crypto::lookup::substitute_mode"]
+description = "the milestone's demonstration: a leak behind a public mode"
+rationale = "the hand-written #[ct_test] for this contract passes mode = 0 and observes nothing. Generated inputs reach mode = 1 without anyone naming it, which is the gap M6 exists to close"
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"
+
+[check."crypto::controls::tail_byte_probe"]
+description = "per-byte control: only the final byte of the secret reaches an address"
+rationale = "a harness that marked only the pointer, only the leading byte, or the wrong width reports this as clean. It is the test that proves the marking is complete rather than nominal"
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"
+
+[check."crypto::controls::public_branch"]
+description = "negative control: branches on a public input only"
+rationale = "a finding here would be wrong in the direction that makes the tool useless"
+
+[check."crypto::reduce::reduce_once"]
+description = "conditional subtraction over a 32-bit secret, written with a branch"
+rationale = "recorded from the artifact rather than the source: the compiler if-converts the branch, so no leak is observed. A `u32` has 94 boundary values, which is why the budget is raised rather than the boundaries skipped"
+cases = 120
+
+[check."crypto::reduce::reduce_once_masked"]
+description = "the same reduction with the subtraction selected by a mask"
+cases = 120

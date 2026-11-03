@@ -31,7 +31,7 @@ use serde::Serialize;
 use crate::contract::Contract;
 use crate::dynamic_harness::{self, BatchRun, DynamicError};
 use crate::generate::{Corpus, GeneratedCase, Strategy, Value};
-use crate::memcheck::{Classification, MemcheckError};
+use crate::memcheck::{Classification, MemcheckError, MemcheckRun};
 use crate::native::Limits;
 use crate::security::Outcome;
 
@@ -166,6 +166,12 @@ pub struct Finding {
     /// Whether a frame naming the contract's function appears in the
     /// attribution window.
     pub attributed: bool,
+    /// `file:line` of the contract's **own** frame, which is the line a
+    /// developer has to read. The fingerprint's location is the shallowest
+    /// located frame instead, which at `-O` is usually an inlined `core`
+    /// helper: stable for matching, useless for acting on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site: Option<String>,
     pub isolation: Isolation,
     /// The reproducing inputs after shrinking, when shrinking improved on the
     /// isolated case.
@@ -198,6 +204,12 @@ impl Finding {
                 .map(ToString::to_string)
                 .collect(),
             attributed: error.attributable_to(function),
+            site: error.attributed_frame(function).and_then(|frame| {
+                frame.file.as_ref().map(|file| match frame.line {
+                    Some(line) => format!("{file}:{line}"),
+                    None => file.clone(),
+                })
+            }),
             isolation,
             shrunk: None,
         }
@@ -329,6 +341,28 @@ fn target_errors<'r>(run: &'r BatchRun, function: &str) -> Vec<&'r MemcheckError
         .collect()
 }
 
+/// Which positive control a diagnostic can be attributed to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlKind {
+    /// Marking reaches compiled code somewhere in this binary.
+    Calibration,
+    /// *This* contract's secret storage was marked at the call site.
+    SecretBinding,
+}
+
+/// Whether a control fired in a parsed Memcheck report.
+///
+/// Shared so a replay asks the same question `check_contract` asks. A second
+/// definition of "the controls confirmed" is a second thing to get wrong.
+pub fn control_fired(run: &MemcheckRun, control: ControlKind) -> bool {
+    let symbol = match control {
+        ControlKind::Calibration => trace_check_control::PROBE,
+        ControlKind::SecretBinding => trace_check_control::BINDING,
+    };
+    run.secret_dependency_errors()
+        .any(|error| error.attributable_to(symbol))
+}
+
 /// Whether a diagnostic belongs to one of the two positive controls.
 ///
 /// Both are `#[inline(never)]` so this split is possible; without it the
@@ -351,6 +385,13 @@ mod trace_check_control {
 }
 
 /// Whether a batch shows a finding matching `fingerprint` in `function`.
+///
+/// Public as [`run_reproduces`] so a replay asks the same question isolation and
+/// shrinking ask, rather than a second definition of "the same finding".
+pub fn run_reproduces(run: &BatchRun, function: &str, fingerprint: &Fingerprint) -> bool {
+    reproduces(run, function, fingerprint)
+}
+
 fn reproduces(run: &BatchRun, function: &str, fingerprint: &Fingerprint) -> bool {
     target_errors(run, function)
         .into_iter()

@@ -893,7 +893,11 @@ fn run_bounded_with_env(
     })
 }
 
-fn tool_version(program: &Path, args: &[&str]) -> Result<String, String> {
+/// Reads a tool's self-reported version, for provenance.
+///
+/// Public because the generated-testing backend records the same three tools
+/// this one does.
+pub fn tool_version(program: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new(program)
         .args(args)
         .stdin(Stdio::null())

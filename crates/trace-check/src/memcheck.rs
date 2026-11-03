@@ -26,7 +26,7 @@
 
 use std::fmt;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Valgrind XML protocol versions this parser understands.
 ///
@@ -137,7 +137,10 @@ impl Origin {
 }
 
 /// What a Memcheck error means for this analysis.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+///
+/// `Deserialize` as well as `Serialize`, because a persisted reproducer records
+/// the classification it was found for and a replay has to read it back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Classification {
     /// `UninitCondition` from a marked secret: a secret-derived value reached
@@ -249,6 +252,28 @@ impl MemcheckError {
             .iter()
             .find(|frame| frame.file.is_some() && frame.line.is_some())
             .or_else(|| self.primary_stack.first())
+    }
+
+    /// The shallowest primary frame that names `function`, within the
+    /// attribution window.
+    ///
+    /// Distinct from [`MemcheckError::primary_frame`], which is the shallowest
+    /// frame with *any* source location. At `-O` that is usually an inlined
+    /// `core` helper — a leaking load sits inside `core::ptr::read_volatile`,
+    /// so `primary_frame` reports `library/core/src/ptr/mod.rs` and names no
+    /// code the developer wrote. Both are wanted: the shallowest located frame
+    /// is a stable identity for matching one finding across re-runs, and this
+    /// one is what a developer has to go and read.
+    pub fn attributed_frame(&self, function: &str) -> Option<&Frame> {
+        self.primary_stack
+            .iter()
+            .take(ATTRIBUTION_DEPTH)
+            .find(|frame| {
+                frame
+                    .function
+                    .as_deref()
+                    .is_some_and(|name| frame_names_function(name, function))
+            })
     }
 
     /// Whether a frame naming `function` appears within the attribution window
@@ -441,7 +466,10 @@ pub fn parse(xml: &str) -> Result<MemcheckRun, MemcheckParseError> {
     use quick_xml::Reader;
 
     let mut reader = Reader::from_str(xml);
-    reader.config_mut().trim_text(true);
+    // Deliberately *not* `trim_text(true)`. Text is split at every entity
+    // reference, so per-fragment trimming also eats the spaces around one:
+    // `a &amp; b` came out as `a&b`. Whitespace is trimmed once, when the
+    // accumulated value is stored.
     reader.config_mut().check_end_names = true;
 
     let mut protocol_version: Option<String> = None;
@@ -486,11 +514,42 @@ pub fn parse(xml: &str) -> Result<MemcheckRun, MemcheckParseError> {
                 }
                 text.clear();
             }
+            // Appended, not assigned. quick-xml splits text at every entity
+            // reference and delivers the reference separately, so `<fn>` names
+            // containing `&lt;` -- which is every generic or trait-qualified
+            // Rust symbol -- arrive in pieces. Overwriting kept only the
+            // fragment after the last entity, which turned
+            // `read_volatile&lt;u8&gt;` into `u8` and made the finding
+            // unattributable.
             Ok(Event::Text(contents)) => {
-                text = contents
+                text.push_str(
+                    &contents
+                        .decode()
+                        .map_err(|e| MemcheckParseError::Malformed(e.to_string()))?,
+                );
+            }
+            Ok(Event::GeneralRef(reference)) => {
+                let name = reference
                     .decode()
-                    .map_err(|e| MemcheckParseError::Malformed(e.to_string()))?
-                    .into_owned();
+                    .map_err(|e| MemcheckParseError::Malformed(e.to_string()))?;
+                match resolve_entity(&name) {
+                    Some(resolved) => text.push_str(&resolved),
+                    // An entity this parser does not know is kept in its
+                    // original form rather than dropped: losing characters from
+                    // a symbol name silently is what the bug above did.
+                    None => {
+                        text.push('&');
+                        text.push_str(&name);
+                        text.push(';');
+                    }
+                }
+            }
+            Ok(Event::CData(contents)) => {
+                text.push_str(
+                    &contents
+                        .decode()
+                        .map_err(|e| MemcheckParseError::Malformed(e.to_string()))?,
+                );
             }
             Ok(Event::End(end)) => {
                 let name = String::from_utf8_lossy(end.name().as_ref()).into_owned();
@@ -502,17 +561,25 @@ pub fn parse(xml: &str) -> Result<MemcheckRun, MemcheckParseError> {
 
                 match name.as_str() {
                     "valgrindoutput" if depth == 0 => root_closed = true,
-                    "protocolversion" if !in_error => protocol_version = Some(text.clone()),
-                    "tool" if !in_error => tool = Some(text.clone()),
+                    "protocolversion" if !in_error => {
+                        protocol_version = Some(text.trim().to_string())
+                    }
+                    "tool" if !in_error => tool = Some(text.trim().to_string()),
                     "state" if in_status => {
                         if text.trim() == "FINISHED" {
                             finished = true;
                         }
                     }
                     "status" => in_status = false,
-                    "fn" if in_frame => frame.as_mut().unwrap().function = Some(text.clone()),
-                    "file" if in_frame => frame.as_mut().unwrap().file = Some(text.clone()),
-                    "obj" if in_frame => frame.as_mut().unwrap().object = Some(text.clone()),
+                    "fn" if in_frame => {
+                        frame.as_mut().unwrap().function = Some(text.trim().to_string())
+                    }
+                    "file" if in_frame => {
+                        frame.as_mut().unwrap().file = Some(text.trim().to_string())
+                    }
+                    "obj" if in_frame => {
+                        frame.as_mut().unwrap().object = Some(text.trim().to_string())
+                    }
                     "line" if in_frame => frame.as_mut().unwrap().line = text.trim().parse().ok(),
                     "frame" => {
                         if let Some(complete) = frame.take() {
@@ -525,16 +592,18 @@ pub fn parse(xml: &str) -> Result<MemcheckRun, MemcheckParseError> {
                             error.push_stack(std::mem::take(&mut frames));
                         }
                     }
-                    "kind" if in_error => current.as_mut().unwrap().kind = Some(text.clone()),
+                    "kind" if in_error => {
+                        current.as_mut().unwrap().kind = Some(text.trim().to_string())
+                    }
                     "what" if in_error => {
                         let error = current.as_mut().unwrap();
                         if error.what.is_none() {
-                            error.what = Some(text.clone());
+                            error.what = Some(text.trim().to_string());
                         }
                     }
                     // Each `auxwhat` describes the stack that follows it.
                     "auxwhat" if in_error => {
-                        current.as_mut().unwrap().pending_auxwhat = Some(text.clone())
+                        current.as_mut().unwrap().pending_auxwhat = Some(text.trim().to_string())
                     }
                     "error" => {
                         if let Some(complete) = current.take() {
@@ -608,6 +677,34 @@ pub fn parse(xml: &str) -> Result<MemcheckRun, MemcheckParseError> {
         protocol_version,
         errors,
     })
+}
+
+/// Resolves an XML entity reference to the text it stands for.
+///
+/// Valgrind escapes `<`, `>` and `&`, which appear in every demangled Rust
+/// symbol carrying generics, a closure, or a trait qualification. The five
+/// predefined entities plus numeric character references cover what the XML
+/// specification allows here; anything else is unknown and is preserved
+/// verbatim by the caller rather than dropped.
+fn resolve_entity(name: &str) -> Option<String> {
+    match name {
+        "lt" => return Some("<".to_string()),
+        "gt" => return Some(">".to_string()),
+        "amp" => return Some("&".to_string()),
+        "apos" => return Some("'".to_string()),
+        "quot" => return Some("\"".to_string()),
+        _ => {}
+    }
+    // `&#NNN;` and `&#xHH;`.
+    let digits = name.strip_prefix('#')?;
+    let code = match digits
+        .strip_prefix('x')
+        .or_else(|| digits.strip_prefix('X'))
+    {
+        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+        None => digits.parse().ok()?,
+    };
+    char::from_u32(code).map(|c| c.to_string())
 }
 
 #[derive(Default)]
@@ -695,6 +792,66 @@ mod tests {
 <status><state>FINISHED</state></status>
 </valgrindoutput>"#;
 
+    /// An escaped `<fn>` name survives parsing intact, so a generic or
+    /// trait-qualified frame is still attributable.
+    ///
+    /// The regression: quick-xml splits text at each entity reference, and the
+    /// parser used to overwrite rather than append, so
+    /// `read_volatile&lt;u8&gt;` arrived as `u8`. A real leak inside such a
+    /// frame then failed attribution and was downgraded to INCONCLUSIVE.
+    #[test]
+    fn escaped_symbol_names_survive_parsing() {
+        let xml = complete(
+            "<error><unique>0x0</unique><kind>UninitCondition</kind>\
+             <what>Conditional jump or move depends on uninitialised value(s)</what>\
+             <stack><frame><ip>0x1</ip>\
+             <fn>crypto::tag::verify_tag::&lt;u8&gt;</fn>\
+             <file>lib.rs</file><line>7</line></frame></stack>\
+             <auxwhat>Uninitialised value was created by a client request</auxwhat>\
+             <stack><frame><ip>0x9</ip><fn>harness</fn></frame></stack></error>",
+        );
+        let run = parse(&xml).expect("fixture parses");
+        let error = &run.errors[0];
+        assert_eq!(
+            error.primary_stack[0].function.as_deref(),
+            Some("crypto::tag::verify_tag::<u8>")
+        );
+        assert!(
+            error.attributable_to("tag::verify_tag"),
+            "a generic frame must still be attributable to its contract"
+        );
+    }
+
+    /// Every predefined entity and both numeric forms resolve, and an unknown
+    /// entity is preserved rather than silently dropped.
+    #[test]
+    fn entities_resolve_or_are_preserved() {
+        assert_eq!(resolve_entity("lt").as_deref(), Some("<"));
+        assert_eq!(resolve_entity("gt").as_deref(), Some(">"));
+        assert_eq!(resolve_entity("amp").as_deref(), Some("&"));
+        assert_eq!(resolve_entity("apos").as_deref(), Some("'"));
+        assert_eq!(resolve_entity("quot").as_deref(), Some("\""));
+        assert_eq!(resolve_entity("#65").as_deref(), Some("A"));
+        assert_eq!(resolve_entity("#x41").as_deref(), Some("A"));
+        assert!(resolve_entity("nbsp").is_none());
+        assert!(resolve_entity("#xZZ").is_none());
+    }
+
+    /// An `&amp;` inside a `<what>` message is resolved rather than left as
+    /// markup or truncated.
+    #[test]
+    fn escaped_text_in_a_message_is_resolved() {
+        let xml = complete(
+            "<error><unique>0x0</unique><kind>UninitValue</kind>\
+             <what>a &amp; b &lt; c</what>\
+             <stack><frame><ip>0x1</ip><fn>f</fn></frame></stack>\
+             <auxwhat>Uninitialised value was created by a client request</auxwhat>\
+             <stack><frame><ip>0x9</ip><fn>harness</fn></frame></stack></error>",
+        );
+        let run = parse(&xml).expect("fixture parses");
+        assert_eq!(run.errors[0].what, "a & b < c");
+    }
+
     fn complete(body: &str) -> String {
         format!(
             "<valgrindoutput><protocolversion>6</protocolversion><tool>memcheck</tool>{body}\
@@ -719,6 +876,39 @@ mod tests {
         assert_eq!(error.auxiliary_stacks.len(), 1);
         assert_eq!(error.auxiliary_stacks[0].frames.len(), 2);
         assert_eq!(error.origin_frames().len(), 2);
+    }
+
+    /// The attributed frame is the developer's own function, not the inlined
+    /// `core` helper the address technically lands in.
+    #[test]
+    fn the_attributed_frame_names_the_developers_code() {
+        let xml = complete(
+            "<error><unique>0x0</unique><kind>UninitValue</kind>\
+             <what>Use of uninitialised value of size 8</what>\
+             <stack>\
+             <frame><ip>0x1</ip><fn>read_volatile&lt;u8&gt;</fn>\
+             <file>library/core/src/ptr/mod.rs</file><line>2107</line></frame>\
+             <frame><ip>0x2</ip><fn>crypto::lookup::substitute_indexed</fn>\
+             <file>src/lookup.rs</file><line>37</line></frame>\
+             </stack>\
+             <auxwhat>Uninitialised value was created by a client request</auxwhat>\
+             <stack><frame><ip>0x9</ip><fn>harness</fn></frame></stack></error>",
+        );
+        let run = parse(&xml).expect("fixture parses");
+        let error = &run.errors[0];
+        // The stable identity is the shallowest located frame.
+        assert_eq!(
+            error.primary_frame().and_then(|f| f.file.as_deref()),
+            Some("library/core/src/ptr/mod.rs")
+        );
+        // What a developer reads is their own line.
+        let attributed = error
+            .attributed_frame("substitute_indexed")
+            .expect("the contract's own frame");
+        assert_eq!(attributed.file.as_deref(), Some("src/lookup.rs"));
+        assert_eq!(attributed.line, Some(37));
+        // A function that is not on the stack has no attributed frame.
+        assert!(error.attributed_frame("verify_tag").is_none());
     }
 
     /// A module-qualified target is attributed to a frame whose path ends with
