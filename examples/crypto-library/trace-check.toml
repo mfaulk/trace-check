@@ -187,12 +187,24 @@ cases = 200
 expectation = "analyzer-regression"
 expected_outcome = "LEAK_DETECTED"
 
+# The entry that makes this fixture detectable. Without exploration the same
+# check honestly reports NO_LEAK_OBSERVED -- the leak is there, on a path M6's
+# generator cannot construct.
+[check."crypto::hidden::nested_modes".explore]
+enabled = true
+candidate_budget = 1500
+security_case_budget = 128
+
 [check."crypto::hidden::magic_gate"]
 description = "diagnostic: a leak behind an exact 32-bit public equality"
-rationale = "region and branch coverage give no gradient toward one 32-bit constant, so this is expected NOT to be found by coverage feedback alone. It is recorded as INCONCLUSIVE-by-strategy in the milestone document rather than asserted here"
+rationale = "region coverage gives no gradient toward one 32-bit constant -- the M7.1 spike measured sixteen random tokens producing byte-identical coverage -- so exploration is expected NOT to find this. The declared outcome records that honestly instead of leaving the gap implicit"
 cases = 200
 expectation = "analyzer-regression"
 expected_outcome = "NO_LEAK_OBSERVED"
+
+[check."crypto::hidden::magic_gate".explore]
+enabled = true
+candidate_budget = 1000
 
 [check."crypto::hidden::threshold_window"]
 description = "boundary and coverage interaction: a leak in a window above a public threshold"
@@ -201,6 +213,10 @@ cases = 200
 expectation = "analyzer-regression"
 expected_outcome = "LEAK_DETECTED"
 
+[check."crypto::hidden::threshold_window".explore]
+enabled = true
+candidate_budget = 512
+
 [check."crypto::hidden::secret_gated"]
 description = "a leak reachable only for some secret values, behind one public predicate"
 rationale = "keeps secret-input exploration honest: a strategy that froze the secret would never execute the region behind the secret-bit test"
@@ -208,7 +224,20 @@ cases = 200
 expectation = "analyzer-regression"
 expected_outcome = "LEAK_DETECTED"
 
+[check."crypto::hidden::secret_gated".explore]
+enabled = true
+candidate_budget = 512
+# Restating the defaults, because this is the fixture they exist for: freezing
+# the secret would leave the region behind the secret-bit test unexplored.
+mutate_public = true
+mutate_secret = true
+
 [check."crypto::hidden::nested_modes_clean"]
 description = "false-positive control sharing nested_modes' shape, with a safe guarded region"
 rationale = "exploration reaches the deeply guarded region and the security backend must still observe nothing. A finding here would mean discovery had begun manufacturing evidence"
 cases = 200
+
+[check."crypto::hidden::nested_modes_clean".explore]
+enabled = true
+candidate_budget = 1500
+security_case_budget = 128

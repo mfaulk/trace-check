@@ -430,6 +430,94 @@ pub struct CheckSettings {
     /// this split exists to prevent.
     #[serde(default)]
     pub expected_outcome: Option<String>,
+    /// M7 coverage-guided exploration. Disabled unless asked for.
+    #[serde(default)]
+    pub explore: ExploreConfig,
+}
+
+/// Per-contract coverage-guided exploration settings.
+///
+/// Off by default, deliberately. Exploration builds a second artifact and needs
+/// the toolchain's LLVM tools, so turning it on is a decision about build time
+/// and machine setup. A configuration written for M6 stays valid and keeps
+/// doing exactly what it did.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExploreConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Mutation candidates to attempt, beyond the baseline corpus.
+    #[serde(default = "default_candidate_budget")]
+    pub candidate_budget: usize,
+    /// Cap on cases handed to the Memcheck backend.
+    ///
+    /// Separate from `cases` on purpose: exploring is cheap and analyzing is
+    /// not, and a single number would hide which of the two a developer was
+    /// actually budgeting.
+    #[serde(default = "default_security_case_budget")]
+    pub security_case_budget: usize,
+    /// The feedback mechanism. Only `llvm-regions` is implemented.
+    #[serde(default = "default_feedback")]
+    pub feedback: String,
+    /// Whether public parameters may be mutated.
+    #[serde(default = "default_true")]
+    pub mutate_public: bool,
+    /// Whether secret parameters may be mutated.
+    #[serde(default = "default_true")]
+    pub mutate_secret: bool,
+    /// Wall-clock safety limit, in seconds.
+    #[serde(default = "default_time_limit_seconds")]
+    pub time_limit_seconds: u64,
+}
+
+fn default_candidate_budget() -> usize {
+    crate::explore::DEFAULT_CANDIDATE_BUDGET
+}
+
+fn default_security_case_budget() -> usize {
+    crate::explore::DEFAULT_SECURITY_CASE_BUDGET
+}
+
+fn default_feedback() -> String {
+    crate::coverage::FEEDBACK.to_string()
+}
+
+fn default_time_limit_seconds() -> u64 {
+    crate::explore::DEFAULT_TIME_LIMIT.as_secs()
+}
+
+impl Default for ExploreConfig {
+    fn default() -> Self {
+        ExploreConfig {
+            enabled: false,
+            candidate_budget: default_candidate_budget(),
+            security_case_budget: default_security_case_budget(),
+            feedback: default_feedback(),
+            mutate_public: true,
+            mutate_secret: true,
+            time_limit_seconds: default_time_limit_seconds(),
+        }
+    }
+}
+
+impl ExploreConfig {
+    /// The exploration settings this entry describes, under `seed`.
+    ///
+    /// The generation seed is reused rather than configured twice: one seed
+    /// reproduces one run, and two seeds would make "the same seed reproduces
+    /// the same corpus" a claim about a pair.
+    pub fn settings(&self, seed: u64) -> crate::explore::ExploreSettings {
+        crate::explore::ExploreSettings {
+            candidate_budget: self.candidate_budget,
+            security_case_budget: self.security_case_budget,
+            seed,
+            round_size: crate::coverage::DEFAULT_ROUND_SIZE,
+            mutate_public: self.mutate_public,
+            mutate_secret: self.mutate_secret,
+            dry_rounds: crate::explore::DEFAULT_DRY_ROUNDS,
+            time_limit: std::time::Duration::from_secs(self.time_limit_seconds),
+        }
+    }
 }
 
 fn default_cases() -> usize {
@@ -466,6 +554,7 @@ impl Default for CheckSettings {
             shrink_budget: default_shrink_budget(),
             expectation: Expectation::default(),
             expected_outcome: None,
+            explore: ExploreConfig::default(),
         }
     }
 }
@@ -507,6 +596,46 @@ impl CheckSettings {
             .map(|(_, strategy)| *strategy)
         {
             return reject(format!("`strategies` lists {duplicate} twice"));
+        }
+        if self.explore.enabled {
+            if self.explore.candidate_budget == 0 {
+                return reject(
+                    "`explore.candidate_budget` is 0, so exploration would attempt nothing and \
+                     the run would report a search it did not perform"
+                        .to_string(),
+                );
+            }
+            if self.explore.security_case_budget == 0 {
+                return reject(
+                    "`explore.security_case_budget` is 0, so no case would be analyzed, and a \
+                     run that checks nothing is not a pass"
+                        .to_string(),
+                );
+            }
+            if self.explore.feedback != crate::coverage::FEEDBACK {
+                return reject(format!(
+                    "`explore.feedback` is {:?}; this build implements only {:?}. Branch, edge \
+                     and comparison feedback need a nightly toolchain -- see \
+                     docs/MILESTONE-07.md",
+                    self.explore.feedback,
+                    crate::coverage::FEEDBACK
+                ));
+            }
+            if !self.explore.mutate_public && !self.explore.mutate_secret {
+                return reject(
+                    "`explore.mutate_public` and `explore.mutate_secret` are both false, so no \
+                     mutation could change anything and exploration would be a slower way to \
+                     run the baseline corpus"
+                        .to_string(),
+                );
+            }
+            if self.explore.time_limit_seconds == 0 {
+                return reject(
+                    "`explore.time_limit_seconds` is 0, so exploration would stop before its \
+                     first round and report an incomplete search"
+                        .to_string(),
+                );
+            }
         }
         match (&self.expectation, &self.expected_outcome) {
             (Expectation::SecurityContract, Some(declared)) => reject(format!(

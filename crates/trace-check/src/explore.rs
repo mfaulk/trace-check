@@ -332,7 +332,7 @@ pub struct MutationMix {
 pub struct ExploreSettings {
     /// Mutation candidates to attempt, beyond the baseline corpus.
     pub candidate_budget: usize,
-    /// Cap on cases handed to the security backend.
+    /// Cap on **explored** cases added to the security corpus.
     pub security_case_budget: usize,
     pub seed: u64,
     /// Candidates per discovery round.
@@ -377,8 +377,12 @@ pub struct Exploration {
     pub baseline_cases: usize,
     /// Mutation candidates attempted.
     pub candidates_attempted: usize,
-    /// Candidates that produced usable coverage.
+    /// Of the mutation candidates attempted, how many produced usable
+    /// coverage. Baseline cases are counted by `baseline_observed`, because one
+    /// combined number exceeds `candidates_attempted` and reads as nonsense.
     pub candidates_observed: usize,
+    /// Baseline cases that produced usable coverage.
+    pub baseline_observed: usize,
     /// Candidates retained for reaching something new.
     pub candidates_retained: usize,
     pub rounds: usize,
@@ -588,6 +592,7 @@ pub fn explore(
         baseline_cases: baseline.cases.len(),
         candidates_attempted: state.attempted,
         candidates_observed: state.observed,
+        baseline_observed: state.baseline_observed,
         candidates_retained: state.retained_mutations,
         rounds: state.rounds,
         baseline_regions: state.baseline_regions,
@@ -666,6 +671,7 @@ struct State<'a> {
     next_id: usize,
     attempted: usize,
     observed: usize,
+    baseline_observed: usize,
     retained_mutations: usize,
     baseline_regions: usize,
     rounds: usize,
@@ -695,6 +701,7 @@ impl<'a> State<'a> {
             next_id: 0,
             attempted: 0,
             observed: 0,
+            baseline_observed: 0,
             retained_mutations: 0,
             baseline_regions: 0,
             rounds: 0,
@@ -718,7 +725,7 @@ impl<'a> State<'a> {
             let novel = observation.novel(&self.seen);
             let fresh_function = self.fresh_functions(observation);
             if observation.status.usable() {
-                self.observed += 1;
+                self.baseline_observed += 1;
             } else {
                 self.failures.push(CandidateFailure {
                     case_id: *id,
@@ -1354,6 +1361,255 @@ impl fmt::Display for ExploreError {
 
 impl std::error::Error for ExploreError {}
 
+/// A bounded corpus chosen from an exploration, for the security backend.
+///
+/// The discovery corpus and the security corpus are deliberately separate
+/// values. Exploration can retain hundreds of candidates; running all of them
+/// under Memcheck would cost more than the budget a CI job has, and a tool that
+/// silently spent it would be making the developer's scheduling decision for
+/// them. So selection is its own stage, and everything it dropped is counted.
+#[derive(Debug, Clone, Serialize)]
+pub struct Selection {
+    /// Explored cases the selection was allowed to add.
+    pub budget: usize,
+    /// Total cases the security backend will run.
+    pub total: usize,
+    /// Candidate ids chosen, in the order they will be analyzed.
+    pub selected: Vec<usize>,
+    /// Of those, cases that had to be kept whatever their coverage: M6's
+    /// generated corpus, including any replayed reproducers.
+    pub mandatory: usize,
+    /// Cases the set-cover heuristic added for the regions they contribute.
+    pub by_coverage: usize,
+    /// Explored candidates dropped because the selection already covered every
+    /// region they reach.
+    pub excluded_duplicate_coverage: usize,
+    /// Explored candidates dropped because the budget ran out. Distinct from
+    /// the line above, because only this one costs coverage.
+    pub excluded_for_budget: usize,
+    /// Regions, in the discovery artifact, the selection covers.
+    pub regions_selected: usize,
+    /// Regions exploration reached that no selected case covers.
+    ///
+    /// Zero unless the budget truncated the selection. Reported either way,
+    /// because "minimized without loss" and "minimized within a budget" are
+    /// different claims.
+    pub regions_lost: usize,
+}
+
+impl Selection {
+    /// Whether the budget cut coverage the exploration had reached.
+    pub fn truncated(&self) -> bool {
+        self.excluded_for_budget > 0 || self.regions_lost > 0
+    }
+
+    /// What this selection dropped, in words, or `None` when it dropped
+    /// nothing that cost coverage.
+    pub fn truncation(&self) -> Option<String> {
+        if !self.truncated() {
+            return None;
+        }
+        Some(format!(
+            "{} explored candidate(s) were dropped for budget, losing {} region(s) of discovery \
+             coverage. Raise `explore.security_case_budget` to analyze them",
+            self.excluded_for_budget, self.regions_lost
+        ))
+    }
+}
+
+/// Chooses a bounded security corpus from an exploration.
+///
+/// # The budget bounds what exploration *adds*
+///
+/// Every case M6 would have generated is selected before the heuristic runs at
+/// all, and `budget` caps the explored cases added on top of them.
+///
+/// That split was a correction. When the budget capped the **total**, a
+/// contract with a 200-case corpus and a 128-case budget kept its 200 mandatory
+/// cases and had no room left for the three explored candidates — so a run
+/// configured to search dropped exactly the inputs it had been run to find, and
+/// reported `NO_LEAK_OBSERVED` on the fixture whose leak it had just located.
+///
+/// Two budgets that can conflict have to be resolved somehow, and the
+/// alternatives are worse: capping the total either drops cases M6 would have
+/// run, which is less checking under a flag asking for more, or drops the
+/// explored ones, which makes the feature do nothing. Independent budgets mean
+/// a developer who sets both gets both, and [`Selection::total`] says what that
+/// came to.
+///
+/// The rest is the textbook greedy set-cover heuristic over the explored
+/// candidates — repeatedly take the candidate covering the most
+/// not-yet-covered regions — with ties broken by the lowest candidate id. It is
+/// a heuristic and not an optimum, which is the right trade here: an exact
+/// minimum cover is NP-hard and the budget is a rough number anyway.
+///
+/// # What a region count here does and does not mean
+///
+/// Every region in this function is a region of the **discovery** artifact. A
+/// candidate selected for covering a region there may follow a different path
+/// in the optimized security artifact, which is a difference the report states
+/// rather than resolves. Selection coverage is a property of the search, never
+/// evidence about the code.
+pub fn select(exploration: &Exploration, budget: usize) -> Selection {
+    let usable: Vec<&Candidate> = exploration
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.mandatory || !candidate.covered.is_empty())
+        .collect();
+
+    // Stage one: the cases that are not the heuristic's business.
+    let mut selected: Vec<usize> = Vec::new();
+    let mut covered = RegionSet::new();
+    for candidate in usable.iter().filter(|candidate| candidate.mandatory) {
+        selected.push(candidate.id);
+        covered.extend(candidate.covered.iter().cloned());
+    }
+    let mandatory = selected.len();
+
+    // Stage two: greedy set cover over what exploration found.
+    let mut remaining: Vec<&Candidate> = usable
+        .into_iter()
+        .filter(|candidate| !candidate.mandatory)
+        .collect();
+    let mut by_coverage = 0;
+    let mut duplicates = 0;
+    while by_coverage < budget {
+        // Highest contribution wins; the lowest id breaks a tie, so the choice
+        // does not depend on iteration order or on a hash.
+        let best = remaining
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                (
+                    candidate.covered.difference(&covered).count(),
+                    std::cmp::Reverse(candidate.id),
+                    index,
+                )
+            })
+            .max();
+        let Some((contribution, _, index)) = best else {
+            break;
+        };
+        if contribution == 0 {
+            // Nothing left adds a region. Everything still in `remaining` is
+            // covered by what is already selected.
+            duplicates += remaining.len();
+            remaining.clear();
+            break;
+        }
+        let candidate = remaining.swap_remove(index);
+        selected.push(candidate.id);
+        covered.extend(candidate.covered.iter().cloned());
+        by_coverage += 1;
+    }
+
+    // Anything still pending when the loop ended on the budget was dropped for
+    // the budget, and only those cost coverage.
+    let mut excluded_for_budget = 0;
+    let mut lost = RegionSet::new();
+    for candidate in &remaining {
+        let novel = candidate.covered.difference(&covered).count();
+        if novel == 0 {
+            duplicates += 1;
+        } else {
+            excluded_for_budget += 1;
+            lost.extend(candidate.covered.difference(&covered).cloned());
+        }
+    }
+
+    Selection {
+        budget,
+        total: selected.len(),
+        selected,
+        mandatory,
+        by_coverage,
+        excluded_duplicate_coverage: duplicates,
+        excluded_for_budget,
+        regions_selected: covered.len(),
+        regions_lost: lost.len(),
+    }
+}
+
+/// Turns a selection into the typed corpus the security backend consumes.
+///
+/// The handoff, and the milestone's principal architectural boundary. What
+/// crosses it is M6's own [`Corpus`] type and nothing else: no coverage, no
+/// region ids, no claim about what was explored. The security backend cannot
+/// tell a selected candidate from a boundary case, which is the point —
+/// exploration must not be able to influence how a finding is classified.
+///
+/// Values are revalidated against the contract on the way through, so a mutated
+/// value can never be bound to the wrong width.
+pub fn security_corpus(
+    contract: &str,
+    descriptor: &Descriptor,
+    exploration: &Exploration,
+    selection: &Selection,
+) -> Result<Corpus, ExploreError> {
+    // The seed the baseline was generated under, carried through so a corpus
+    // summary names the seed that reproduces this corpus rather than the zero
+    // `with_ids` defaults to.
+    let seed = exploration.seed;
+    let mut entries: Vec<CaseEntry> = Vec::with_capacity(selection.selected.len());
+    for id in &selection.selected {
+        let candidate = exploration
+            .candidates
+            .iter()
+            .find(|candidate| candidate.id == *id)
+            .ok_or_else(|| {
+                ExploreError::Io(format!("selected case {id} is not in the exploration"))
+            })?;
+        let strategy = match &candidate.origin {
+            Origin::Baseline { strategy } => *strategy,
+            Origin::Mutated { .. } => Strategy::Explored,
+        };
+        entries.push((candidate.id, strategy, candidate.inputs.clone()));
+    }
+    let mut corpus = generate::with_ids(contract, descriptor, &entries)?;
+    corpus.seed = seed;
+    Ok(corpus)
+}
+
+/// Why each selected case is in the corpus, for a report and a reproducer.
+///
+/// The mapping back from an analyzed case to the discovery observation that
+/// selected it. A finding against an explored case is otherwise impossible to
+/// explain: a developer sees an input nobody wrote and no strategy name
+/// accounts for.
+#[derive(Debug, Clone, Serialize)]
+pub struct Provenance {
+    pub case_id: usize,
+    pub origin: Origin,
+    /// Regions this case covered in the discovery artifact.
+    pub discovery_regions: usize,
+    /// Regions it was the first to reach.
+    pub novel_regions: usize,
+    pub target_invoked: bool,
+    pub inputs: String,
+}
+
+/// The provenance of every selected case, in selection order.
+pub fn provenance(exploration: &Exploration, selection: &Selection) -> Vec<Provenance> {
+    selection
+        .selected
+        .iter()
+        .filter_map(|id| {
+            exploration
+                .candidates
+                .iter()
+                .find(|candidate| candidate.id == *id)
+        })
+        .map(|candidate| Provenance {
+            case_id: candidate.id,
+            origin: candidate.origin.clone(),
+            discovery_regions: candidate.covered.len(),
+            novel_regions: candidate.novel,
+            target_invoked: candidate.target_invoked,
+            inputs: candidate.describe(),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1754,6 +2010,264 @@ mod tests {
             detail: "x".to_string()
         }
         .complete());
+    }
+
+    // ---------------------------------------------------------------------
+    // Selection
+    // ---------------------------------------------------------------------
+
+    fn region_at(line: u32) -> crate::coverage::Region {
+        crate::coverage::Region {
+            file: "/lib/src/a.rs".to_string(),
+            line_start: line,
+            column_start: 1,
+            line_end: line,
+            column_end: 9,
+        }
+    }
+
+    fn candidate(id: usize, mandatory: bool, lines: &[u32]) -> Candidate {
+        Candidate {
+            id,
+            inputs: nested_case(id as u64 % 256, 0, 0, 0),
+            origin: if mandatory {
+                Origin::Baseline {
+                    strategy: Strategy::Boundaries,
+                }
+            } else {
+                Origin::Mutated {
+                    seed: 0,
+                    operator: Operator::Interesting,
+                    target: MutationTarget::Public,
+                    parameters: vec!["stage".to_string()],
+                }
+            },
+            covered: lines.iter().copied().map(region_at).collect(),
+            novel: lines.len(),
+            target_invoked: true,
+            mandatory,
+        }
+    }
+
+    fn exploration_of(candidates: Vec<Candidate>) -> Exploration {
+        let reached: RegionSet = candidates
+            .iter()
+            .flat_map(|candidate| candidate.covered.iter().cloned())
+            .collect();
+        Exploration {
+            feedback: "llvm-regions".to_string(),
+            granularity: "regions".to_string(),
+            coverage_map: CoverageMap {
+                id: "map".to_string(),
+                total_regions: reached.len(),
+                in_scope_regions: reached.len(),
+                files: vec!["/lib/src/a.rs".to_string()],
+                target_records: 1,
+            },
+            discovery_artifact_sha256: "sha".to_string(),
+            scope: "/lib".to_string(),
+            seed: 1,
+            candidate_budget: 100,
+            baseline_cases: candidates.iter().filter(|c| c.mandatory).count(),
+            candidates_attempted: candidates.iter().filter(|c| !c.mandatory).count(),
+            candidates_observed: candidates.iter().filter(|c| !c.mandatory).count(),
+            baseline_observed: candidates.iter().filter(|c| c.mandatory).count(),
+            candidates_retained: candidates.iter().filter(|c| !c.mandatory).count(),
+            rounds: 1,
+            baseline_regions: 0,
+            regions_reached: reached.len(),
+            mutation_mix: MutationMix::default(),
+            termination: Termination::BudgetExhausted,
+            elapsed_ms: 0,
+            failures: Vec::new(),
+            candidates,
+        }
+    }
+
+    /// Every mandatory case is selected before the heuristic runs, so enabling
+    /// exploration cannot reduce what the security backend is given.
+    #[test]
+    fn mandatory_cases_are_always_selected() {
+        let exploration = exploration_of(vec![
+            candidate(0, true, &[1, 2]),
+            candidate(1, true, &[1, 2]),
+            candidate(2, true, &[1, 2]),
+            candidate(10, false, &[9]),
+        ]);
+        let selection = select(&exploration, 64);
+        assert_eq!(selection.mandatory, 3);
+        for id in [0, 1, 2] {
+            assert!(
+                selection.selected.contains(&id),
+                "mandatory case {id} was not selected"
+            );
+        }
+        // Mandatory cases come first, so an analyzed batch runs M6's corpus
+        // before anything exploration invented.
+        assert_eq!(&selection.selected[..3], &[0, 1, 2]);
+    }
+
+    /// A budget smaller than the baseline corpus does not starve exploration.
+    ///
+    /// The regression this pins: when the budget capped the *total*, a 200-case
+    /// corpus with a 128-case budget left no room for the explored candidates,
+    /// so the run dropped exactly the inputs it had been run to find.
+    #[test]
+    fn a_budget_smaller_than_the_baseline_still_admits_explored_cases() {
+        let exploration = exploration_of(vec![
+            candidate(0, true, &[1]),
+            candidate(1, true, &[2]),
+            candidate(2, true, &[3]),
+            candidate(10, false, &[9]),
+        ]);
+        let selection = select(&exploration, 2);
+        assert_eq!(selection.mandatory, 3);
+        assert_eq!(
+            selection.by_coverage, 1,
+            "the explored candidate must still be analyzed"
+        );
+        assert!(selection.selected.contains(&10));
+        assert_eq!(selection.total, 4);
+        assert_eq!(selection.regions_lost, 0);
+        assert!(selection.truncation().is_none());
+    }
+
+    /// An explored candidate whose regions are already covered is excluded as a
+    /// duplicate, which costs no coverage and is counted separately from a
+    /// budget drop.
+    #[test]
+    fn duplicate_coverage_is_excluded_without_losing_regions() {
+        let exploration = exploration_of(vec![
+            candidate(0, true, &[1, 2]),
+            candidate(10, false, &[1, 2]),
+            candidate(11, false, &[1]),
+            candidate(12, false, &[3]),
+        ]);
+        let selection = select(&exploration, 64);
+        assert!(
+            selection.selected.contains(&12),
+            "the novel case was dropped"
+        );
+        assert_eq!(selection.excluded_duplicate_coverage, 2);
+        assert_eq!(selection.excluded_for_budget, 0);
+        assert_eq!(selection.regions_lost, 0);
+        assert!(!selection.truncated());
+        assert!(selection.truncation().is_none());
+    }
+
+    /// Minimization keeps every region the exploration reached, when the budget
+    /// allows it.
+    #[test]
+    fn minimization_retains_every_reached_region() {
+        let exploration = exploration_of(vec![
+            candidate(0, true, &[1]),
+            candidate(10, false, &[1, 2]),
+            candidate(11, false, &[3, 4]),
+            candidate(12, false, &[2, 3]),
+            candidate(13, false, &[5]),
+        ]);
+        let selection = select(&exploration, 64);
+        assert_eq!(
+            selection.regions_selected, exploration.regions_reached,
+            "minimization lost a region it had the budget to keep"
+        );
+        assert_eq!(selection.regions_lost, 0);
+    }
+
+    /// The greedy heuristic takes the largest contribution first, so a budget
+    /// of two picks the two-region case over either one-region case.
+    #[test]
+    fn selection_prefers_the_largest_contribution() {
+        let exploration = exploration_of(vec![
+            candidate(0, true, &[1]),
+            candidate(10, false, &[2]),
+            candidate(11, false, &[3, 4, 5]),
+            candidate(12, false, &[6]),
+        ]);
+        let selection = select(&exploration, 1);
+        assert_eq!(selection.selected, vec![0, 11]);
+        assert_eq!(selection.by_coverage, 1);
+        assert_eq!(selection.excluded_for_budget, 2);
+        assert_eq!(selection.regions_lost, 2, "regions 2 and 6 were dropped");
+        assert!(selection.truncated());
+        assert!(selection
+            .truncation()
+            .expect("a truncated selection explains itself")
+            .contains("dropped for budget"));
+    }
+
+    /// Ties are broken by the lowest candidate id, so selection does not depend
+    /// on iteration order.
+    #[test]
+    fn selection_is_deterministic_under_ties() {
+        let build = || {
+            exploration_of(vec![
+                candidate(0, true, &[1]),
+                candidate(13, false, &[7]),
+                candidate(11, false, &[8]),
+                candidate(12, false, &[9]),
+            ])
+        };
+        let first = select(&build(), 1);
+        for _ in 0..8 {
+            assert_eq!(select(&build(), 1).selected, first.selected);
+        }
+        assert_eq!(
+            first.selected,
+            vec![0, 11],
+            "the lowest id must win a tie, got {:?}",
+            first.selected
+        );
+    }
+
+    /// The security corpus carries M6's own strategies for baseline cases and
+    /// `explored` for the rest, so a report cannot misattribute either.
+    #[test]
+    fn the_security_corpus_labels_where_each_case_came_from() {
+        let descriptor = descriptor(NESTED);
+        let exploration =
+            exploration_of(vec![candidate(0, true, &[1]), candidate(10, false, &[2])]);
+        let selection = select(&exploration, 64);
+        let corpus = security_corpus(NESTED, &descriptor, &exploration, &selection)
+            .expect("the selection converts");
+
+        assert_eq!(corpus.cases.len(), 2);
+        assert_eq!(corpus.cases[0].id, 0);
+        assert_eq!(corpus.cases[0].strategy, Strategy::Boundaries);
+        assert_eq!(corpus.cases[1].id, 10);
+        assert_eq!(corpus.cases[1].strategy, Strategy::Explored);
+        // Case ids survive the handoff, which is what lets a finding be traced
+        // back to the observation that selected it.
+        assert!(corpus.to_wire().contains("10 explored "));
+
+        let provenance = provenance(&exploration, &selection);
+        assert_eq!(provenance.len(), 2);
+        assert!(matches!(provenance[1].origin, Origin::Mutated { .. }));
+        assert!(provenance[1].inputs.contains("index="));
+    }
+
+    /// A candidate whose coverage was never usable is not selectable: an
+    /// unmeasured input has no evidence for being chosen over any other.
+    #[test]
+    fn a_candidate_with_no_coverage_is_not_selected_on_its_own_merit() {
+        let exploration = exploration_of(vec![
+            candidate(0, true, &[1]),
+            candidate(10, false, &[]),
+            candidate(11, false, &[2]),
+        ]);
+        let selection = select(&exploration, 64);
+        assert!(!selection.selected.contains(&10));
+        assert!(selection.selected.contains(&11));
+    }
+
+    /// A mandatory case with no coverage is still selected: it is M6's case,
+    /// and its place in the corpus does not depend on a coverage measurement.
+    #[test]
+    fn a_mandatory_case_with_no_coverage_is_still_selected() {
+        let exploration = exploration_of(vec![candidate(0, true, &[]), candidate(10, false, &[2])]);
+        let selection = select(&exploration, 64);
+        assert!(selection.selected.contains(&0));
+        assert_eq!(selection.mandatory, 1);
     }
 
     /// Operators are only offered for representations they can preserve.
