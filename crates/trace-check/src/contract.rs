@@ -491,6 +491,14 @@ impl CheckSettings {
                     .to_string(),
             );
         }
+        if self.strategies.contains(&Strategy::Explored) {
+            return reject(
+                "`strategies` lists \"explored\", which is produced by coverage feedback from an \
+                 instrumented artifact rather than by a rule over the signature. Enable it with \
+                 `[check.\"...\".explore] enabled = true` instead"
+                    .to_string(),
+            );
+        }
         if let Some(duplicate) = self
             .strategies
             .iter()
