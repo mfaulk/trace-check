@@ -29,6 +29,7 @@
 //! dynamic backend's `NO_LEAK_OBSERVED`.
 
 pub mod census;
+pub mod check;
 pub mod compare;
 pub mod contract;
 pub mod dynamic_harness;

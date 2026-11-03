@@ -1280,6 +1280,29 @@ mod tests {
         assert!(!corpus.truncated().is_empty());
     }
 
+    /// A corpus of replayed regressions alone has no boundary floor, because it
+    /// never asked for boundary coverage.
+    #[test]
+    fn a_regression_only_corpus_has_no_boundary_floor() {
+        let settings = GenerateSettings {
+            cases: 4,
+            strategies: Vec::new(),
+            regressions: vec![vec![
+                ("index".to_string(), Value::Scalar { bits: 8, value: 9 }),
+                ("mode".to_string(), Value::Scalar { bits: 8, value: 1 }),
+            ]],
+            ..Default::default()
+        };
+        let corpus = generate(
+            "c::substitute_mode",
+            &descriptor(SUBSTITUTE_MODE),
+            &settings,
+        )
+        .expect("accepted");
+        assert_eq!(corpus.cases.len(), 1);
+        assert_eq!(corpus.cases[0].strategy, Strategy::Regression);
+    }
+
     /// A budget too small to cover the boundaries is refused rather than
     /// quietly skipping them.
     #[test]

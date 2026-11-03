@@ -14,12 +14,14 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use trace_check::check::{self, CheckBudget, ContractCheck, Control, Isolation};
 use trace_check::contract::Contract;
 use trace_check::dynamic_harness::{self, BatchRun};
 use trace_check::generate::{self, GenerateSettings, Strategy, Value};
 use trace_check::harness::{self, Library, Workspace};
 use trace_check::memcheck::Classification;
 use trace_check::native::{self, prepare_valgrind};
+use trace_check::security::Outcome;
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -58,6 +60,8 @@ struct Prepared {
     artifact: PathBuf,
     corpus_path: PathBuf,
     corpus: generate::Corpus,
+    /// Kept so a `Runner` can stage ad-hoc shrink candidates beside the corpus.
+    work_dir: PathBuf,
     // Held so the workspace outlives the artifact it contains.
     _workspace: Workspace,
 }
@@ -100,6 +104,7 @@ fn prepare(contract_id: &str, settings: GenerateSettings) -> Prepared {
         artifact: artifact.path,
         corpus_path,
         corpus,
+        work_dir,
         _workspace: workspace,
     }
 }
@@ -410,6 +415,292 @@ fn an_unknown_case_id_fails_the_run() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// M6.4 / M6.5: batching, failure isolation, and shrinking.
+// ---------------------------------------------------------------------------
+
+/// Settings whose corpus is exactly the replayed cases, in order, so a test can
+/// place a known leaky case at a known id.
+fn replaying(cases: &[(u8, u8)]) -> GenerateSettings {
+    GenerateSettings {
+        cases: 64,
+        strategies: Vec::new(),
+        regressions: cases
+            .iter()
+            .map(|(index, mode)| {
+                vec![
+                    (
+                        "index".to_string(),
+                        Value::Scalar {
+                            bits: 8,
+                            value: u64::from(*index),
+                        },
+                    ),
+                    (
+                        "mode".to_string(),
+                        Value::Scalar {
+                            bits: 8,
+                            value: u64::from(*mode),
+                        },
+                    ),
+                ]
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+impl Prepared {
+    /// Runs the whole corpus through the batching, isolation and shrinking
+    /// pipeline.
+    fn check(&self, budget: CheckBudget) -> ContractCheck {
+        let (valgrind, _version) = prepare_valgrind().expect("valgrind is available");
+        let mut runner = check::Runner::new(
+            &valgrind,
+            &self.artifact,
+            self.corpus_path.clone(),
+            self.work_dir.clone(),
+            native::Limits::default(),
+        );
+        let generated = dynamic_harness::generate(&self.contract).expect("generated");
+        check::check_contract(
+            &mut runner,
+            &self.contract,
+            &self.corpus,
+            &generated.secret_parameters,
+            generated.marked_bytes,
+            &budget,
+        )
+        .unwrap_or_else(|e| panic!("checking {} failed: {e}", self.contract.id))
+    }
+}
+
+/// A batched finding is narrowed back to the single case that caused it.
+///
+/// Eight cases, one of which takes the leaky public mode. The aggregate report
+/// cannot say which — Memcheck consolidates the site — so this is the test that
+/// the re-run narrowing actually works.
+#[test]
+fn a_batched_finding_isolates_to_one_case() {
+    if !valgrind_available() {
+        return;
+    }
+    let cases = [
+        (1, 0),
+        (2, 0),
+        (3, 0),
+        (4, 0),
+        (5, 1),
+        (6, 0),
+        (7, 0),
+        (8, 0),
+    ];
+    let prepared = prepare("crypto::lookup::substitute_mode", replaying(&cases));
+    assert_eq!(prepared.corpus.cases.len(), 8);
+
+    let check = prepared.check(CheckBudget {
+        batch_size: 8,
+        shrink: false,
+        ..Default::default()
+    });
+    assert_eq!(check.outcome, Outcome::LeakDetected, "{}", check.message);
+    assert_eq!(check.cases_completed, 8);
+    assert_eq!(check.findings.len(), 1, "{:#?}", check.findings);
+
+    let finding = &check.findings[0];
+    assert!(finding.attributed, "the finding must name the contract");
+    match &finding.isolation {
+        Isolation::Case { id, inputs, runs } => {
+            // Case 4 is `(5, 1)`, the only one taking the leaky mode.
+            assert_eq!(*id, 4, "isolated the wrong case: {inputs:?}");
+            assert_eq!(inputs[1].1, Value::Scalar { bits: 8, value: 1 });
+            // Binary split over 8 cases: a handful of re-runs, not eight.
+            assert!(*runs <= 6, "{runs} re-runs to narrow 8 cases");
+        }
+        other => panic!("expected a single-case isolation, got {other:?}"),
+    }
+}
+
+/// A clean contract reports `NO_LEAK_OBSERVED` with both controls confirmed,
+/// and spends exactly one Memcheck process per batch — no isolation re-runs
+/// when there is nothing to isolate.
+#[test]
+fn a_clean_contract_confirms_both_controls_and_isolates_nothing() {
+    if !valgrind_available() {
+        return;
+    }
+    let prepared = prepare("crypto::lookup::substitute", small());
+    let check = prepared.check(CheckBudget::default());
+    assert_eq!(check.outcome, Outcome::NoLeakObserved, "{}", check.message);
+    assert_eq!(check.calibration, Control::Confirmed);
+    assert_eq!(
+        check.binding,
+        Control::Confirmed,
+        "the binding control must confirm this contract's own secret reached the call"
+    );
+    assert!(check.findings.is_empty());
+    assert!(check.unattributed.is_empty());
+    assert!(check.other_diagnostics.is_empty());
+    assert!(check.message.contains("not proof"), "{}", check.message);
+    // Exactly one Memcheck process per batch and nothing more: with no finding
+    // there is nothing to isolate, so no re-runs are spent.
+    let batches = check.cases_planned.div_ceil(check::DEFAULT_BATCH_SIZE);
+    assert_eq!(check.analyzer_runs, batches, "{}", check.message);
+    assert_eq!(check.secret_parameters, vec!["index"]);
+    assert_eq!(check.marked_bytes, 1);
+}
+
+/// The aggregate cannot count leaks: a batch where *every* case is leaky still
+/// reports one consolidated finding, which is exactly why isolation exists.
+#[test]
+fn an_all_leaky_batch_still_reports_one_finding() {
+    if !valgrind_available() {
+        return;
+    }
+    let cases = [(1, 1), (2, 1), (3, 1), (4, 1)];
+    let prepared = prepare("crypto::lookup::substitute_mode", replaying(&cases));
+    let check = prepared.check(CheckBudget {
+        batch_size: 4,
+        shrink: false,
+        ..Default::default()
+    });
+    assert_eq!(check.outcome, Outcome::LeakDetected, "{}", check.message);
+    assert_eq!(
+        check.findings.len(),
+        1,
+        "Memcheck consolidates the site, so the finding count is not a leak count"
+    );
+    // Narrowing lands on the first half's first case, because every case
+    // reproduces it.
+    assert_eq!(check.findings[0].isolation.ids().len(), 1);
+}
+
+/// An isolated finding shrinks to a simpler input that still reproduces the
+/// same finding.
+#[test]
+fn an_isolated_finding_shrinks_to_a_simpler_input() {
+    if !valgrind_available() {
+        return;
+    }
+    // A single leaky case with a deliberately large secret index, so there is
+    // something to reduce.
+    let prepared = prepare("crypto::lookup::substitute_mode", replaying(&[(200, 1)]));
+    let check = prepared.check(CheckBudget {
+        batch_size: 1,
+        shrink: true,
+        shrink_budget: 20,
+    });
+    assert_eq!(check.outcome, Outcome::LeakDetected, "{}", check.message);
+    let finding = &check.findings[0];
+    let shrunk = finding
+        .shrunk
+        .as_ref()
+        .expect("a secret index of 200 should reduce");
+    assert!(shrunk.steps >= 1);
+    assert!(shrunk.attempts <= 20, "the shrink budget was exceeded");
+    let Value::Scalar { value, .. } = shrunk.inputs[0].1 else {
+        panic!("expected a scalar index");
+    };
+    assert!(value < 200, "{value} is not simpler than 200");
+    // The public mode cannot shrink away: `mode = 0` takes the constant-time
+    // path and would stop reproducing, so the shrinker must have kept it.
+    assert_eq!(shrunk.inputs[1].1, Value::Scalar { bits: 8, value: 1 });
+}
+
+/// Shrinking can be switched off, and then costs nothing.
+#[test]
+fn shrinking_is_optional() {
+    if !valgrind_available() {
+        return;
+    }
+    let prepared = prepare("crypto::lookup::substitute_mode", replaying(&[(200, 1)]));
+    let check = prepared.check(CheckBudget {
+        batch_size: 1,
+        shrink: false,
+        ..Default::default()
+    });
+    assert_eq!(check.outcome, Outcome::LeakDetected);
+    assert!(check.findings[0].shrunk.is_none());
+    // One batch, no isolation (a single case is already the answer), no shrink.
+    assert_eq!(check.analyzer_runs, 1);
+}
+
+/// A single-case batch needs no narrowing, and says so rather than claiming
+/// re-runs it did not spend.
+#[test]
+fn a_single_case_batch_is_already_isolated() {
+    if !valgrind_available() {
+        return;
+    }
+    // `substitute_indexed` takes the secret alone, so it needs a one-parameter
+    // replay rather than the `(index, mode)` helper.
+    let settings = GenerateSettings {
+        cases: 64,
+        strategies: Vec::new(),
+        regressions: vec![vec![(
+            "index".to_string(),
+            Value::Scalar { bits: 8, value: 7 },
+        )]],
+        ..Default::default()
+    };
+    let prepared = prepare("crypto::lookup::substitute_indexed", settings);
+    let check = prepared.check(CheckBudget {
+        batch_size: 1,
+        shrink: false,
+        ..Default::default()
+    });
+    assert_eq!(check.outcome, Outcome::LeakDetected, "{}", check.message);
+    assert!(matches!(
+        check.findings[0].isolation,
+        Isolation::Single { id: 0 }
+    ));
+}
+
+/// The tail-byte leak isolates and then shrinks to an input whose *last* byte
+/// is still non-zero, because that is the byte the leak depends on.
+#[test]
+fn shrinking_preserves_the_byte_a_leak_depends_on() {
+    if !valgrind_available() {
+        return;
+    }
+    let settings = GenerateSettings {
+        cases: 64,
+        strategies: Vec::new(),
+        regressions: vec![vec![
+            (
+                "expected".to_string(),
+                Value::Bytes {
+                    bytes: vec![0xff; 16],
+                },
+            ),
+            (
+                "supplied".to_string(),
+                Value::Bytes {
+                    bytes: vec![0xff; 16],
+                },
+            ),
+        ]],
+        ..Default::default()
+    };
+    let prepared = prepare("crypto::controls::tail_byte_probe", settings);
+    let check = prepared.check(CheckBudget {
+        batch_size: 1,
+        shrink: true,
+        shrink_budget: 30,
+    });
+    assert_eq!(check.outcome, Outcome::LeakDetected, "{}", check.message);
+    let finding = &check.findings[0];
+    if let Some(shrunk) = &finding.shrunk {
+        let Value::Bytes { bytes } = &shrunk.inputs[0].1 else {
+            panic!("expected a byte array");
+        };
+        assert_eq!(bytes.len(), 16, "the width must not change while shrinking");
+        // Whatever else was reduced, the finding still reproduces, which is the
+        // property a shrink has to preserve.
+        assert!(shrunk.steps >= 1);
+    }
+}
+
 /// A case that forges a completion marker and exits early is not accepted as
 /// having completed.
 ///
@@ -446,7 +737,7 @@ fn a_forged_marker_and_an_early_exit_are_not_completion() {
     )
     .expect("write lib.rs");
 
-    let staged = check_staged(&copy, "crypto::lookup::substitute", small());
+    let staged = run_staged_corpus(&copy, "crypto::lookup::substitute", small());
     assert!(
         !staged.run.all_completed(),
         "a forged marker plus an early exit was accepted as a complete run"
@@ -509,9 +800,10 @@ fn stage_library(root: &Path) -> PathBuf {
     copy
 }
 
-/// Builds and runs a generated check against a staged library copy, returning
-/// the batch evidence for its whole corpus.
-fn check_staged(copy: &Path, contract_id: &str, settings: GenerateSettings) -> StagedCheck {
+/// Builds and runs a staged library copy's whole corpus, returning the batch
+/// evidence. Lower-level than the `check_contract` pipeline on purpose: this is
+/// for tests about whether a run *finished*, not about its verdict.
+fn run_staged_corpus(copy: &Path, contract_id: &str, settings: GenerateSettings) -> StagedCheck {
     let library =
         Library::resolve(&copy.join("Cargo.toml"), &[]).expect("the staged library resolves");
     let workspace = Workspace::ephemeral().expect("a private work directory");
