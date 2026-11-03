@@ -1,0 +1,35 @@
+# The M6.1 feasibility spike. Deliberately **outside** the workspace: it is
+# evidence recorded for `docs/MILESTONE-06.md`, not a maintained example, and
+# `--workspace` must not reach it. Its path dependencies are relative, so it
+# builds from a fresh clone.
+[package]
+name = "tc-spike-m6"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "tc-spike-m6"
+path = "src/main.rs"
+
+[dependencies]
+# The real library, taken as an ordinary Cargo path dependency. `package` plus
+# an explicit key lets the harness spell the call with the library's *lib* name,
+# which is what a contract identity is qualified by.
+crypto = { package = "crypto-library", path = "../../../examples/crypto-library" }
+trace-check-test = { path = "../../../crates/trace-check-test" }
+trace-check-secret = { path = "../../../crates/trace-check-secret" }
+
+# Production-like optimization *and* symbols, matching the `memcheck` profile
+# the existing native backend uses: a finding without a source location is not
+# actionable. `panic = "unwind"` because this is an ordinary test binary.
+[profile.release]
+opt-level = 3
+debug = true
+lto = false
+codegen-units = 1
+incremental = false
+strip = false
+panic = "unwind"
+
+[workspace]

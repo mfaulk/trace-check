@@ -1,6 +1,11 @@
 /target
 .idea
 
+# Out-of-workspace packages build into their own directory. Their lockfiles are
+# tracked, because a recorded result describes the dependency versions it was
+# taken with.
+docs/spikes/*/target/
+
 # Generated trace output. Raw traces are large and contain the case input
 # values, so only the compact fixtures under tests/fixtures are tracked.
 *.trace
