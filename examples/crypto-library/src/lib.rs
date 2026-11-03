@@ -28,6 +28,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod controls;
+pub mod hidden;
 pub mod lookup;
 pub mod reduce;
 pub mod tag;

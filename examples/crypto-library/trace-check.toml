@@ -171,3 +171,44 @@ cases = 200
 [check."crypto::reduce::reduce_once_masked"]
 description = "the same reduction with the subtraction selected by a mask"
 cases = 200
+
+# ---------------------------------------------------------------------------
+# M7 hidden-path fixtures. See `src/hidden.rs` for why M6's generator cannot
+# construct the reaching inputs, and `docs/MILESTONE-07.md` for the measured
+# comparison. Each is an analyzer regression: detecting the planted leak is
+# this entry passing.
+# ---------------------------------------------------------------------------
+
+[check."crypto::hidden::nested_modes"]
+description = "the core coverage-guidance test: a leak behind three public predicates"
+rationale = "boundary generation moves one parameter away from base and pairwise moves two, so neither can satisfy a three-parameter conjunction at any budget. Two of the three required values are not u8 boundary values either. Only coverage feedback, which can extend a retained seed one predicate at a time, reaches it"
+# Four u8 parameters have 22 boundary values each, so the boundary floor is 85.
+cases = 200
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"
+
+[check."crypto::hidden::magic_gate"]
+description = "diagnostic: a leak behind an exact 32-bit public equality"
+rationale = "region and branch coverage give no gradient toward one 32-bit constant, so this is expected NOT to be found by coverage feedback alone. It is recorded as INCONCLUSIVE-by-strategy in the milestone document rather than asserted here"
+cases = 200
+expectation = "analyzer-regression"
+expected_outcome = "NO_LEAK_OBSERVED"
+
+[check."crypto::hidden::threshold_window"]
+description = "boundary and coverage interaction: a leak in a window above a public threshold"
+rationale = "the threshold is a power of two, so M6's boundary stage already reaches it. The entry exists so a coverage-guided run that dropped the mandatory boundary cases in favour of its own candidates would stop detecting this"
+cases = 200
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"
+
+[check."crypto::hidden::secret_gated"]
+description = "a leak reachable only for some secret values, behind one public predicate"
+rationale = "keeps secret-input exploration honest: a strategy that froze the secret would never execute the region behind the secret-bit test"
+cases = 200
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"
+
+[check."crypto::hidden::nested_modes_clean"]
+description = "false-positive control sharing nested_modes' shape, with a safe guarded region"
+rationale = "exploration reaches the deeply guarded region and the security backend must still observe nothing. A finding here would mean discovery had begun manufacturing evidence"
+cases = 200
