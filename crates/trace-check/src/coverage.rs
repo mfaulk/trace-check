@@ -324,7 +324,17 @@ impl LlvmTools {
                 });
             }
         }
+        // `llvm-cov --version` prints three lines; a report needs the one
+        // naming the version, and an embedded newline would break every
+        // line-oriented consumer of the text report.
         let version = native::tool_version(&cov, &["--version"])
+            .map(|text| {
+                text.lines()
+                    .map(str::trim)
+                    .find(|line| line.starts_with("LLVM version"))
+                    .unwrap_or_else(|| text.lines().next().unwrap_or("llvm-cov").trim())
+                    .to_string()
+            })
             .unwrap_or_else(|_| "llvm-cov (version unavailable)".to_string());
         Ok(LlvmTools {
             profdata,

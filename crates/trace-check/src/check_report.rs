@@ -24,6 +24,7 @@ use serde::Serialize;
 
 use crate::check::{ContractCheck, Control};
 use crate::contract::Expectation;
+use crate::explore::{MutationMix, Provenance, Selection};
 use crate::generate::{Corpus, StrategyCoverage};
 use crate::security::Outcome;
 
@@ -39,14 +40,32 @@ pub const EXIT_INCOMPLETE: u8 = 2;
 
 /// Limits restated in every report, because a stored result outlives the
 /// conversation that produced it.
-pub const LIMITATIONS: [&str; 6] = [
+pub const LIMITATIONS: [&str; 5] = [
     "A clean result is NO_LEAK_OBSERVED over the inputs that were generated and the paths they took. It is not a proof, and it says nothing about inputs that were not generated.",
     "The analyzed artifact is not the production binary. Its profile, dependency versions and hash are recorded because the result describes that build.",
     "Memcheck models secret-dependent branches and secret-dependent addresses. It does not model caches, execution ports, speculation, or data-dependent instruction timing.",
     "A batched run cannot attribute a finding to a case without re-running it, and a sequence-dependent finding may not reduce to a single case at all.",
-    "Execution coverage -- which branches or regions the generated inputs reached -- is not measured. Input-strategy coverage is not a substitute for it.",
     "The contract inventory is what the configuration names, not every #[constant_time] annotation in the source tree.",
 ];
+
+/// The coverage limitation, stated differently depending on whether coverage
+/// was measured at all.
+///
+/// Two sentences that must never both appear. Without exploration, execution
+/// coverage is simply unknown. With it, coverage *is* measured -- but in a
+/// different artifact, which is a sharper and more easily misread caveat than
+/// "not measured" and so is worth its own wording.
+pub const COVERAGE_NOT_MEASURED: &str = concat!(
+    "Execution coverage -- which branches or regions the generated inputs reached -- is not ",
+    "measured. Input-strategy coverage is not a substitute for it.",
+);
+
+pub const COVERAGE_MEASURED_ELSEWHERE: &str = concat!(
+    "Execution coverage was measured, but in the instrumented discovery artifact and not in the ",
+    "artifact the security result describes. A region reached during exploration may be reached ",
+    "by different machine code, or not reached at all, in the optimized uninstrumented build. ",
+    "Coverage guided which inputs were analyzed; it verifies nothing.",
+);
 
 /// Toolchain and library provenance for a whole run.
 #[derive(Debug, Clone, Serialize)]
@@ -112,6 +131,65 @@ impl CorpusSummary {
     }
 }
 
+/// What exploration established, kept wholly separate from what the security
+/// backend established.
+///
+/// Every number here describes the **discovery** artifact: a different build,
+/// with different machine code, whose only job was to find inputs. A candidate
+/// that reached a region here may follow a different path in the optimized
+/// security artifact, and no count in this structure is evidence about
+/// constant-time behavior. [`Policy`] cannot be improved by anything in it —
+/// exploration can only ever make a run *less* conclusive, by failing.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiscoveryEvidence {
+    /// The discovery artifact's hash. Never the security artifact's.
+    pub artifact_sha256: String,
+    pub profile: String,
+    pub instrumentation: String,
+    pub harness_sha256: String,
+    /// Bytes this artifact marked as secret. Always zero: it marks nothing.
+    pub marked_bytes: u64,
+    pub llvm_tools: String,
+    pub feedback: String,
+    pub granularity: String,
+    pub coverage_map_id: String,
+    /// Library directory whose files counted as target coverage.
+    pub scope: String,
+    pub seed: u64,
+    pub candidate_budget: usize,
+    pub baseline_cases: usize,
+    pub candidates_attempted: usize,
+    pub candidates_observed: usize,
+    pub baseline_observed: usize,
+    pub candidates_retained: usize,
+    pub rounds: usize,
+    pub baseline_regions: usize,
+    pub regions_reached: usize,
+    pub regions_added: usize,
+    pub mutation_mix: MutationMix,
+    pub termination: String,
+    pub termination_detail: String,
+    pub elapsed_ms: u128,
+    /// Candidates whose coverage could not be used, with the reason. Non-empty
+    /// means the reported exploration is not the exploration performed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub failures: Vec<String>,
+    pub selection: Selection,
+    /// Why each analyzed case is in the corpus.
+    pub selected_provenance: Vec<Provenance>,
+}
+
+impl DiscoveryEvidence {
+    /// Whether exploration did the work it was asked to do.
+    pub fn complete(&self) -> bool {
+        self.failures.is_empty()
+            && matches!(
+                self.termination.as_str(),
+                "budget-exhausted" | "converged" | "queue-empty"
+            )
+    }
+}
+
 /// Whether this entry satisfied what it was asserting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -165,6 +243,10 @@ pub struct ContractEntry {
     /// Paths of reproducers written for this contract's findings.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub reproducers: Vec<String>,
+    /// Exploration evidence, when exploration ran. Absent means it did not,
+    /// which is a different thing from having run and found nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<DiscoveryEvidence>,
 }
 
 impl ContractEntry {
@@ -176,6 +258,34 @@ impl ContractEntry {
     /// configuration says, because a security contract cannot declare an
     /// expected outcome in the first place.
     pub fn evaluate(
+        expectation: Expectation,
+        expected_outcome: Option<&str>,
+        check: &ContractCheck,
+        discovery: Option<&DiscoveryEvidence>,
+    ) -> (Policy, String) {
+        let (policy, detail) = Self::evaluate_security(expectation, expected_outcome, check);
+        // Exploration is applied *after* the security decision and can only
+        // ever subtract. A run that was asked to explore and did not finish has
+        // not checked the inputs it claims to have checked, so a satisfied
+        // result becomes incomplete -- and a detected leak stays a detected
+        // leak, because a finding from the security artifact does not depend on
+        // how the input that triggered it was chosen.
+        match discovery {
+            Some(evidence) if !evidence.complete() && policy == Policy::Satisfied => (
+                Policy::Incomplete,
+                format!(
+                    "required exploration did not complete ({}), so the inputs this result \
+                     describes are not the inputs the run was configured to search for. The \
+                     security analysis itself was: {detail}",
+                    evidence.termination_detail
+                ),
+            ),
+            _ => (policy, detail),
+        }
+    }
+
+    /// The security decision alone, with no input from exploration.
+    fn evaluate_security(
         expectation: Expectation,
         expected_outcome: Option<&str>,
         check: &ContractCheck,
@@ -331,6 +441,16 @@ pub fn build(
             ));
         }
     }
+    for entry in &contracts {
+        if let Some(discovery) = &entry.discovery {
+            if !discovery.complete() {
+                blocking.push(format!(
+                    "`{}` required exploration and it did not complete: {}",
+                    entry.contract, discovery.termination_detail
+                ));
+            }
+        }
+    }
     if require_all_configured && !not_selected.is_empty() {
         blocking.push(format!(
             "{} configured contract(s) were not checked, so this run does not cover the \
@@ -339,6 +459,19 @@ pub fn build(
             not_selected.join(", ")
         ));
     }
+
+    // The coverage caveat depends on whether any contract explored, so it is
+    // chosen here rather than being a constant.
+    let explored = contracts.iter().any(|entry| entry.discovery.is_some());
+    let mut limitations: Vec<String> = LIMITATIONS.iter().map(|s| s.to_string()).collect();
+    limitations.insert(
+        4,
+        if explored {
+            COVERAGE_MEASURED_ELSEWHERE.to_string()
+        } else {
+            COVERAGE_NOT_MEASURED.to_string()
+        },
+    );
 
     let ok = blocking.is_empty();
     CheckReport {
@@ -356,7 +489,7 @@ pub fn build(
             blocking_reasons: blocking,
             ok,
         },
-        limitations: LIMITATIONS.iter().map(|s| s.to_string()).collect(),
+        limitations,
     }
 }
 
@@ -398,6 +531,91 @@ impl CheckReport {
         for entry in &self.contracts {
             line!("{}", entry.contract);
             line!("  declared at {}", entry.site);
+
+            // Section one: exploration evidence. Printed first and labelled as
+            // discovery, so a reader meets the coverage numbers already knowing
+            // they belong to a different artifact than everything below them.
+            if let Some(discovery) = &entry.discovery {
+                line!("");
+                line!("  -- exploration (discovery artifact; no security evidence) --");
+                line!(
+                    "  artifact: {} [{}]",
+                    short_hash(&discovery.artifact_sha256),
+                    discovery.instrumentation
+                );
+                line!("  build:    {}", discovery.profile);
+                line!(
+                    "  marking:  {} byte(s) -- this artifact marks no secret and makes no claim",
+                    discovery.marked_bytes
+                );
+                line!("  tools:    {}", discovery.llvm_tools);
+                line!(
+                    "  feedback: {} -- {}",
+                    discovery.feedback,
+                    discovery.granularity
+                );
+                line!(
+                    "  map:      {} over {}",
+                    short_hash(&discovery.coverage_map_id),
+                    discovery.scope
+                );
+                line!(
+                    "  searched: {} candidate(s) of a {} budget in {} round(s), seed {}, {} ms",
+                    discovery.candidates_attempted,
+                    discovery.candidate_budget,
+                    discovery.rounds,
+                    discovery.seed,
+                    discovery.elapsed_ms
+                );
+                line!(
+                    "  mutations: {} public, {} secret, {} combined ({} duplicate, {} vacuous)",
+                    discovery.mutation_mix.public,
+                    discovery.mutation_mix.secret,
+                    discovery.mutation_mix.combined,
+                    discovery.mutation_mix.duplicates,
+                    discovery.mutation_mix.vacuous
+                );
+                line!(
+                    "  regions:  {} reached, {} by the baseline corpus, {} added by exploration",
+                    discovery.regions_reached,
+                    discovery.baseline_regions,
+                    discovery.regions_added
+                );
+                line!(
+                    "  retained: {} candidate(s); {} of {} candidate(s) and {} of {} baseline \
+                     case(s) produced usable coverage",
+                    discovery.candidates_retained,
+                    discovery.candidates_observed,
+                    discovery.candidates_attempted,
+                    discovery.baseline_observed,
+                    discovery.baseline_cases
+                );
+                let selection = &discovery.selection;
+                line!(
+                    "  selected: {} case(s) for analysis = {} mandatory (M6's corpus) + {} of a \
+                     {} explored budget; {} excluded as duplicate coverage, {} for budget",
+                    selection.total,
+                    selection.mandatory,
+                    selection.by_coverage,
+                    selection.budget,
+                    selection.excluded_duplicate_coverage,
+                    selection.excluded_for_budget
+                );
+                if let Some(truncation) = selection.truncation() {
+                    line!("  TRUNCATED: {truncation}");
+                }
+                line!(
+                    "  stopped:  {} -- {}",
+                    discovery.termination,
+                    discovery.termination_detail
+                );
+                for failure in discovery.failures.iter().take(4) {
+                    line!("  UNMEASURED: {failure}");
+                }
+                line!("");
+                line!("  -- security analysis (uninstrumented artifact) --");
+            }
+
             let secrets: Vec<String> = entry
                 .secrets
                 .iter()
@@ -409,6 +627,10 @@ impl CheckReport {
                 })
                 .collect();
             line!("  secret:   {}", secrets.join(", "));
+            line!(
+                "  artifact: {} [no instrumentation]",
+                short_hash(&entry.artifact_sha256)
+            );
             line!(
                 "  corpus:   {} case(s), seed {}, strategies {}",
                 entry.corpus.cases,
@@ -465,6 +687,20 @@ impl CheckReport {
                         line!("    SEQUENCE-DEPENDENT over case(s) {ids:?}: {detail}");
                     }
                 }
+                // Where the triggering input came from. Without this, a finding
+                // against an explored case shows a developer values nobody
+                // wrote and no strategy name accounts for.
+                if let (Some(discovery), Some(id)) =
+                    (&entry.discovery, finding.isolation.ids().first())
+                {
+                    if let Some(provenance) = discovery
+                        .selected_provenance
+                        .iter()
+                        .find(|provenance| provenance.case_id == *id)
+                    {
+                        line!("    input from: {}", provenance.origin.describe());
+                    }
+                }
                 if let Some(shrunk) = &finding.shrunk {
                     line!(
                         "    shrunk in {} step(s) of {} attempt(s): {}",
@@ -498,11 +734,38 @@ impl CheckReport {
             line!("");
         }
 
-        line!("Summary:");
+        // Section three: the CI decision. Kept apart from both evidence
+        // sections, and never restating a coverage number -- execution coverage
+        // and security-verification coverage are different things and a summary
+        // that mixed them would be the one place a reader is most likely to
+        // confuse them.
+        line!("CI decision:");
         line!("  Contracts selected: {}", self.selected.len());
         line!("  Contracts checked:  {}", self.summary.contracts_checked);
         line!("  Leaks detected:     {}", self.summary.leaks_detected);
         line!("  Incomplete:         {}", self.summary.incomplete);
+        let explored = self
+            .contracts
+            .iter()
+            .filter(|entry| entry.discovery.is_some())
+            .count();
+        if explored > 0 {
+            let finished = self
+                .contracts
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .discovery
+                        .as_ref()
+                        .is_some_and(DiscoveryEvidence::complete)
+                })
+                .count();
+            line!("  Explored:           {explored} contract(s), {finished} completed");
+            line!(
+                "  Note:               exploration coverage is not verification coverage; it \
+                 describes code executed in an instrumented artifact and nothing else"
+            );
+        }
         if self.summary.expectations_unmet > 0 {
             line!("  Expectations unmet: {}", self.summary.expectations_unmet);
         }
@@ -525,6 +788,11 @@ impl CheckReport {
         line!("Result: {}", if self.summary.ok { "PASS" } else { "FAIL" });
         out
     }
+}
+
+/// First twelve characters of a hash, for human-readable output.
+fn short_hash(hash: &str) -> String {
+    hash.chars().take(12).collect()
 }
 
 fn render_inputs(inputs: &[(String, crate::generate::Value)]) -> String {
@@ -580,8 +848,9 @@ mod tests {
         expected: Option<&str>,
         check: ContractCheck,
     ) -> ContractEntry {
-        let (policy, detail) = ContractEntry::evaluate(expectation, expected, &check);
+        let (policy, detail) = ContractEntry::evaluate(expectation, expected, &check, None);
         ContractEntry {
+            discovery: None,
             contract: check.contract.clone(),
             function: check.function.clone(),
             site: "src/lookup.rs:12".into(),

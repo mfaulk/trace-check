@@ -151,6 +151,23 @@ enum Command {
         /// Cases per Valgrind process, overriding the configuration.
         #[arg(long)]
         batch_size: Option<usize>,
+        /// Search for inputs with coverage feedback before analyzing.
+        ///
+        /// Builds a second, instrumented artifact and uses the regions each
+        /// candidate reaches to decide which inputs are worth analyzing. Needs
+        /// the toolchain's LLVM tools: `rustup component add llvm-tools`.
+        ///
+        /// Coverage guides the search. It establishes nothing: every security
+        /// conclusion still comes from the uninstrumented Memcheck artifact.
+        #[arg(long, conflicts_with = "replay")]
+        explore: bool,
+        /// Mutation candidates per contract. Implies --explore.
+        #[arg(long, conflicts_with = "replay")]
+        explore_cases: Option<usize>,
+        /// Cap on cases handed to Memcheck. Separate from --explore-cases
+        /// because exploring is cheap and analyzing is not.
+        #[arg(long, conflicts_with = "replay")]
+        security_cases: Option<usize>,
         /// Skip input reduction after a finding is isolated.
         #[arg(long)]
         no_shrink: bool,
@@ -249,6 +266,9 @@ fn execute(cli: Cli) -> Result<u8, String> {
             seed,
             batch_size,
             no_shrink,
+            explore,
+            explore_cases,
+            security_cases,
             reproducer_dir,
             replay,
             ci,
@@ -267,6 +287,12 @@ fn execute(cli: Cli) -> Result<u8, String> {
                 // Absent unless the flag was passed, so a configured `shrink`
                 // is only ever overridden deliberately.
                 shrink: if no_shrink { Some(false) } else { None },
+                // `--explore` turns exploration on; its absence leaves the
+                // configuration alone rather than turning it off, so a
+                // contract that enabled it in trace-check.toml keeps it.
+                explore: if explore { Some(true) } else { None },
+                explore_cases,
+                security_cases,
             },
             reproducer_dir,
             replay,

@@ -273,7 +273,9 @@ pub fn run_contract_verification(
 }
 
 use check::{CheckBudget, Runner as CheckRunner};
-use check_report::{CheckProvenance, CheckReport, ContractEntry, CorpusSummary, SecretSummary};
+use check_report::{
+    CheckProvenance, CheckReport, ContractEntry, CorpusSummary, DiscoveryEvidence, SecretSummary,
+};
 use dynamic_harness::DynamicError;
 use generate::GenerateError;
 use reproducer::{Reproducer, ReproducerError};
@@ -288,6 +290,13 @@ pub struct CheckOverrides {
     pub seed: Option<u64>,
     pub batch_size: Option<usize>,
     pub shrink: Option<bool>,
+    /// Turn M7 coverage-guided exploration on or off for every selected
+    /// contract.
+    pub explore: Option<bool>,
+    /// Mutation candidates per contract.
+    pub explore_cases: Option<usize>,
+    /// Cap on cases handed to the security backend.
+    pub security_cases: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -297,6 +306,8 @@ pub enum CheckRunError {
     Generate(GenerateError),
     Native(NativeError),
     Reproducer(ReproducerError),
+    Coverage(coverage::CoverageError),
+    Explore(explore::ExploreError),
     /// No contract was selected at all.
     NothingSelected {
         available: Vec<String>,
@@ -311,6 +322,8 @@ impl std::fmt::Display for CheckRunError {
             CheckRunError::Generate(error) => write!(f, "{error}"),
             CheckRunError::Native(error) => write!(f, "{error}"),
             CheckRunError::Reproducer(error) => write!(f, "{error}"),
+            CheckRunError::Coverage(error) => write!(f, "{error}"),
+            CheckRunError::Explore(error) => write!(f, "{error}"),
             CheckRunError::NothingSelected { available } => write!(
                 f,
                 "no contracts selected; pass --contract <identity> or --all-configured. \
@@ -353,6 +366,16 @@ impl From<ReproducerError> for CheckRunError {
         CheckRunError::Reproducer(error)
     }
 }
+impl From<coverage::CoverageError> for CheckRunError {
+    fn from(error: coverage::CoverageError) -> Self {
+        CheckRunError::Coverage(error)
+    }
+}
+impl From<explore::ExploreError> for CheckRunError {
+    fn from(error: explore::ExploreError) -> Self {
+        CheckRunError::Explore(error)
+    }
+}
 
 /// Runs generated constant-time testing for the selected contracts.
 ///
@@ -364,6 +387,20 @@ impl From<ReproducerError> for CheckRunError {
 /// harness. This is the same ordering M5 settled on, for the same reason — a
 /// developer with a misspelled contract name or an unsupported parameter type
 /// should be told about *that*, not about a missing analyzer.
+///
+/// The LLVM coverage tools are located the same way and for the same reason,
+/// one step earlier than Valgrind: a contract that cannot be explored usually
+/// cannot be analyzed either, and the annotation is what a developer should
+/// hear about.
+///
+/// # Where exploration fits
+///
+/// When a contract enables it, exploration runs **between** corpus generation
+/// and analysis. It builds its own instrumented artifact, searches for inputs,
+/// selects a bounded corpus, and hands that corpus back. Everything downstream
+/// — secret marking, calibration, the binding control, batching, isolation,
+/// shrinking, classification, the CI policy — is M6's, unchanged, and cannot
+/// tell an explored case from a boundary case.
 pub fn run_generated_checks(
     library: &Library,
     config: &VerifyConfig,
@@ -384,6 +421,7 @@ pub fn run_generated_checks(
     }
 
     let mut valgrind: Option<(PathBuf, String)> = None;
+    let mut tools: Option<coverage::LlvmTools> = None;
     let mut entries = Vec::new();
 
     for contract_id in contracts {
@@ -400,6 +438,20 @@ pub fn run_generated_checks(
         if let Some(shrink) = overrides.shrink {
             settings.shrink = shrink;
         }
+        if let Some(explore) = overrides.explore {
+            settings.explore.enabled = explore;
+        }
+        if let Some(candidates) = overrides.explore_cases {
+            settings.explore.candidate_budget = candidates;
+            // Naming a candidate budget is asking for exploration. Requiring
+            // both flags would make `--explore-cases 2000` silently do nothing.
+            if overrides.explore.is_none() {
+                settings.explore.enabled = true;
+            }
+        }
+        if let Some(cases) = overrides.security_cases {
+            settings.explore.security_case_budget = cases;
+        }
         // An override can make a configured entry invalid, so the result is
         // re-validated rather than trusted because the file was valid.
         settings
@@ -409,7 +461,31 @@ pub fn run_generated_checks(
         let (work_dir, target_dir) = workspace.directories_for(contract_id)?;
         let contract = harness::probe_contract(library, contract_id, &work_dir, &target_dir)?;
         let generated = dynamic_harness::generate(&contract)?;
-        let corpus = generate::generate(contract_id, &contract.descriptor, &settings.generation())?;
+        let baseline =
+            generate::generate(contract_id, &contract.descriptor, &settings.generation())?;
+
+        // Exploration, when the contract asks for it. It may only *replace the
+        // corpus*: the artifact built below, the controls, and every downstream
+        // stage are the same whether it ran or not.
+        let (corpus, discovery) = if settings.explore.enabled {
+            if tools.is_none() {
+                tools = Some(coverage::LlvmTools::locate()?);
+            }
+            let tools = tools.as_ref().expect("located just above");
+            let (corpus, evidence) = explore_contract(
+                library,
+                &contract,
+                &baseline,
+                tools,
+                &settings,
+                &work_dir,
+                &target_dir,
+            )?;
+            (corpus, Some(evidence))
+        } else {
+            (baseline, None)
+        };
+
         let corpus_path = dynamic_harness::stage_corpus(&corpus, &work_dir)?;
         let artifact =
             dynamic_harness::build(library, &generated, contract_id, &work_dir, &target_dir)?;
@@ -471,6 +547,7 @@ pub fn run_generated_checks(
             settings.expectation,
             settings.expected_outcome.as_deref(),
             &outcome,
+            discovery.as_ref(),
         );
         entries.push(ContractEntry {
             contract: contract_id.clone(),
@@ -487,6 +564,7 @@ pub fn run_generated_checks(
             policy_detail,
             check: outcome,
             reproducers,
+            discovery,
         });
     }
 
@@ -522,6 +600,96 @@ pub fn run_generated_checks(
         entries,
         require_all_configured,
     ))
+}
+
+/// Explores one contract and returns the corpus the security backend should run.
+///
+/// # The architectural boundary
+///
+/// This function owns the instrumented artifact and everything coverage means.
+/// What it returns is a [`generate::Corpus`] — M6's own type, carrying inputs
+/// and nothing else — plus evidence *about the search*, which the report keeps
+/// in its own section. The caller cannot accidentally let a region count
+/// influence a security conclusion, because no region count crosses back.
+///
+/// # Why the discovery artifact is built per contract
+///
+/// For the reason M5 builds one symbolic artifact per contract: the generated
+/// harness calls one function, and anything its `main` does not reach is dead
+/// code the compiler is free to drop. A shared multi-contract discovery binary
+/// would have a coverage map whose records depend on which other contracts were
+/// selected, which would make a region identity depend on the command line.
+fn explore_contract(
+    library: &Library,
+    contract: &contract::Contract,
+    baseline: &generate::Corpus,
+    tools: &coverage::LlvmTools,
+    settings: &contract::CheckSettings,
+    work_dir: &Path,
+    target_dir: &Path,
+) -> Result<(generate::Corpus, DiscoveryEvidence), CheckRunError> {
+    let harness = dynamic_harness::generate_discovery(contract)?;
+    let artifact = dynamic_harness::build(library, &harness, &contract.id, work_dir, target_dir)?;
+    let collector = coverage::Collector::new(
+        tools,
+        &artifact.path,
+        &artifact.sha256,
+        Path::new(&library.manifest_path),
+        &contract.function,
+        native::Limits::default(),
+    );
+    let explore_settings = settings.explore.settings(settings.seed);
+    let exploration = explore::explore(
+        &contract.id,
+        &contract.descriptor,
+        baseline,
+        &collector,
+        &explore_settings,
+        work_dir,
+    )?;
+    let selection = explore::select(&exploration, explore_settings.security_case_budget);
+    let corpus =
+        explore::security_corpus(&contract.id, &contract.descriptor, &exploration, &selection)?;
+
+    let evidence = DiscoveryEvidence {
+        artifact_sha256: artifact.sha256.clone(),
+        profile: dynamic_harness::HarnessKind::Discovery
+            .profile()
+            .to_string(),
+        instrumentation: dynamic_harness::INSTRUMENT_FLAG.to_string(),
+        harness_sha256: harness.source_sha256.clone(),
+        marked_bytes: harness.marked_bytes,
+        llvm_tools: tools.version.clone(),
+        feedback: exploration.feedback.clone(),
+        granularity: exploration.granularity.clone(),
+        coverage_map_id: exploration.coverage_map.id.clone(),
+        scope: exploration.scope.clone(),
+        seed: exploration.seed,
+        candidate_budget: exploration.candidate_budget,
+        baseline_cases: exploration.baseline_cases,
+        candidates_attempted: exploration.candidates_attempted,
+        candidates_observed: exploration.candidates_observed,
+        baseline_observed: exploration.baseline_observed,
+        candidates_retained: exploration.candidates_retained,
+        rounds: exploration.rounds,
+        baseline_regions: exploration.baseline_regions,
+        regions_reached: exploration.regions_reached,
+        regions_added: exploration.regions_added(),
+        mutation_mix: exploration.mutation_mix.clone(),
+        termination: exploration.termination.as_str().to_string(),
+        termination_detail: exploration
+            .incompleteness()
+            .unwrap_or_else(|| exploration.termination.describe()),
+        elapsed_ms: exploration.elapsed_ms,
+        failures: exploration
+            .failures
+            .iter()
+            .map(|failure| format!("case {}: {}", failure.case_id, failure.status))
+            .collect(),
+        selected_provenance: explore::provenance(&exploration, &selection),
+        selection,
+    };
+    Ok((corpus, evidence))
 }
 
 /// Replays a persisted reproducer against a freshly built artifact.
