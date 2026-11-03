@@ -1,0 +1,22 @@
+[package]
+name = "enforcement-fixture"
+description = "A minimal annotation-only library, for M8's contract-discovery mutation test"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "fixture"
+path = "src/lib.rs"
+
+# Outside the workspace on purpose. The mutation test copies this library and
+# edits its source, and a workspace member whose source is rewritten mid-test
+# would disturb `cargo test --workspace`.
+[workspace]
+
+[dependencies]
+# The *only* dependency. A proc-macro crate is compiled for the host and
+# contributes nothing to the target binary, so this stays `no_std` and needs no
+# dev-dependency on `trace-check-test`.
+trace-check-macros = { path = "../../crates/trace-check-macros" }
