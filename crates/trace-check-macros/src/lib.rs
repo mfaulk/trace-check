@@ -162,6 +162,10 @@ fn expand_constant_time(args: SecretArgs, function: ItemFn) -> proc_macro2::Toke
     let module_const = module_ident(&name_literal);
     let site_const = site_ident(&name_literal);
     let descriptor = describe_contract(&function, &args.secrets);
+    // The inventory record. Emitted unconditionally -- including under
+    // `dynamic = false`, which is the whole point: a declaration must not
+    // become invisible because its owner opted out of the test adapter.
+    let inventory = inventory_record(&name_literal, &descriptor, args.dynamic);
 
     let adapter_parts = match adapter_signature(&function, &args.secrets) {
         Ok(parts) => parts,
@@ -257,7 +261,106 @@ fn expand_constant_time(args: SecretArgs, function: ItemFn) -> proc_macro2::Toke
         #[allow(non_upper_case_globals)]
         #visibility const #descriptor_const: &str = #descriptor;
 
+        #inventory
+
         #dynamic
+    }
+}
+
+/// Section the inventory records are placed in.
+///
+/// Read out of the library's own `rlib` rather than a linked executable, so
+/// final-link garbage collection never gets the chance to discard a record.
+const INVENTORY_SECTION: &str = ".trace_check.contracts";
+
+/// Magic prefix, schema version, and header size of one inventory record.
+///
+/// The linker concatenates these statics, and may pad between them, so the
+/// reader scans for the magic rather than assuming records are back to back.
+const INVENTORY_MAGIC: &str = "TCCONTR1";
+const INVENTORY_SCHEMA: u16 = 1;
+
+/// Emits the compiler-retained inventory record for one declaration.
+///
+/// # Why a `#[used]` static rather than a function or a test
+///
+/// A procedural attribute macro sees one item at a time and cannot enumerate
+/// the rest of the crate. M3's answer was a generated `#[cfg(test)]` metadata
+/// test, which works but is conditional on the dynamic adapter and on the test
+/// harness running at all. This record is ordinary object data in a normal
+/// library build: enumerating it requires no registry to maintain, no test to
+/// execute, and no `std`.
+///
+/// # Why the payload is assembled by `concat!` in the generated code
+///
+/// `module_path!()`, `file!()` and `line!()` are only meaningful where the
+/// annotation expanded; a proc macro cannot know them. So the record text is
+/// built at the expansion site from those macros and from the *same*
+/// `describe_contract` output the descriptor constant uses — one parse of the
+/// signature, embedded in two places, rather than a second description that
+/// could drift from the first.
+///
+/// # Why the text is private
+///
+/// The record lives inside an anonymous `const _: () = { … }` block, so it is
+/// not exported in crate metadata. `lib.rmeta` sits in the same archive and
+/// carries no such section, which is what makes "find the section" an exact
+/// question rather than a byte search that could also match a copy of the text
+/// held somewhere else.
+fn inventory_record(name: &str, descriptor: &str, dynamic: bool) -> proc_macro2::TokenStream {
+    let magic = INVENTORY_MAGIC;
+    let schema = INVENTORY_SCHEMA;
+    // As text for the JSON payload: an interpolated `u16` would `stringify!`
+    // to `1u16`, which is not a JSON number.
+    let schema_text = schema.to_string();
+    let header = magic.len() + 2 + 4;
+    let section = INVENTORY_SECTION;
+    let dynamic_literal = if dynamic { "true" } else { "false" };
+    quote! {
+        // Anonymous, so the record text is not part of the crate's exported
+        // metadata and the static's name cannot collide with anything.
+        const _: () = {
+            // Raw string literals throughout, so the JSON's own quotes do not
+            // have to survive two levels of escaping on the way here.
+            const PAYLOAD: &str = concat!(
+                r#"{"schema_version":"#, #schema_text,
+                r#","id":""#, module_path!(), "::", #name,
+                r#"","module":""#, module_path!(),
+                r#"","function":""#, #name,
+                r#"","file":""#, file!(),
+                r#"","line":"#, line!(),
+                r#","dynamic":"#, #dynamic_literal,
+                r#","descriptor":"#, #descriptor,
+                "}"
+            );
+            // A length-framed record, because the linker concatenates these.
+            #[used]
+            #[link_section = #section]
+            static RECORD: [u8; #header + PAYLOAD.len()] = {
+                let mut out = [0u8; #header + PAYLOAD.len()];
+                let magic = #magic.as_bytes();
+                let mut index = 0;
+                while index < magic.len() {
+                    out[index] = magic[index];
+                    index += 1;
+                }
+                let schema = (#schema as u16).to_le_bytes();
+                out[8] = schema[0];
+                out[9] = schema[1];
+                let length = (PAYLOAD.len() as u32).to_le_bytes();
+                out[10] = length[0];
+                out[11] = length[1];
+                out[12] = length[2];
+                out[13] = length[3];
+                let payload = PAYLOAD.as_bytes();
+                let mut index = 0;
+                while index < payload.len() {
+                    out[#header + index] = payload[index];
+                    index += 1;
+                }
+                out
+            };
+        };
     }
 }
 

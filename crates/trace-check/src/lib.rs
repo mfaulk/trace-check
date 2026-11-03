@@ -39,6 +39,7 @@ pub mod experiment;
 pub mod explore;
 pub mod generate;
 pub mod harness;
+pub mod inventory;
 pub mod library_report;
 pub mod memcheck;
 pub mod native;

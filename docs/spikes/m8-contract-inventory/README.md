@@ -75,6 +75,8 @@ Three details are load-bearing:
 | Unknown schema version | explicit error | ✅ |
 | Truncated header | explicit error | ✅ |
 | Payload that is not JSON | explicit error | ✅ |
+| LTO-enabled profile | not silently empty | ✅ bitcode detected, LTO forced off for the inventory build |
+| Real library (18 declarations) | every one discovered | ✅ 18 of 18 |
 
 ```
 == Release profile, default features ==
@@ -133,6 +135,52 @@ a string table — and doing it in-process removes an external-tool dependency,
 removes the text-scraping, and makes "every section with this name" the
 straightforward reading rather than the careful one.
 
+## The second finding: LTO makes the rlib bitcode, not ELF
+
+Applied to this repository's own `examples/crypto-library`, the reader found
+**zero** records — while the spike library worked. The difference is the
+workspace's release profile:
+
+```toml
+[profile.release]
+lto = true
+codegen-units = 1
+```
+
+With fat LTO, rustc puts **LLVM bitcode** in the rlib's `.o` members rather than
+machine code:
+
+```
+$ head -c 4 crypto-....rcgu.o | od -An -tx1
+ 42 43 c0 de          # "BC\xc0\xde", the LLVM bitcode magic
+```
+
+An ELF section walk correctly finds nothing there, and "nothing" is
+indistinguishable from "this library declares no contracts" unless the reader
+says otherwise. That is the same failure shape as the `llvm-objcopy` one, from a
+different direction, and it has two consequences for the implementation:
+
+1. **The inventory build is trace-check's own build**, with its own flags, in
+   its own target directory — exactly as M5, M6 and M7 each build their own
+   artifact with a pinned profile and record it. LTO is forced off for it
+   (`CARGO_PROFILE_<PROFILE>_LTO=off`), and the flags go into the recorded build
+   identity. With that override the real library yields all **18** of its
+   declarations:
+
+   ```
+   v1 crypto::controls::public_branch
+   v1 crypto::controls::tail_byte_probe
+   v1 crypto::hidden::header_gate
+   ... 12 more ...
+   v1 crypto::tag::verify_tag_volatile_early_exit
+   total: 18
+   ```
+
+2. **An archive whose object members are not ELF is an error**, never an empty
+   inventory. The reader counts object members and how many it could read, so
+   "no contracts declared" and "I could not read this artifact" are different
+   results with different exit codes.
+
 ## Go / no-go
 
 **Go.** The mechanism satisfies every gate the milestone sets, including the four
@@ -148,7 +196,10 @@ Decisions recorded against the evidence:
    tool loses records and the alternative scrapes hex.
 3. **The read target is the library's `rlib`**, identified from Cargo's
    structured build output, never a path guessed under `target/`.
-4. **Anything unreadable is an error**, never a skipped record.
+4. **Anything unreadable is an error**, never a skipped record — including an
+   archive whose objects are bitcode rather than ELF.
+5. **LTO is forced off for the inventory build**, and the flags are recorded in
+   the build identity.
 
 ## Limitations of this spike
 
