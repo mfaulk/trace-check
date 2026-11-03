@@ -35,6 +35,7 @@ pub mod compare;
 pub mod contract;
 pub mod coverage;
 pub mod dynamic_harness;
+pub mod enforcement;
 pub mod experiment;
 pub mod explore;
 pub mod generate;

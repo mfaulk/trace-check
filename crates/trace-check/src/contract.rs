@@ -706,6 +706,14 @@ pub struct VerifyConfig {
     /// table and keeps working unchanged.
     #[serde(default)]
     pub check: BTreeMap<String, CheckSettings>,
+    /// M8's assurance policy: what each declared contract is required to
+    /// establish, and which obligations are deliberately waived.
+    ///
+    /// Optional for the same reason. Absent, the defaults apply -- strict mode
+    /// and a generated check required of every declaration -- so an existing
+    /// configuration gains enforcement without being edited.
+    #[serde(default)]
+    pub policy: crate::enforcement::PolicyConfig,
 }
 
 /// Default configuration file name, looked for beside the library's manifest.
@@ -729,6 +737,13 @@ impl VerifyConfig {
         for (contract, settings) in &config.check {
             settings.validate(contract)?;
         }
+        // The policy is validated at load, not at use: an exemption with no
+        // reason or a requirement that establishes nothing is a configuration
+        // error, and a developer should hear about it before a backend runs.
+        config
+            .policy
+            .validate()
+            .map_err(|detail| ContractError::Config(format!("{}: {detail}", path.display())))?;
         Ok(config)
     }
 
@@ -744,6 +759,7 @@ impl VerifyConfig {
             description: String::new(),
             verify: BTreeMap::new(),
             check: BTreeMap::new(),
+            policy: crate::enforcement::PolicyConfig::default(),
         }
     }
 
