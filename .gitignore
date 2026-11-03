@@ -22,3 +22,7 @@ native-memcheck.json
 m3-consumer.json
 m4-symbolic.json
 m5-library.json
+
+# Python bytecode from the spike readers.
+__pycache__/
+*.pyc
