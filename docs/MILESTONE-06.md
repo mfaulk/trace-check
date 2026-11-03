@@ -1,7 +1,7 @@
 # Milestone 06 — Generated constant-time testing and CI enforcement
 
-**Status:** M6.1 complete (this document and the feasibility spike). M6.2–M6.7
-planned — see [Work packages](#10-work-packages).
+**Status:** Implemented — see [Work packages](#10-work-packages) and
+[Results](#11-results).
 **Backend:** Valgrind Memcheck, reused unchanged from M2/M3
 **New capability:** useful dynamic leakage testing from a contract annotation
 alone, without a hand-written `#[ct_test]`
@@ -264,7 +264,7 @@ has an acceptable execution model.
 * **Keep the existing calibration *and* add a target-binding control.** The
   `decoy` result shows the two prove different things.
 
-## 5. Phase B — typed input generation (planned)
+## 5. Phase B — typed input generation
 
 Deterministic, seeded generation for the representations the contract descriptor
 already models: `u8`/`u16`/`u32`/`u64`, public `bool`, `[u8; N]` and `&[u8; N]`.
@@ -285,7 +285,7 @@ in one bit. Any derived public input is computed **before** marking.
 The corpus must be canonical, seeded, budget-bounded, independent of the
 analyzer backend, and must record which strategy produced each case.
 
-## 6. Phase C — the generated harness (planned)
+## 6. Phase C — the generated harness
 
 `crates/trace-check/src/dynamic_harness.rs`, generating the package shape the
 spike validated. Per case: decode, validate representations and domains,
@@ -295,7 +295,7 @@ marked region, declassify, record completion.
 Nothing may be generated, serialized, logged or compared while a value is
 marked, unless that operation belongs to the function under analysis.
 
-## 7. Phase D — isolation, and E — reproduction (planned)
+## 7. Phase D — isolation, and E — reproduction
 
 Batch, then binary-split on failure, then verify the isolated finding matches
 the original's classification and location. An isolated case that does not
@@ -311,7 +311,7 @@ type-aware and budgeted separately; a candidate is retained only if the *same*
 leakage finding still reproduces. A panic, a different memory error, or an
 unrelated failure is not a successful shrink.
 
-## 8. Phase F — CI semantics (planned)
+## 8. Phase F — CI semantics
 
 This phase resolves a real mismatch in the current design. M4/M5 configuration
 lets a known-vulnerable fixture declare `expected_outcome = "LEAK_DETECTED"`,
@@ -347,7 +347,7 @@ source tree. `--all-configured` keeps that honest in the name. Until a reliable
 contract inventory exists, the report must say the inventory is incomplete
 rather than imply full annotation coverage.
 
-## 9. Phase G — coverage terminology (planned)
+## 9. Phase G — coverage terminology
 
 Three distinct things, never conflated:
 
@@ -365,14 +365,168 @@ of secret values proven safe.
 | Package | Deliverable | Gate | State |
 | --- | --- | --- | --- |
 | M6.1 | This document and the feasibility spike | finds the `substitute_mode` leak across two public modes | **complete** |
-| M6.2 | Deterministic typed generator and corpus format | same seed reproduces the corpus | planned |
-| M6.3 | Generated Cargo harness and Memcheck execution | correct marking and invocation of the real function | planned |
-| M6.4 | Batching and diagnostic isolation | an aggregate finding reproduces as an input or sequence | planned |
-| M6.5 | Reproduction and minimal shrinking | a saved failure reproduces the same leak | planned |
-| M6.6 | CI security policy and contract-coverage reporting | a leak cannot pass a security check | planned |
-| M6.7 | Integration tests, benchmark, documentation | M1–M5 remain green | planned |
+| M6.2 | Deterministic typed generator and corpus format | same seed reproduces the corpus | **complete** |
+| M6.3 | Generated Cargo harness and Memcheck execution | correct marking and invocation of the real function | **complete** |
+| M6.4 | Batching and diagnostic isolation | an aggregate finding reproduces as an input or sequence | **complete** |
+| M6.5 | Reproduction and minimal shrinking | a saved failure reproduces the same leak | **complete** |
+| M6.6 | CI security policy and contract-coverage reporting | a leak cannot pass a security check | **complete** |
+| M6.7 | Integration tests, benchmark, documentation | M1–M5 remain green | **complete** |
 
-## 11. Limitations
+## 11. Results
+
+### The success criterion, measured
+
+`ci/benchmark-m6.py` compares the generated workflow against the library's own
+hand-written check for `crypto::lookup::substitute_mode`. Warm runs, one
+machine (the provenance in §3 applies), measured with the milestone's final
+implementation:
+
+| Approach | Outcome | Leaks | Sites | Cases | Analyzer runs | Reproducible | Wall |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| hand-written `#[ct_test]` | `NO_LEAK_OBSERVED` | 0 | 0 | 1 | 1 | 0 | 1.0 s |
+| generated, boundaries only | `LEAK_DETECTED` | 1 | 1 | 43 | 10 | 1 | 12.7 s |
+| generated, + random | `LEAK_DETECTED` | 1 | 1 | 64 | 10 | 1 | 12.5 s |
+| generated, + shrinking | `LEAK_DETECTED` | 1 | 1 | 64 | 11 | 1 | 13.2 s |
+
+(43 is this contract's boundary floor; the smaller budget the first version of
+this table used is now refused.)
+
+The milestone's criterion — that the generated workflow discovers a known
+vulnerability the hand-written test does not — holds, and CI asserts it rather
+than trusting this table.
+
+Two honest notes on the cost. The wall-clock figures include generating and
+building the harness per contract, which is most of it; the §4 measurement of
+~0.64 s per Valgrind process still holds, and the 10–11 analyzer runs are the
+batches plus the isolation re-runs. And boundaries alone were enough here, because
+`index` only has to be *marked* to leak through the address — the random stage
+earns its place on contracts where a value matters, not this one.
+
+### Every contract in the example library
+
+`cargo trace-check check --all-configured --ci` checks all ten declared
+contracts and passes, with `ci/verify-m6-generated.py` validating the report
+rather than the exit code. Two measured results are worth recording because they
+were not what the source suggests:
+
+* **`verify_tag_early_exit` is `VERIFIED_BOUNDED` symbolically and
+  `LEAK_DETECTED` here.** The freestanding artifact M5 builds vectorizes the
+  per-byte branch away; this build keeps it. The same function, two honest
+  answers about two different compilations — which is the whole reason a result
+  names its artifact.
+* **`reduce_once` is written with a branch on the secret and observes no leak.**
+  The compiler if-converted it. A reader of the source would expect a finding.
+
+### What the mutation tests establish
+
+Three mutations take a function reported clean, change the library's real
+implementation, and require the verdict to flip with the harness design, the
+generator and the configuration untouched:
+
+| Mutation | From | Caught |
+| --- | --- | --- |
+| secret-indexed lookup | `substitute`'s full-table scan | yes |
+| secret branch under a public mode | `public_branch`'s branch on `mode` | yes |
+| last-byte-only leak | `verify_tag`, via an injected `expected[15]` load | yes |
+
+The third is the one that matters most: a harness that marked the pointer, the
+leading byte, or the wrong width would report it clean.
+
+### Defects this work surfaced
+
+Running the thing found three bugs, two of them in code that predates M6:
+
+* **Memcheck XML entity handling** (`memcheck.rs`). quick-xml splits text at
+  every entity reference and the parser overwrote rather than appended, so
+  `read_volatile&lt;u8&gt;` arrived as `u8`. Every generic or trait-qualified
+  frame name was destroyed, which made real findings unattributable and
+  downgraded them to `INCONCLUSIVE`. `trim_text(true)` compounded it by
+  trimming fragments individually, turning `a &amp; b` into `a&b`. This affected
+  M2 and M3 as well as M6.
+* **Findings named an inlined `core` frame.** The shallowest frame with a source
+  location is a stable identity for matching a finding across re-runs, but at
+  `-O` it is usually inside `core::ptr::read_volatile` — so a reproducer pointed
+  at `library/core/src/ptr/mod.rs` and named no code the developer wrote.
+  Findings now carry the contract's own frame as a separate, developer-facing
+  site.
+* **Artifact hashes were not reproducible.** The generated package's absolute
+  path was baked into debug info, so two identical runs produced different
+  hashes and `--replay` could never report that it ran against the same build.
+  The path is now remapped.
+
+### Defects review found after implementation
+
+Five, all localized, all now covered by regressions. Three could produce a
+misleadingly successful result, which is the class that matters most here.
+
+**A batch could be reported complete without the harness finishing.**
+`all_completed()` compared the *number* of per-case markers against the number
+requested, and matched markers anywhere in a line. The function under analysis
+shares the harness's stdout, so it could print a plausible marker and terminate
+the process and be credited as having run. Completion now needs four things: a
+per-run nonce stamped into every marker (generated by the runner, passed on the
+command line, absent from the library's source), the final run-completion
+marker, a matching count, and the completed ids being *exactly* the requested
+ids in order. The exit status is checked too, and documented as the weakest
+signal — Valgrind's `--error-exitcode` replaces the program's own status
+whenever Memcheck reported anything, so the final marker is what actually
+catches an abandoned run. Separately, the whole-corpus path reconstructed its
+*requested* ids from the harness's own markers, which made the comparison
+vacuous for that path; they now come from the corpus file.
+
+**Replay could exit 0 on evidence it never established.** `NOT_REPRODUCED` was
+derived from the absence of a matching diagnostic, with no requirement that the
+run was instrumented, parseable, complete or calibrated — so malformed analyzer
+output on a rebuilt artifact looked exactly like a fixed leak. Replay now has
+three verdicts, and `NOT_REPRODUCED` requires a sound run; anything else is
+`INCONCLUSIVE`, which fails. The gates are shared with `check_contract` rather
+than restated, so there cannot be two definitions of a trustworthy run. A
+finding that *did* appear still stands regardless: a leak cannot be un-observed.
+
+**Sequence-dependent reproducers lost their repeated inputs.** Replay rebuilt
+its corpus through ordinary generation, which deduplicates by input value — so a
+reproducer for a leak that needs two identical calls collapsed to one and could
+never reproduce, defeating the whole point of preserving the batch.
+`generate::verbatim` keeps order, multiplicity and values, retaining only the
+per-case validation.
+
+**The boundary floor was too low.** It was `max(|B_i|)`, but the stage sweeps
+each parameter against a shared base case and emits `1 + sum(|B_i| - 1)`. Two
+`u32` parameters have 94 boundary values each and produce 187 cases; a budget of
+94 was accepted. The floor now equals what the stage emits, asserted against the
+generator's own output. The example library's two modular-reduction contracts
+moved from 120 to 200 cases as a result, and CI asserts no completed run ever
+reports boundary cases dropped for budget.
+
+**Relationship coverage counted the wrong thing.** `planned` was
+`relationships * kinds`, but the generator applies one relationship to every
+byte-array boundary pattern of its left parameter — 13 for a 16-byte array, not
+5. Because the count was too *low*, `emitted >= planned` marked the strategy
+complete while candidates were dropped. Fixing it exposed that the boundary
+stage's shared base case then read as lost coverage, so coverage now separates
+duplicates from budget loss and only a real shortfall is truncation.
+
+### What changed from the plan
+
+* **The target is called directly.** §6 of the plan allowed for a laundered
+  function pointer, as M5 needs. The spike measured that a plain cross-crate
+  call keeps the target inside the attribution window, so the simpler form is
+  used and the reified form is a documented fallback.
+* **A second positive control was added.** The plan asked for an end-to-end
+  negative control proving the marked bytes reach the declared parameter; that
+  became `secret_binding_probe`, run per case, whose silence makes a run
+  inconclusive.
+* **Deduplication is distinguished from truncation.** Reporting them as one
+  number made a fully covered contract print a `TRUNCATED` line.
+* **The boundary budget is a hard floor, not a soft one.** A budget that cannot
+  cover a contract's boundary values is refused, naming the contract and the
+  minimum, rather than silently skipping the cheapest high-value cases. A `u32`
+  parameter has 94 boundary values, which is why two contracts raise `cases` to
+  120.
+* **`--all-configured`, not `--all-contracts`.** The honest name for what it
+  covers.
+
+## 12. Limitations
 
 * A clean generated run is evidence about the inputs generated and the paths
   they took. It is not a proof, and `NO_LEAK_OBSERVED` keeps that name.
@@ -385,7 +539,7 @@ of secret values proven safe.
 * The contract inventory is incomplete: configured contracts, not all
   annotations.
 
-## 12. Non-goals
+## 13. Non-goals
 
 No new symbolic engine; no coverage-guided fuzzing integration; no general heap
 modeling; no arbitrary structs, traits, generics or async; no statistical timing
@@ -397,7 +551,7 @@ In particular, LLVM coverage-guided fuzzing is **not** a prerequisite. It is an
 attractive M7, but it adds compilation artifacts and a second set of assumptions
 about which paths the security analyzer actually executes.
 
-## 13. Future direction
+## 14. Future direction
 
 * **M7** — coverage-guided leakage discovery, keeping coverage instrumentation
   separate from security analysis.

@@ -19,17 +19,22 @@ the formal noninterference property, and the roadmap.
 | M3 | Rust developer API — annotations, assertions, CI | complete |
 | M4 | Bounded relational verification (BINSEC symbolic execution) | complete, experimental |
 | M5 | Verifying the real functions in a Cargo library | complete, experimental |
-| M6 | Generated constant-time testing and CI enforcement | in progress — feasibility spike complete |
+| M6 | Generated constant-time testing and CI enforcement | complete, experimental |
 | M7 | Coverage-guided leakage discovery | future |
 | M8 | Compiler and build-profile regression analysis | future |
 | M9 | Hardware-oriented validation — statistical timing | future |
 
-M6 is in progress: its plan, the recorded feasibility results, and the
-limitations it accepts are in
-[docs/MILESTONE-06.md](docs/MILESTONE-06.md). Nothing below describes M6 —
-`cargo trace-check check` does not exist yet.
+`trace-check` turns that idea into reproducible analysis, from five directions:
 
-`trace-check` turns that idea into reproducible analysis, from four directions:
+* **Generated dynamic testing** (`check`, experimental) — generate inputs for a
+  declared contract and run them under Memcheck, with no hand-written test and
+  no container. The annotation already says which parameters are secret and the
+  signature supplies their types, so `check --contract my_crate::verify_tag` is
+  the whole input. Boundary values first, then pairwise combinations of
+  parameters, then seeded random fill; a finding is narrowed back to the single
+  input that caused it, reduced, and saved as a replayable reproducer. This is
+  the backend that finds a leak hiding behind a *public* mode no hand-written
+  test thought to pass. See [docs/MILESTONE-06.md](docs/MILESTONE-06.md).
 
 * **Bounded relational verification** (`verify`, experimental) — compile an
   optimized native target and ask a relational symbolic executor whether *any*
@@ -58,6 +63,7 @@ limitations it accepts are in
 
 ```sh
 cargo trace-check test                           # your own crate's checks (M3)
+cargo trace-check check --contract my_crate::verify_tag    # generated inputs (M6)
 cargo trace-check verify --contract my_crate::verify_tag   # your real function (M5)
 cargo trace-check verify                         # bundled standalone cases (M4)
 cargo run -p trace-check -- native               # native, under Memcheck
@@ -299,6 +305,117 @@ Observed event counts for `early_exit_opaque`, by mismatch position:
   every other command.
 
 ## Commands
+
+### `check` — generated constant-time testing
+
+```sh
+cargo trace-check check --contract crypto::lookup::substitute_mode
+cargo trace-check check --all-configured --ci
+cargo trace-check check --contract my_crate::verify_tag --cases 128 --seed 12345
+cargo trace-check check --replay failure.json
+```
+
+Generates inputs for a declared `#[constant_time]` contract and runs them under
+Memcheck. No hand-written `#[ct_test]` and no container: the annotation names
+the secret and the signature supplies the types, so a minimally supported
+contract needs no configuration at all.
+
+Why it exists: a hand-written dynamic check exercises the inputs someone thought
+of. `examples/crypto-library` has the demonstration — `substitute_mode` takes a
+public `mode`, its leak is on the `mode = 1` path, and its hand-written check
+passes `mode = 0` and honestly observes nothing. Generated inputs reach the other
+path without anyone naming it.
+
+**Generation.** Deterministic and seeded, spent in a fixed order: boundary
+values per parameter (zero, one, maxima, powers of two and their neighbours,
+and for byte arrays the all-zero, all-ones, alternating, one-hot and
+last-byte-only patterns), then pairwise combinations of parameters, then seeded
+random fill. Boundary coverage is a **hard** guarantee: a budget too small to
+cover every parameter's boundary values is refused, naming the contract and the
+minimum, because those are the cheap high-value cases. Pairwise is quadratic and
+explicitly best-effort, and a report names what it dropped. Persisted regressions replay *first* and can never be crowded out
+by the budget. Supported shapes are the ones the contract descriptor models:
+`u8`/`u16`/`u32`/`u64`, `bool` for a public parameter, and `[u8; N]` or
+`&[u8; N]` with a literal length. Anything else is refused with the type as
+written, never given a guessed value.
+
+Uniform random generation is close to useless for some shapes — two random
+16-byte tags essentially never match — so relationships between equal-length
+byte arrays are opt-in:
+
+```toml
+[[check."crypto::tag::verify_tag".relationships]]
+left = "expected"
+right = "supplied"
+kind = "equal"          # or differ-first-byte, differ-last-byte,
+                        # differ-one-bit, share-prefix
+```
+
+**Finding an input, not just a leak.** Cases run in batches, because Valgrind
+startup dominates: 256 cases in one process cost about what one case costs.
+But Memcheck consolidates repeated diagnostic sites, so a batch where one case
+leaks and a batch where every case leaks are *indistinguishable* in its output —
+the error count is not a leak count. A batch that reports a finding is therefore
+re-run over shrinking subsets until one case reproduces it, which takes
+⌈log₂ n⌉ extra processes. A finding that will not narrow is **kept**, reported
+as sequence-dependent with its batch preserved, because dropping a finding for
+resisting attribution is the one outcome a security tool cannot have.
+
+An isolated input is then reduced, and a candidate is accepted only when the
+*same* finding still reproduces — a panic or a different diagnostic is a
+different bug, not progress. `--reproducer-dir` writes a versioned JSON
+reproducer per finding; `--replay` runs one back, verbatim: order, multiplicity
+and values are preserved, because a leak that needs two identical calls cannot
+be reproduced by one.
+
+A replay reports three outcomes, not two. `NOT_REPRODUCED` is only ever
+returned when a complete, instrumented, calibrated run establishes the
+finding's absence; anything else is `INCONCLUSIVE` and fails. An infrastructure
+failure must never read as a fixed vulnerability. Only one combination passes:
+the finding is gone **and** the artifact changed — losing a finding on an
+unchanged build is a contradiction, not a fix.
+
+**Completion is evidence, not a count.** Every marker the generated harness
+prints carries a per-run nonce, so the function under analysis — which shares
+the harness's stdout — cannot forge one, and a final run-completion marker is
+required because nothing a per-case marker says rules out the process dying
+immediately afterwards.
+
+**Two positive controls, not one.** Calibration proves marking reaches compiled
+code in this binary. It cannot prove that *this contract's* secret reached the
+function, because it marks its own byte and passes either way — so each case
+also hands the bytes it is about to pass to a second probe. A run where that
+probe is silent is `INCONCLUSIVE`, never clean.
+
+**CI policy.** A `[check."…"]` entry declares what it asserts:
+
+| `expectation` | Meaning | A detected leak |
+| --- | --- | --- |
+| `security-contract` (default) | the function must satisfy the property | fails the build |
+| `analyzer-regression` | trace-check must produce a stated result on a known-vulnerable example | is that fixture passing |
+
+A security contract **cannot declare an `expected_outcome` at all** — the schema
+refuses it. That is what stops a stray expectation from turning a real leak into
+a green build, and it is why this project's own deliberately vulnerable fixtures
+have to say `expectation = "analyzer-regression"` out loud.
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | every selected contract satisfied what it asserted |
+| `1` | a leak was detected against a security contract |
+| `2` | incomplete — inconclusive, zero cases, a control that did not confirm, an unmet regression expectation, or `--ci` with contracts skipped |
+
+`--all-configured` is deliberately not called `--all-contracts`: it covers what
+`trace-check.toml` names, **not** every annotation in the source tree, and the
+report says so. `--ci` adds the guarantee that no configured contract was
+skipped.
+
+Reports distinguish three things that are easy to conflate: *contract coverage*
+(which contracts were checked), *input-strategy coverage* (which planned input
+categories were generated, with per-strategy planned/emitted counts), and
+*execution coverage* (which code paths ran) — which is **not** measured and is
+named as absent. The fraction of generated inputs executed is not a fraction of
+secret values proven safe.
 
 ### `native` — secret-dependency analysis of native code
 
@@ -649,11 +766,17 @@ crates/trace-check/
   src/harness.rs                 generating and linking a verification harness
                                  around a real Cargo library function
   src/library_report.rs          contract verification text and JSON reporting
+  src/generate.rs                deterministic typed input generation (M6)
+  src/dynamic_harness.rs         generating a std harness around a real library
+                                 function, and batched Memcheck execution
+  src/check.rs                   batching, failure isolation and shrinking
+  src/reproducer.rs              persisted reproducers and replay
+  src/check_report.rs            generated-testing reporting and CI policy
 crates/trace-check-secret/       secret marking for Memcheck (C shim)
 crates/trace-check-test/         developer API: assert_constant_time!, ct_test
 crates/trace-check-macros/       the ct_test and constant_time attributes
-crates/cargo-trace-check/        the `cargo trace-check test` and `verify`
-                                 subcommands
+crates/cargo-trace-check/        the `cargo trace-check test`, `check` and
+                                 `verify` subcommands
   tests/integration.rs           fixture and end-to-end tests
   tests/fixtures/                compact captured traces
 examples/mac-compare/            the example, its cases.json, screen.json
@@ -669,10 +792,13 @@ examples/external-library/       the same workflow for a crate outside this
                                  workspace, with its own lockfile (M5)
 examples/legacy-branch-demo/     original proof of concept, kept for context
 docs/                            milestone plan, methodology, limitations
+docs/spikes/m6-generated-harness/ the recorded M6.1 feasibility spike
 ci/verify-m3-consumer.py         asserts the M3 consumer report, not its exit code
 ci/verify-m4-symbolic.py         asserts the M4 symbolic report, not its exit code
 ci/verify-m5-library.py          asserts the M5 contract report, not its exit code
-.github/workflows/ci.yml         pinned Linux CI (M1-M3 job + M4/M5 analyzer job)
+ci/verify-m6-generated.py        asserts the M6 generated report, not its exit code
+ci/benchmark-m6.py               generated vs hand-written effectiveness benchmark
+.github/workflows/ci.yml         pinned Linux CI (M1-M3/M6 job + M4/M5 analyzer job)
 ```
 
 ## Development

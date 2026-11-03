@@ -165,6 +165,48 @@ jobs:
           set -e
           test "$code" = "1" || { echo "expected exit 1 (leak detected), got $code"; exit 1; }
 
+      # M6: generated constant-time testing. No hand-written #[ct_test] and no
+      # container -- the annotation and the signature are the whole input.
+      #
+      # Exits 0 with the library's own configuration: its clean contracts are
+      # security contracts that pass, and its deliberately vulnerable ones are
+      # declared `analyzer-regression`, so detecting their planted leaks is
+      # those fixtures passing. `--ci` additionally refuses a run that skipped
+      # any configured contract.
+      - name: Every configured contract is checked with generated inputs
+        working-directory: examples/crypto-library
+        run: |
+          cargo run --locked --release -p cargo-trace-check -- check \
+            --all-configured --ci --format json \
+            > "$GITHUB_WORKSPACE/m6-generated.json"
+          python3 "$GITHUB_WORKSPACE/ci/verify-m6-generated.py" \
+            "$GITHUB_WORKSPACE/m6-generated.json"
+
+      # The policy split, asserted rather than assumed. The *same* function
+      # that passes above as an analyzer-regression fixture must fail when it is
+      # declared as a security contract: the only difference is the
+      # configuration in force.
+      - name: A leak in a declared security contract fails the build
+        working-directory: examples/crypto-library
+        run: |
+          set -euo pipefail
+          printf 'schema_version = 1\n\n[check."crypto::lookup::substitute_mode"]\n' \
+            > /tmp/m6-security.toml
+          set +e
+          cargo run --locked --release -p cargo-trace-check -- check \
+            --contract crypto::lookup::substitute_mode --cases 50 \
+            --config /tmp/m6-security.toml
+          code=$?
+          set -e
+          test "$code" = "1" || {
+            echo "a leak in a function declared constant-time must exit 1, got $code"
+            exit 1; }
+
+      # The milestone's effectiveness claim, measured rather than asserted: the
+      # generated workflow must find a leak the hand-written check does not.
+      - name: Generated testing beats the hand-written check
+        run: python3 ci/benchmark-m6.py
+
       - name: Reproduce the demonstration
         run: cargo run --locked --release -p trace-check -- demo mac-compare
 
@@ -184,6 +226,7 @@ jobs:
             mac-compare-report.json
             mac-compare-screen.json
             native-memcheck.json
+            m6-generated.json
 
   # M4: bounded relational verification. A separate job because its backend is
   # a container image rather than a package, and because it must not be able to

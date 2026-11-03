@@ -975,3 +975,175 @@ fn run_staged_cases(copy: &Path, contract_id: &str, cases: &[Vec<(String, Value)
         .any(|error| error.attributable_to(&contract.function));
     found
 }
+
+// ---------------------------------------------------------------------------
+// M6.7: mutation tests.
+//
+// These are the tests that catch broken secret marking, a harness generated
+// against the wrong parameter, and a classifier that accidentally depends on
+// fixture names. Each one takes a function the suite above reports CLEAN, edits
+// the library's real implementation, and requires the verdict to flip while the
+// harness design, the generator and the configuration stay the same.
+// ---------------------------------------------------------------------------
+
+/// Rewrites one source file in a staged copy, requiring the injection site to
+/// still exist so a silently-missed mutation cannot pass as a clean result.
+fn mutate(copy: &Path, file: &str, from: &str, to: &str) {
+    let path = copy.join("src").join(file);
+    let original = std::fs::read_to_string(&path).expect("source file");
+    let mutated = original.replace(from, to);
+    assert_ne!(
+        mutated, original,
+        "the injection site no longer exists in {file}; this test is no longer testing anything"
+    );
+    std::fs::write(&path, mutated).expect("write mutated source");
+}
+
+/// Runs a generated check against a staged library copy.
+fn check_staged(copy: &Path, contract_id: &str, settings: GenerateSettings) -> ContractCheck {
+    let library =
+        Library::resolve(&copy.join("Cargo.toml"), &[]).expect("the staged library resolves");
+    let workspace = Workspace::ephemeral().expect("a private work directory");
+    let (work_dir, _) = workspace
+        .directories_for(contract_id)
+        .expect("per-contract directories");
+    let target_dir = shared_target_dir();
+
+    let contract = harness::probe_contract(&library, contract_id, &work_dir, &target_dir)
+        .unwrap_or_else(|e| panic!("reading {contract_id} from the staged copy failed: {e}"));
+    let generated = dynamic_harness::generate(&contract).expect("generated");
+    let corpus =
+        generate::generate(contract_id, &contract.descriptor, &settings).expect("corpus generated");
+    let corpus_path = dynamic_harness::stage_corpus(&corpus, &work_dir).expect("staged");
+    let artifact =
+        dynamic_harness::build(&library, &generated, contract_id, &work_dir, &target_dir)
+            .unwrap_or_else(|e| panic!("building the staged harness failed: {e}"));
+
+    let (valgrind, _version) = prepare_valgrind().expect("valgrind is available");
+    let mut runner = check::Runner::new(
+        &valgrind,
+        &artifact.path,
+        corpus_path,
+        work_dir.clone(),
+        native::Limits::default(),
+    );
+    check::check_contract(
+        &mut runner,
+        &contract,
+        &corpus,
+        &generated.secret_parameters,
+        generated.marked_bytes,
+        &CheckBudget {
+            batch_size: 32,
+            shrink: false,
+            ..Default::default()
+        },
+    )
+    .unwrap_or_else(|e| panic!("checking the staged copy failed: {e}"))
+}
+
+/// Mutation 1: a full-table scan becomes a secret-indexed lookup.
+///
+/// `substitute` is reported clean by the suite above. Indexing by the secret
+/// instead of by the loop counter must make the generated check fail, with
+/// nothing else changed.
+#[test]
+fn mutation_a_secret_indexed_lookup_is_caught() {
+    if !valgrind_available() {
+        return;
+    }
+    let staged = tempfile::tempdir().expect("temp dir");
+    let copy = stage_library(staged.path());
+    mutate(
+        &copy,
+        "lookup.rs",
+        "read_volatile(&SBOX[position as usize])",
+        "read_volatile(&SBOX[want as usize])",
+    );
+    let check = check_staged(&copy, "crypto::lookup::substitute", small());
+    assert_eq!(
+        check.outcome,
+        Outcome::LeakDetected,
+        "a secret-indexed load replaced a constant-time scan and was not caught: {}",
+        check.message
+    );
+    assert!(check.findings.iter().any(|finding| finding.attributed));
+}
+
+/// Mutation 2: a secret-dependent branch appears under a public mode.
+///
+/// `public_branch` branches on its public input only and is reported clean.
+/// Making the branch depend on the secret instead must be caught — and it is
+/// the generator that has to reach the mode, since no test names it.
+#[test]
+fn mutation_b_a_secret_branch_under_a_public_mode_is_caught() {
+    if !valgrind_available() {
+        return;
+    }
+    let staged = tempfile::tempdir().expect("temp dir");
+    let copy = stage_library(staged.path());
+    // Only the body changes, so the contract descriptor and the generated
+    // harness are byte-for-byte what they were.
+    mutate(
+        &copy,
+        "controls.rs",
+        "let base = if (mode & 1) == 0 { 0usize } else { 8usize };",
+        "let base = if (secret & 1) == 0 { 0usize } else { 8usize };",
+    );
+    let check = check_staged(&copy, "crypto::controls::public_branch", small());
+    assert_eq!(
+        check.outcome,
+        Outcome::LeakDetected,
+        "a branch on the secret replaced a branch on a public input and was not caught: {}",
+        check.message
+    );
+}
+
+/// Mutation 3: a leak that depends only on the final byte of a 16-byte secret.
+///
+/// `verify_tag` folds all 16 bytes and is reported clean. Making only the last
+/// byte select a load address must still be caught: a harness that marked the
+/// pointer, the leading byte, or the wrong width would report this clean, and
+/// the last byte is the one a short mark misses.
+#[test]
+fn mutation_c_a_last_byte_only_leak_is_caught() {
+    if !valgrind_available() {
+        return;
+    }
+    let staged = tempfile::tempdir().expect("temp dir");
+    let copy = stage_library(staged.path());
+    // A helper whose load address depends on the secret's final byte only.
+    //
+    // Injected after `TAG_LEN`, which is unique in the file: injecting at
+    // `pub fn verify_tag(` would land between the `#[constant_time]` attribute
+    // and the function it annotates.
+    mutate(
+        &copy,
+        "tag.rs",
+        "pub const TAG_LEN: usize = 16;",
+        "pub const TAG_LEN: usize = 16;\n\n\
+         static TAIL_TABLE: [u8; 256] = [0x11; 256];\n\n\
+         /// Injected by a mutation test: only `expected[15]` reaches an address.\n\
+         fn tail_leak(expected: &[u8; 16]) -> bool {\n    \
+         // SAFETY: a `u8` index is always inside a 256-byte table.\n    \
+         (unsafe { core::ptr::read_volatile(&TAIL_TABLE[expected[15] as usize]) }) != 0x12\n\
+         }",
+    );
+    // Call it from the contract's own body, so the leak is on the analyzed
+    // path. The signature and the declared contract are untouched.
+    mutate(
+        &copy,
+        "tag.rs",
+        "expected.ct_eq(supplied).unwrap_u8() == 1",
+        "expected.ct_eq(supplied).unwrap_u8() == 1 && tail_leak(expected)",
+    );
+
+    let check = check_staged(&copy, "crypto::tag::verify_tag", small());
+    assert_eq!(
+        check.outcome,
+        Outcome::LeakDetected,
+        "a leak depending only on the secret's final byte was missed, so the marking is not \
+         complete: {}",
+        check.message
+    );
+}

@@ -1,12 +1,15 @@
-# crypto-library — one implementation, two analyses
+# crypto-library — one implementation, three analyses
 
 An ordinary `no_std` Rust library. Nothing in it is a verification harness and
 nothing in it is written for an analyzer: each function is defined once, in
-`src/`, and both backends analyze code compiled from that source.
+`src/`, and every backend analyzes code compiled from that source.
 
 ```sh
 # M3: dynamic, under Valgrind Memcheck. Runs the inputs the tests chose.
 cargo trace-check test
+
+# M6: dynamic, under Valgrind Memcheck. Generates the inputs itself.
+cargo trace-check check --all-configured
 
 # M5: symbolic, under BINSEC. Searches a declared domain for a secret
 # assignment that leaks.
@@ -33,11 +36,35 @@ correct ones, so a **full** run of either command exits nonzero by design.
 | `cargo trace-check test` | 1 | the vulnerable contracts are detected, as intended |
 | `cargo trace-check verify --all-contracts` | 0 | every contract **declares** its expected outcome, and all of them are reproduced |
 | `cargo trace-check verify --contract crypto::tag::verify_tag` | 0 | `VERIFIED_BOUNDED`, as declared |
+| `cargo trace-check check --all-configured --ci` | 0 | the clean contracts are security contracts that pass; the vulnerable ones are declared `analyzer-regression`, so detecting their planted leaks is those fixtures passing |
+| `cargo trace-check check --contract crypto::lookup::substitute_mode` | 0 | `LEAK_DETECTED`, as that fixture declares |
 
 `verify` exits 0 on a reproduced `LEAK_DETECTED` because the declared
 expectation was met: the security of the function and the pass/fail of the
 regression fixture are separate questions. `test` has no such declaration, so a
 detected leak is a failure there.
+
+`check` makes that distinction explicit rather than implicit. Every `[check]`
+entry states whether it is a `security-contract` — where a leak fails the build
+— or an `analyzer-regression`, where detecting a known leak is the point. A
+security contract **cannot** declare an expected outcome, so no configuration in
+this file can make a real leak acceptable. To see the other side of the split:
+
+```sh
+# The same function, declared as a real contract instead of a fixture. Exits 1.
+printf 'schema_version = 1\n\n[check."crypto::lookup::substitute_mode"]\n' \
+    > /tmp/security.toml
+cargo trace-check check --contract crypto::lookup::substitute_mode \
+    --config /tmp/security.toml
+```
+
+## The contract `check` exists for
+
+`substitute_mode` takes a public `mode`, and its leak is only on the `mode = 1`
+path. The hand-written `#[ct_test]` for it passes `mode = 0` and observes
+nothing — which is honest, and useless. `check` generates inputs from the
+annotation and reaches the other path without anyone naming it, then narrows the
+finding back to the single input that caused it.
 
 ## The contracts
 
