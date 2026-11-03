@@ -1,0 +1,25 @@
+[package]
+name = "tc-spike-inventory"
+description = "M8.1 feasibility spike: a compiler-backed contract inventory read out of a compiled rlib"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "spike"
+path = "src/lib.rs"
+
+[features]
+# A feature-gated declaration, to show the inventory follows the selected
+# compilation rather than the source text.
+fast = []
+
+[profile.release]
+opt-level = 3
+# Several codegen units on purpose: a record must not be lost or duplicated
+# when the crate is split across objects.
+codegen-units = 16
+
+# Its own workspace root, so the spike is never absorbed into the repository's
+# workspace and cannot be built by an ordinary `cargo build` at the top level.
+[workspace]
