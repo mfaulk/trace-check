@@ -645,6 +645,59 @@ for the reproducible feasibility experiments — including the two findings that
 shaped the mechanism: `llvm-objcopy --dump-section` silently loses records, and
 an LTO rlib holds bitcode rather than ELF.
 
+### Auditing somebody else's library (M9)
+
+Everything above analyzes code written in this repository.
+[`examples/crypto-bigint-audit`](examples/crypto-bigint-audit/README.md) analyzes
+[RustCrypto `crypto-bigint`](https://github.com/RustCrypto/crypto-bigint)
+`0.7.10`, consumed as an ordinary pinned crates.io dependency with **no upstream
+source change**:
+
+```sh
+cargo trace-check check --all-contracts --ci \
+  --manifest-path examples/crypto-bigint-audit/Cargo.toml
+```
+
+A thin adapter decodes a declared-secret `&[u8; 32]` with the library's own
+`U256::from_be_slice`, calls the library's own `wrapping_add`, and folds all 32
+result bytes. A contract covers that **whole invocation** — decoding, the
+library's types, its operation, and the result consumption — so a clean result
+on the adapter, read alone, is indistinguishable from a harness that marked
+nothing.
+
+Six controls are what make it mean something, and all six are detected: a branch
+on a decoded limb, on an interior limb, on the final secret byte alone, on the
+`Limb` carry `Uint::carrying_add` *returned*, and a load address derived from the
+decoded sum. They are declared `expected_outcome = "LEAK_DETECTED"`, so if one
+stops being detected the run fails on an unmet expectation rather than reporting
+a clean sweep.
+
+The decisive evidence is that changing the **library**, not the harness, flips
+the verdict:
+
+```sh
+python3 ci/mutate-m9.py --mutation mutation-a-carry-branch \
+  --contract cbaudit::add::wrapping_add_secret_left \
+  --expect-outcome LEAK_DETECTED --expect-frame src/uint/add.rs --compare-clean
+```
+
+The driver stages the pinned source into an isolated copy, applies an explicit
+patch, requires the adapter's own functional tests to still pass, and runs the
+unchanged contract. The finding's leaf frame is
+`carrying_add<4> (src/uint/add.rs:31)` — upstream source, at the patched line —
+and the clean and mutated artifact hashes must differ or the run fails. A stale
+patch and a mutation in a function that is never called both fail as invalid
+experiments instead of being reported as clean.
+
+The one integration hazard this turned up: two adapters whose bodies compile
+identically are folded to one symbol, and a finding in either then cannot be
+attributed — reported as `INCONCLUSIVE`, never as clean. See
+[docs/MILESTONE-09.md](docs/MILESTONE-09.md) for that and the other three
+findings, and [docs/audits/crypto-bigint/](docs/audits/crypto-bigint/threat-model.md)
+for the analysis boundary. **None of it is a claim that `crypto-bigint` is
+secure:** it is one operation of three, under two modeled observations, on one
+artifact.
+
 ### `native` — secret-dependency analysis of native code
 
 ```sh
@@ -1023,8 +1076,13 @@ examples/crypto-library/         an ordinary no_std library whose real functions
                                  verified, plus its trace-check.toml (M5)
 examples/external-library/       the same workflow for a crate outside this
                                  workspace, with its own lockfile (M5)
+examples/crypto-bigint-audit/    audit adapters over RustCrypto crypto-bigint
+                                 0.7.10, consumed unmodified as a pinned
+                                 dependency, with the propagation controls (M9)
 examples/legacy-branch-demo/     original proof of concept, kept for context
 docs/                            milestone plan, methodology, limitations
+docs/audits/crypto-bigint/       the M9 target selection, threat model and
+                                 integration report
 docs/spikes/m6-generated-harness/ the recorded M6.1 feasibility spike
 docs/spikes/m7-coverage-feedback/ the recorded M7.1 feasibility spike
 docs/spikes/m8-contract-inventory/ the recorded M8.1 feasibility spike
@@ -1037,7 +1095,10 @@ ci/benchmark-m7.py               M6-versus-M7 discovery benchmark and acceptance
 ci/verify-m8-contracts.py        asserts the M8 coverage report, not its exit code
 ci/benchmark-m8.py               contract-discovery overhead at 0/10/50/100 declarations
 ci/benchmark-m6.py               generated vs hand-written effectiveness benchmark
-.github/workflows/ci.yml         pinned Linux CI (M1-M3/M6-M8 job + M4/M5 analyzer job)
+ci/mutate-m9.py                  one upstream-mutation experiment, with the
+                                 validity checks that make its outcome earned
+ci/mutations/                    the explicit patches those experiments apply
+.github/workflows/ci.yml         pinned Linux CI (M1-M3/M6-M9 job + M4/M5 analyzer job)
 ```
 
 ## Development

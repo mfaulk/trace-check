@@ -1,0 +1,13 @@
+Negative control: a patch whose context no longer exists upstream.
+--- a/src/uint/add.rs
++++ b/src/uint/add.rs
+@@ -18,8 +18,9 @@
+     pub const fn carrying_add_with_a_name_that_was_never_upstream(
+         &self,
+         rhs: &Self,
+     ) -> (Self, Limb) {
+         let mut limbs = [Limb::ZERO; LIMBS];
++        let _ = core::hint::black_box(&limbs);
+         let mut i = 0;
+
+         (Self { limbs }, Limb::ZERO)

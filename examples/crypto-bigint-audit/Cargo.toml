@@ -1,0 +1,37 @@
+[package]
+name = "crypto-bigint-audit"
+description = "Audit adapters that expose RustCrypto crypto-bigint operations to trace-check"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# The crate name qualifies every contract identity, so the contracts read
+# `cbaudit::add::wrapping_add_secret_left`.
+[lib]
+name = "cbaudit"
+path = "src/lib.rs"
+
+# Outside the workspace on purpose, for two reasons. The audit crate must
+# resolve its own dependency graph — the whole point is that trace-check
+# analyzes a library it knows nothing about — and the mutation experiments copy
+# this crate and rewrite the dependency underneath the copy, which a workspace
+# member cannot do without disturbing `cargo test --workspace`.
+[workspace]
+
+[dependencies]
+# `=0.7.10`, not `0.7.10`. The analyzed artifact is the claim, so the
+# dependency's exact version is part of the pinned configuration: a caret
+# requirement would let a patch release change the compiled code that a
+# recorded finding refers to. The committed `Cargo.lock` pins the rest of the
+# graph; this pins the subject of the audit itself.
+#
+# `default-features = false` drops `rand_core`, which the audit does not use.
+# The resulting graph is `cpubits`, `ctutils`, `cmov` and `num-traits`, all
+# `no_std`.
+crypto-bigint = { version = "=0.7.10", default-features = false }
+
+# A proc-macro crate, compiled for the host, contributing nothing to the
+# analyzed binary — which is what lets this stay `no_std` outside its own test
+# build.
+trace-check-macros = { path = "../../crates/trace-check-macros" }

@@ -1,0 +1,15 @@
+--- a/src/uint/add.rs
++++ b/src/uint/add.rs
+@@ -33,6 +33,12 @@
+     #[must_use]
+     pub const fn saturating_add(&self, rhs: &Self) -> Self {
+         let (res, overflow) = self.carrying_add(rhs, Limb::ZERO);
++        // M9 NEGATIVE CONTROL: the same secret-dependent branch as mutation A,
++        // in a function the audit adapters never call. A tool that reported a
++        // finding for this would be reporting source it never executed.
++        if overflow.0 != 0 {
++            core::hint::black_box(&res);
++        }
+         Self::select(&res, &Self::MAX, word::choice_from_lsb(overflow.0))
+     }
+ 

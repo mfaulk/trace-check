@@ -1,0 +1,72 @@
+# Check settings for the crypto-bigint audit adapters.
+#
+# What is NOT here: which parameters are secret. That comes from
+# `#[constant_time(secret = …)]` on the adapter itself. Configuration decides
+# only *how* each declaration is analyzed, never what it claims.
+#
+# `expected_outcome` is a regression fixture, never an input to the decision.
+# The six controls below are expected to be *detected*; if one of them ever
+# stops being detected, the gate that makes a clean result on a real operation
+# meaningful has quietly stopped working, and that must surface as an unmet
+# expectation rather than as a passing run.
+schema_version = 1
+description = "Audit adapters over RustCrypto crypto-bigint 0.7.10, with the M9.1 propagation controls."
+
+# ------------------------------------------------------------------
+# Target A — the real operation. These are the contracts whose clean
+# result is the audit evidence, and they are only worth anything
+# because the controls below are detected.
+# ------------------------------------------------------------------
+
+[check."cbaudit::add::wrapping_add_secret_left"]
+description = "U256::wrapping_add with a secret left operand and a public right"
+rationale = "defined for every pair of 256-bit values, so unrestricted generated operands are valid inputs and a finding cannot be an artifact of violating a precondition. The compiled adapter contains the library's own from_be_slice, carrying_add chain and new_be -- see docs/audits/crypto-bigint/integration-report.md"
+
+[check."cbaudit::add::wrapping_add_both_secret"]
+description = "the same operation with both operands secret"
+rationale = "a separate claim, not a separate implementation: safety for a public operand does not imply safety for a secret one"
+
+# ------------------------------------------------------------------
+# M9.1 controls. Each is expected to be detected, and each names the
+# way of being wrong it rules out.
+# ------------------------------------------------------------------
+
+[check."cbaudit::controls::pre_decode_first_byte"]
+description = "control B1: a branch on secret[0] before any decoding"
+rationale = "necessary but insufficient. It shows the harness marked the array; it shows nothing about crypto-bigint, because the secret never reaches it"
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"
+
+[check."cbaudit::controls::decoded_high_limb_branch"]
+description = "control B2: a branch on the decoded value's most significant limb, secret[0..8]"
+rationale = "the first control that is about propagation rather than marking: the branch is driven by a Word the library produced from the secret bytes"
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"
+
+[check."cbaudit::controls::decoded_interior_limb_branch"]
+description = "control B3: a branch on an interior limb, secret[8..16]"
+rationale = "middle limbs are where a partial marking mistake hides -- a harness that marked the first and last eight bytes passes B2 and B4 and fails only here"
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"
+
+[check."cbaudit::controls::decoded_last_byte_branch"]
+description = "control B4: a branch on secret[31] alone, through the least significant limb"
+rationale = "isolating the final byte is what distinguishes complete marking from marking that merely covers the leading bytes or the wrong width"
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"
+
+[check."cbaudit::controls::carry_branch"]
+description = "control B5: a branch on the carry the library itself produced"
+rationale = "carrying_add is upstream code and the carry is its return value, so this follows a secret through multi-limb propagation rather than through decoding alone"
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"
+
+[check."cbaudit::controls::decoded_address_probe"]
+description = "control B6: a secret-derived load address after decoding"
+rationale = "every secret executes the same instructions here, so a control-flow-only analysis reports it clean. It is the evidence that the address half of the observation model also survives decoding"
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"
+
+[check."cbaudit::controls::public_operand_branch"]
+description = "negative control: a branch on the public operand only"
+rationale = "both compared executions share their public inputs, so this is not a leak. A finding here would be wrong in the direction that makes the tool useless, and it is what separates `tracks the declared secret` from `complains about any branch`"
