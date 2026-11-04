@@ -1,6 +1,6 @@
 # Milestone 09 — Real-World Cryptography Integration and Audit Validation
 
-**Status:** M9.0–M9.5 implemented; M9.6–M9.8 outstanding
+**Status:** M9.0–M9.6 implemented; M9.7 and M9.8 outstanding
 **Branch:** `feat/m9-real-world-crypto`
 **Prerequisite:** Milestone 8, merged
 **Reference library:** RustCrypto `crypto-bigint` `0.7.10`
@@ -27,7 +27,7 @@ effectively trace-check can investigate real cryptographic code.
 
 ---
 
-## 2. The mandatory gate, and the four findings that came out of it
+## 2. The mandatory gate, and the findings that came out of M9
 
 M9.1 is a gate, not a milestone phase: the plan forbids proceeding to the
 remaining work packages until it passes. It passed. Full measurements in
@@ -44,7 +44,8 @@ if Memcheck's dependency tracking had stopped at the first type conversion,
 accepting `U256` directly as an annotated parameter would not have fixed it,
 and no amount of adapter engineering would either.
 
-Four things the gate turned up that the plan did not anticipate.
+Five things M9 turned up that the plan did not anticipate. Four came from
+the gate; the fifth is a tool bug no in-repo example could have surfaced.
 
 ### Finding one: identical adapter bodies are folded, and attribution then fails
 
@@ -98,6 +99,33 @@ mutation uses `core::hint::black_box` in the taken arm, which cannot be
 if-converted. The controls in `src/controls.rs` use a volatile write for the
 same reason. A control whose branch the compiler erases is not a control.
 
+### Finding five: the symbolic backend could not link a multi-crate library
+
+The first symbolic run never reached the analyzer:
+
+```text
+rust-lld: error: undefined symbol: rust_eh_personality
+  >>> referenced by core.940e698046960fd5-cgu.0
+```
+
+The verification artifact is a freestanding static ELF linked with `-nostdlib`,
+and the precompiled `libcore` carries unwind tables. A codegen unit with a
+landing pad references `rust_eh_personality` through a DWARF reference, which
+`-nostdlib` has nothing to resolve — even under `panic = "abort"`, because the
+reference is in the unwind data rather than in reachable code.
+
+Every earlier example is one crate plus the proc-macro, and never pulled in
+such a codegen unit, so the link had always succeeded. `crypto-bigint` with its
+four dependencies does. The generated harness now defines the symbol (never
+called — the panic handler loops), with a regression test in `harness.rs`, and
+`examples/crypto-library` and `examples/external-library` reproduce their
+existing expectations unchanged.
+
+This is the only change M9 made outside `examples/` and `ci/`, and it is the
+most valuable thing the milestone produced for the tool itself: bounded
+verification was unavailable to **any** library with more than one dependency,
+and nothing in this repository could have shown that.
+
 ---
 
 ## 3. What was built
@@ -129,6 +157,7 @@ docs/audits/crypto-bigint/
   threat-model.md                 the analysis boundary and what is out of scope
   integration-report.md           the gate's measurements and M9.2's additions
   findings.md                     every outcome, with its attribution
+  symbolic-feasibility.md         M9.6: the full symbolic matrix, and a link blocker
 ```
 
 There is no separate `limitations.md`: scope limits live in `threat-model.md`
@@ -175,6 +204,7 @@ python3 ci/mutate-m9.py --mutation mutation-c-indexed-reduction \
 | Negative control | `NO_LEAK_OBSERVED`, as required |
 | Upstream mutations detected | 3 of 3 — two branch findings, one address finding |
 | Unsupported Rust constructs encountered | none |
+| Symbolic: contracts settled / `INCONCLUSIVE` | 13 / 0, in 13.3 s and 186 MB |
 
 Experiment C's disassembly evidence is in
 [`findings.md`](audits/crypto-bigint/findings.md): the inlined `from_be_slice`
@@ -193,8 +223,6 @@ something a source review establishes — and the same function written with an
 
 ## 5. Limitations
 
-* The symbolic backend was not exercised: BINSEC is not installed on the
-  development host, so M9.6 has not started.
 * The artifact hash is not comparable across invocations, because the staging
   directory's path is in the debug info the harness build keeps deliberately.
   The dependency tree digest *is* stable and is the reproducible identity.
@@ -214,7 +242,7 @@ something a source review establishes — and the same function written with an
 | M9.3 | Real-library dynamic checks and M8 enforcement | **done** for all three targets; no M7 exploration yet |
 | M9.4 | Mutation infrastructure | **done** — isolation, provenance and validity checks in place |
 | M9.5 | Three upstream mutation regressions | **done** — 2 branch, 1 address |
-| M9.6 | Symbolic feasibility spike | not started (no BINSEC on this host) |
+| M9.6 | Symbolic feasibility spike | **done** — 13 of 13, zero INCONCLUSIVE |
 | M9.7 | M6-versus-M7 detection comparison and benchmarks | not started |
 | M9.8 | CI integration and adoption report | Level 1 CI only |
 
@@ -248,7 +276,9 @@ something a source review establishes — and the same function written with an
       with validity controls for a stale patch, an unexecuted mutation and a
       reused artifact.
 - [ ] M6 versus M7 detection effectiveness measured on this integration.
-- [ ] Symbolic feasibility evaluated.
+- [x] Symbolic feasibility evaluated — all thirteen contracts, every
+      expectation reproduced, zero `INCONCLUSIVE`, including 256-bit Montgomery
+      multiplication the plan did not require to complete.
 - [x] CI validates artifact identity, instrumentation, findings and
       completion, at both levels. `ci/verify-m9-integration.py` checks the
       report's own claims; `ci/mutate-m9.py` checks artifact difference,

@@ -98,3 +98,116 @@ expected_outcome = "LEAK_DETECTED"
 [check."cbaudit::controls::public_operand_branch"]
 description = "negative control: a branch on the public operand only"
 rationale = "both compared executions share their public inputs, so this is not a leak. A finding here would be wrong in the direction that makes the tool useless, and it is what separates `tracks the declared secret` from `complains about any branch`"
+
+# ------------------------------------------------------------------
+# M9.6 — bounded relational verification of the same contracts.
+#
+# A bounded result applies only to the compiled verification artifact,
+# the declared input domain, the depth bound and the observation
+# model. It is not a proof about the optimized production library in
+# arbitrary calling contexts.
+#
+# The measurement that shaped this section: relational verification of
+# *branchless* code is cheap no matter how wide the arithmetic is. The
+# cost scales with the number of paths and observations, not with the
+# size of the symbolic terms -- the analyzer never has to reason about
+# what a 256-bit product equals, only about whether any address or
+# branch condition depends on the secret. 256-bit Montgomery
+# multiplication completes in seconds for exactly that reason.
+# ------------------------------------------------------------------
+
+[verify."cbaudit::add::wrapping_add_secret_left"]
+description = "branchless 256-bit addition, secret left operand"
+rationale = "256 symbolic secret bits, but the operation is a four-limb add/adc chain with no branch, so there is one path to explore"
+max_depth = 20000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "VERIFIED_BOUNDED"
+
+[verify."cbaudit::add::wrapping_add_both_secret"]
+description = "the same, with 512 symbolic secret bits"
+rationale = "doubling the symbolic domain does not add paths, which is the point of the measurement"
+max_depth = 20000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "VERIFIED_BOUNDED"
+
+[verify."cbaudit::select::ct_select"]
+description = "the library's constant-time selection, 520 symbolic secret bits"
+rationale = "the real question was whether the analyzer models the `cmov` the selection compiles to. It does"
+max_depth = 20000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "VERIFIED_BOUNDED"
+
+[verify."cbaudit::monty::mul_secret_left"]
+description = "256-bit Montgomery multiplication and reduction"
+rationale = "the target M9's plan expected to be prohibitive. It is not: the code is branchless, so there is one path and the work is discharging per-observation queries"
+max_depth = 200000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "VERIFIED_BOUNDED"
+
+[verify."cbaudit::monty::mul_both_secret"]
+description = "the same, with both operands secret"
+rationale = "the configuration a field multiplication inside a scalar multiplication actually sees"
+max_depth = 200000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "VERIFIED_BOUNDED"
+
+# The controls, from the symbolic side. These matter more here than the
+# clean results do: a VERIFIED_BOUNDED on one of them would mean the
+# secret stopped being symbolic somewhere in the decode, and then every
+# clean result above would be worthless.
+
+[verify."cbaudit::controls::pre_decode_first_byte"]
+description = "control B1: a branch on secret[0] before decoding"
+rationale = "necessary but insufficient -- it shows the harness made the array symbolic, nothing more"
+max_depth = 20000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "LEAK_DETECTED"
+
+[verify."cbaudit::controls::decoded_high_limb_branch"]
+description = "control B2: a branch on the decoded most significant limb"
+rationale = "the first control that is about propagation: the branch is on a Word the library produced"
+max_depth = 20000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "LEAK_DETECTED"
+
+[verify."cbaudit::controls::decoded_interior_limb_branch"]
+description = "control B3: a branch on an interior limb"
+rationale = "where a partial marking mistake would hide"
+max_depth = 20000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "LEAK_DETECTED"
+
+[verify."cbaudit::controls::decoded_last_byte_branch"]
+description = "control B4: a branch on secret[31] alone"
+rationale = "isolating the final byte separates complete marking from marking the leading bytes"
+max_depth = 20000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "LEAK_DETECTED"
+
+[verify."cbaudit::controls::carry_branch"]
+description = "control B5: a branch on the carry the library returned"
+rationale = "the strongest propagation control -- the branched-on value is a return value of upstream code"
+max_depth = 20000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "LEAK_DETECTED"
+
+[verify."cbaudit::controls::decoded_address_probe"]
+description = "control B6: a secret-derived load address after decoding"
+rationale = "one path, no branch, so only the memory-access half of the model can see this"
+max_depth = 20000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "LEAK_DETECTED"
+
+[verify."cbaudit::controls::branch_selected"]
+description = "control B7: selection written with a branch instead of CtSelect"
+rationale = "the pair to `select::ct_select` above: same function, one branchless and verified, one branched and detected"
+max_depth = 20000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "LEAK_DETECTED"
+
+[verify."cbaudit::controls::public_operand_branch"]
+description = "negative control: a branch on the public operand only"
+rationale = "public inputs are symbolic and held equal between the paired executions, so branching on one is not a leak. A finding here would be wrong in the direction that makes the tool useless"
+max_depth = 20000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "VERIFIED_BOUNDED"
