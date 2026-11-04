@@ -29,6 +29,7 @@
 
 pub mod add;
 pub mod controls;
+pub mod hidden;
 pub mod monty;
 pub mod select;
 pub mod sink;

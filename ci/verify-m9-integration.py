@@ -8,9 +8,11 @@ auditing somebody else's library -- the ones that would make the report
 
 * every contract this integration declares is present, and no extra one is
   reported without an expectation here;
-* the expected outcome per contract, including the seven controls that must be
-  LEAK_DETECTED -- a control that stops being detected means a clean result on
-  the real operations establishes nothing;
+* the expected outcome per contract, including the seven propagation controls
+  that must be LEAK_DETECTED -- a control that stops being detected means a
+  clean result on the real operations establishes nothing -- and the two M9.7
+  fixtures that are expected *not* to be found, whose rows record a measured
+  limit of input discovery rather than a clean result;
 * at least one branch finding and one address finding among the controls, so
   both halves of the observation model are shown working;
 * secret marking was calibrated and bound for every contract, so no clean
@@ -41,6 +43,14 @@ EXPECTED = {
     "cbaudit::monty::mul_both_secret": "NO_LEAK_OBSERVED",
     # The negative control: a branch on a public input is not a leak.
     "cbaudit::controls::public_operand_branch": "NO_LEAK_OBSERVED",
+    # The M9.7 fixtures: a leak behind a public predicate. Two are expected
+    # NOT to be found, and those rows are the measured limits of input
+    # discovery rather than clean results -- see exploration.md.
+    "cbaudit::hidden::boundary_gate": "LEAK_DETECTED",
+    "cbaudit::hidden::nested_modes": "LEAK_DETECTED",
+    "cbaudit::hidden::nested_modes_wide": "NO_LEAK_OBSERVED",
+    "cbaudit::hidden::magic_gate": "NO_LEAK_OBSERVED",
+    "cbaudit::hidden::nested_modes_clean": "NO_LEAK_OBSERVED",
     # The propagation gate. Each must be detected.
     "cbaudit::controls::pre_decode_first_byte": "LEAK_DETECTED",
     "cbaudit::controls::decoded_high_limb_branch": "LEAK_DETECTED",
@@ -156,8 +166,8 @@ def main():
     detected = sum(1 for value in EXPECTED.values() if value == "LEAK_DETECTED")
     clean = len(EXPECTED) - detected
     print(
-        f"verify-m9-integration: {len(EXPECTED)} contract(s) -- {detected} control(s) "
-        f"detected, {clean} clean, both observation classes exercised"
+        f"verify-m9-integration: {len(EXPECTED)} contract(s) -- {detected} detected, "
+        f"{clean} reporting no leak, both observation classes exercised"
     )
     print(
         "verify-m9-integration: marking calibrated and bound for every contract, "

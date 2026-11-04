@@ -100,6 +100,73 @@ description = "negative control: a branch on the public operand only"
 rationale = "both compared executions share their public inputs, so this is not a leak. A finding here would be wrong in the direction that makes the tool useless, and it is what separates `tracks the declared secret` from `complains about any branch`"
 
 # ------------------------------------------------------------------
+# M9.7 — leaks in real operations behind *public* predicates.
+#
+# The controls above leak on essentially every input, so they measure
+# nothing about input discovery. These do: the secret handling is the
+# same, and what varies is how hard the vulnerable path is to reach.
+#
+# `expected_outcome` here is the honest measurement, including the two
+# rows nothing finds. A fixture set where exploration won every row
+# would be measuring the fixtures.
+# ------------------------------------------------------------------
+
+[check."cbaudit::hidden::boundary_gate"]
+description = "a leak behind the public operand being all-ones"
+rationale = "an all-ones byte array is a boundary value, so M6's boundary stage supplies it among the first cases. The entry exists so a coverage-guided run that dropped the mandatory boundary cases in favour of its own candidates would stop detecting this"
+cases = 200
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"
+
+[check."cbaudit::hidden::nested_modes"]
+description = "the core coverage-guidance test: a leak behind three public predicates"
+rationale = "boundary generation moves one parameter away from base and pairwise moves two, so neither can satisfy a three-parameter conjunction at any budget. Only coverage feedback, which extends a retained seed one predicate at a time, reaches it -- measured at 3 seeds retained and 14 new regions in 768 candidates"
+cases = 200
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"
+
+# The entry that makes the fixture above detectable. Without exploration the
+# same check honestly reports NO_LEAK_OBSERVED: the leak is there, on a path
+# M6's generator cannot construct.
+[check."cbaudit::hidden::nested_modes".explore]
+enabled = true
+candidate_budget = 4000
+security_case_budget = 128
+
+[check."cbaudit::hidden::nested_modes_wide"]
+description = "diagnostic: the same three predicates, diluted by a public 32-byte operand"
+rationale = "the public surface is 35 bytes instead of 3, so the mutator spends almost all of its public budget on array bytes that cannot open any gate and converges before the third predicate -- 2 seeds retained, 6 new regions, nothing found, at the same budget that finds `nested_modes`. Recorded because coverage-guided discovery is sensitive to how much of the signature is public, not only to how deep the gate is"
+cases = 200
+expectation = "analyzer-regression"
+expected_outcome = "NO_LEAK_OBSERVED"
+
+[check."cbaudit::hidden::nested_modes_wide".explore]
+enabled = true
+candidate_budget = 4000
+security_case_budget = 128
+
+[check."cbaudit::hidden::magic_gate"]
+description = "diagnostic: a leak behind an exact 32-bit public equality"
+rationale = "region coverage gives no gradient toward one 32-bit constant -- every token but one reaches the same regions -- so exploration is expected NOT to find this. The declared outcome records the limit instead of leaving it implicit"
+cases = 200
+expectation = "analyzer-regression"
+expected_outcome = "NO_LEAK_OBSERVED"
+
+[check."cbaudit::hidden::magic_gate".explore]
+enabled = true
+candidate_budget = 4000
+
+[check."cbaudit::hidden::nested_modes_clean"]
+description = "false-positive control: nested_modes' shape with a constant-time body"
+rationale = "exploration reaches the guarded region and the security backend must still observe nothing. A finding here would mean discovery had begun manufacturing evidence"
+cases = 200
+
+[check."cbaudit::hidden::nested_modes_clean".explore]
+enabled = true
+candidate_budget = 4000
+security_case_budget = 128
+
+# ------------------------------------------------------------------
 # M9.6 — bounded relational verification of the same contracts.
 #
 # A bounded result applies only to the compiled verification artifact,
@@ -208,6 +275,46 @@ expected_outcome = "LEAK_DETECTED"
 [verify."cbaudit::controls::public_operand_branch"]
 description = "negative control: a branch on the public operand only"
 rationale = "public inputs are symbolic and held equal between the paired executions, so branching on one is not a leak. A finding here would be wrong in the direction that makes the tool useless"
+max_depth = 20000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "VERIFIED_BOUNDED"
+
+# The M9.7 fixtures, symbolically. The public gate bytes are symbolic and held
+# equal between the paired executions, so the analyzer explores the guarded
+# paths without anyone naming the values -- which is the asymmetry M5 exists to
+# demonstrate, here against an external dependency.
+
+[verify."cbaudit::hidden::boundary_gate"]
+description = "a leak behind the public operand being all-ones"
+rationale = "the dynamic backend finds this too, from its boundary stage. Verified here so the symbolic and dynamic verdicts can be compared on the same fixture"
+max_depth = 20000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "LEAK_DETECTED"
+
+[verify."cbaudit::hidden::nested_modes"]
+description = "a leak behind three public predicates"
+rationale = "the symbolic backend needs no input discovery at all: the gate bytes are symbolic, so the guarded path is explored rather than guessed. The contrast with the dynamic backend -- which needs coverage feedback to reach it -- is the measurement"
+max_depth = 20000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "LEAK_DETECTED"
+
+[verify."cbaudit::hidden::nested_modes_wide"]
+description = "the same, diluted by a public 32-byte operand"
+rationale = "dilution is a property of mutation-based discovery, not of symbolic exploration, so the extra public bytes are expected to cost paths and change nothing about the verdict"
+max_depth = 20000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "LEAK_DETECTED"
+
+[verify."cbaudit::hidden::magic_gate"]
+description = "a leak behind an exact 32-bit public equality"
+rationale = "the fixture neither dynamic strategy can reach. A solver does not guess a 32-bit constant, it solves for one -- which is the sharpest statement in this example of what the symbolic backend buys"
+max_depth = 20000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "LEAK_DETECTED"
+
+[verify."cbaudit::hidden::nested_modes_clean"]
+description = "false-positive control: the same shape with a constant-time body"
+rationale = "the guarded region is reached and must still verify clean. A finding here would mean the analyzer was reporting on the shape rather than on the behavior"
 max_depth = 20000
 checks = ["control-flow", "memory-access"]
 expected_outcome = "VERIFIED_BOUNDED"

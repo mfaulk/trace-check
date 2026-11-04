@@ -12,9 +12,9 @@ cargo trace-check check --all-contracts --ci \
   --manifest-path examples/crypto-bigint-audit/Cargo.toml
 ```
 
-Thirteen declarations, 100% enforcement, exit 0 — because the seven
-expected-to-leak controls are declared as such in `trace-check.toml`. About
-107 s and 174 MB on one x86-64 host.
+Eighteen declarations, 100% enforcement, exit 0 — because every declaration's
+expected outcome is recorded in `trace-check.toml`, including the two the tool
+is *not* expected to find. About 317 s and 187 MB on one x86-64 host.
 
 | Contract | What it is | Outcome |
 | --- | --- | --- |
@@ -31,6 +31,17 @@ expected-to-leak controls are declared as such in `trace-check.toml`. About
 | `controls::decoded_address_probe` | B6: secret-derived load address | `LEAK_DETECTED`, address |
 | `controls::branch_selected` | B7: Target B's selection written with an `if` | `LEAK_DETECTED` |
 | `controls::public_operand_branch` | negative control: public operand only | `NO_LEAK_OBSERVED` |
+| `hidden::boundary_gate` | leak behind an all-ones public operand | `LEAK_DETECTED` |
+| `hidden::nested_modes` | leak behind three public predicates | `LEAK_DETECTED`, needs `--explore` |
+| `hidden::nested_modes_wide` | the same, diluted by a public 32-byte operand | `NO_LEAK_OBSERVED` |
+| `hidden::magic_gate` | leak behind an exact 32-bit equality | `NO_LEAK_OBSERVED` |
+| `hidden::nested_modes_clean` | false-positive control, same nested shape | `NO_LEAK_OBSERVED` |
+
+The last five are the M9.7 input-discovery fixtures, and two of them are
+`NO_LEAK_OBSERVED` for a leak that is really there. Those rows are declared, so
+the limit stays measured rather than implicit — see
+[`docs/audits/crypto-bigint/exploration.md`](../../docs/audits/crypto-bigint/exploration.md).
+The symbolic backend finds all four.
 
 `select::ct_select` clean beside `controls::branch_selected` detected is the
 pair worth looking at first: the library's selection compiles to four
@@ -97,11 +108,15 @@ cargo trace-check verify --all-contracts \
   --manifest-path examples/crypto-bigint-audit/Cargo.toml
 ```
 
-Thirteen contracts, every declared expectation reproduced, **zero
-`INCONCLUSIVE`**, 13 s and 186 MB for the whole matrix — including 256-bit
+Eighteen contracts, every declared expectation reproduced, **zero
+`INCONCLUSIVE`**, 18 s and 184 MB for the whole matrix — including 256-bit
 Montgomery multiplication, which M9's plan did not require to complete at all.
 `VERIFIED_BOUNDED` quantifies over the whole declared secret domain rather than
 over 64 generated inputs.
+
+It also finds every planted `hidden` leak, including the two no dynamic
+strategy reaches: the gate bytes are symbolic, so a solver does not guess a
+32-bit constant, it solves for one.
 
 It is cheap because the cost scales with paths and observations, not with term
 size: the analyzer never reasons about what a 256-bit product equals, only about
@@ -149,6 +164,7 @@ Measurements in
 | `src/select.rs` | Target B, `CtSelect::ct_select` for `U256` |
 | `src/monty.rs` | Target C, `ConstMontyForm::mul` modulo the P-256 prime |
 | `src/controls.rs` | the seven controls and the negative control |
+| `src/hidden.rs` | the M9.7 fixtures: leaks behind public predicates |
 | `src/sink.rs` | the fixed-work 32-byte fold |
 | `tests/functional.rs` | all three operations against the independent oracle |
 | `tests/vectors/generated.rs` | 1012 committed vectors, from `ci/gen-m9-vectors.py` |

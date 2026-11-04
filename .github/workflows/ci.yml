@@ -479,7 +479,7 @@ jobs:
             --all-contracts --ci --format json \
             > "$GITHUB_WORKSPACE/m9-contracts.json"
           python3 "$GITHUB_WORKSPACE/ci/verify-m8-contracts.py" \
-            "$GITHUB_WORKSPACE/m9-contracts.json" --expect-declared 13
+            "$GITHUB_WORKSPACE/m9-contracts.json" --expect-declared 18
           python3 "$GITHUB_WORKSPACE/ci/verify-m9-integration.py" \
             "$GITHUB_WORKSPACE/m9-contracts.json"
 
@@ -573,6 +573,16 @@ jobs:
             --expect-class address \
             --verify-reproducer \
             --compare-clean
+
+      # M9.7: M6 against M7 on the external integration. Asserts the
+      # acceptance property rather than a timing -- coverage guidance must find
+      # strictly more planted vulnerabilities than either M6 baseline and lose
+      # none of theirs -- and fails outright if any configuration reports a
+      # finding on a clean fixture. `--quick` is the three fixtures that decide
+      # it; Valgrind dominates the wall clock and the rest is more of the same
+      # measurement.
+      - name: Coverage guidance finds more vulnerable paths in the real library
+        run: python3 ci/benchmark-m9.py --quick
 
       # Two ways the experiment above could report an outcome it did not earn.
       # Both must fail, and a `python3` exit of 1 is the pass condition here.
@@ -737,7 +747,7 @@ jobs:
           set -euo pipefail
           cargo run --locked --release -p cargo-trace-check -- verify --all-contracts \
             --manifest-path examples/crypto-bigint-audit/Cargo.toml | tee m9-symbolic.txt
-          grep -q 'Summary: 6 verified bounded, 7 leak detected, 0 inconclusive' m9-symbolic.txt
+          grep -q 'Summary: 7 verified bounded, 11 leak detected, 0 inconclusive' m9-symbolic.txt
           grep -q 'Every declared expectation was reproduced' m9-symbolic.txt
 
       # The milestone's defining property, asserted against the checkout rather
