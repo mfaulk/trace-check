@@ -157,7 +157,67 @@ def functional_tests(adapter, mutated):
         )
 
 
-def check_contract(manifest, contract):
+def check_contract(manifest, contract, reproducer_dir=None):
+    command = [
+        "cargo",
+        "run",
+        "--release",
+        "--quiet",
+        "-p",
+        "cargo-trace-check",
+        "--",
+        "check",
+        "--contract",
+        contract,
+        "--manifest-path",
+        str(manifest),
+        "--format",
+        "json",
+    ]
+    if reproducer_dir is not None:
+        command += ["--reproducer-dir", str(reproducer_dir)]
+    result = run(command, cwd=REPO)
+    try:
+        report = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        fail(f"the checker produced no report:\n{result.stdout}\n{result.stderr}")
+    if not report.get("contracts"):
+        fail(f"the report selected no contract for {contract}")
+    return report["contracts"][0]
+
+
+def replay_reproducer(manifest, reproducer_dir, label):
+    """A finding has to be replayable against the build it was found in.
+
+    A reproducer that does not reproduce is worse than none: it reads as an
+    actionable diagnostic and is not one. The replay also has to report the
+    *same artifact* -- reproducing against a different build would say nothing
+    about the one the finding came from.
+    """
+    saved = sorted(pathlib.Path(reproducer_dir).glob("*.json"))
+    if not saved:
+        fail(f"[{label}] the run wrote no reproducer to replay")
+    for path in saved:
+        replayed = check_replay(manifest, path)
+        verdict = replayed.get("verdict")
+        if verdict != "reproduced":
+            fail(
+                f"[{label}] replaying {path.name} gave {verdict!r}, not "
+                f"'reproduced': {replayed.get('message')}"
+            )
+        if not replayed.get("same_artifact"):
+            fail(
+                f"[{label}] {path.name} reproduced against a different artifact "
+                f"({replayed.get('recorded_artifact_sha256', '?')[:12]} recorded, "
+                f"{replayed.get('replayed_artifact_sha256', '?')[:12]} replayed)"
+            )
+        print(
+            f"[{label}] replayed:    {path.name} -> reproduced against "
+            f"{replayed['replayed_artifact_sha256'][:12]}"
+        )
+
+
+def check_replay(manifest, reproducer):
     result = run(
         [
             "cargo",
@@ -168,8 +228,8 @@ def check_contract(manifest, contract):
             "cargo-trace-check",
             "--",
             "check",
-            "--contract",
-            contract,
+            "--replay",
+            str(reproducer),
             "--manifest-path",
             str(manifest),
             "--format",
@@ -178,15 +238,12 @@ def check_contract(manifest, contract):
         cwd=REPO,
     )
     try:
-        report = json.loads(result.stdout)
+        return json.loads(result.stdout)
     except json.JSONDecodeError:
-        fail(f"the checker produced no report:\n{result.stdout}\n{result.stderr}")
-    if not report.get("contracts"):
-        fail(f"the report selected no contract for {contract}")
-    return report["contracts"][0]
+        fail(f"replaying {reproducer} produced no report:\n{result.stdout}{result.stderr}")
 
 
-def experiment(work, source, patch, contract, label):
+def experiment(work, source, patch, contract, label, reproducers=False):
     """Stages one dependency tree, checks one contract, returns the evidence."""
     dependency, before, after = stage_dependency(work, source, patch)
     print(f"[{label}] staged:      {dependency}")
@@ -198,12 +255,35 @@ def experiment(work, source, patch, contract, label):
     functional_tests(adapter, mutated=patch is not None)
     print(f"[{label}] functional:  the staged dependency computes the same values")
 
-    reported = check_contract(adapter / "Cargo.toml", contract)
+    reproducer_dir = work / "reproducers" if reproducers else None
+    reported = check_contract(adapter / "Cargo.toml", contract, reproducer_dir)
     evidence = reported["check"]
     print(f"[{label}] artifact:    {reported['artifact_sha256']}")
     print(f"[{label}] outcome:     {evidence['outcome']}")
     print(f"[{label}] message:     {evidence['message']}")
-    return reported["artifact_sha256"], evidence
+    return reported["artifact_sha256"], evidence, adapter / "Cargo.toml", reproducer_dir
+
+
+def require_class(evidence, expected, label):
+    """A branch mutation must produce a branch finding, not merely a finding.
+
+    The distinction is the whole reason the address half of the observation
+    model exists: a tool that only saw branches would report a secret-indexed
+    load as clean.
+    """
+    # `secret_dependent_value` is what the backend calls a secret-derived value
+    # reaching an address or a syscall -- the address half of the model.
+    wanted = {
+        "branch": "secret_dependent_branch",
+        "address": "secret_dependent_value",
+    }[expected]
+    classes = sorted({f["classification"] for f in evidence.get("findings") or []})
+    if wanted not in classes:
+        fail(
+            f"[{label}] expected a {expected} finding ({wanted}); the run "
+            f"produced {classes or 'none'}"
+        )
+    print(f"[{label}] class:       {wanted}")
 
 
 def require_outcome(evidence, expected, label):
@@ -253,6 +333,16 @@ def main():
         help="source path that must appear in the finding's stack, e.g. src/uint/add.rs",
     )
     parser.add_argument(
+        "--expect-class",
+        choices=["branch", "address"],
+        help="which half of the observation model the finding must come from",
+    )
+    parser.add_argument(
+        "--verify-reproducer",
+        action="store_true",
+        help="save the finding's reproducer and replay it against the same build",
+    )
+    parser.add_argument(
         "--clean",
         action="store_true",
         help="stage the pinned source without applying the patch, for the baseline alone",
@@ -289,7 +379,7 @@ def main():
 
     try:
         if arguments.clean:
-            _, evidence = experiment(
+            _, evidence, _, _ = experiment(
                 root / "clean", source, None, arguments.contract, "clean"
             )
             require_outcome(evidence, arguments.expect_outcome, "clean")
@@ -301,17 +391,26 @@ def main():
             # A separate staging directory per run: never a shared tree that
             # another build could be reading, and never a target directory the
             # two runs could trade cache entries through.
-            baseline_artifact, baseline = experiment(
+            baseline_artifact, baseline, _, _ = experiment(
                 root / "clean", source, None, arguments.contract, "clean"
             )
             require_outcome(baseline, arguments.baseline_outcome, "clean")
 
-        mutated_artifact, mutated = experiment(
-            root / "mutated", source, patch, arguments.contract, "mutated"
+        mutated_artifact, mutated, manifest, reproducer_dir = experiment(
+            root / "mutated",
+            source,
+            patch,
+            arguments.contract,
+            "mutated",
+            reproducers=arguments.verify_reproducer,
         )
         require_outcome(mutated, arguments.expect_outcome, "mutated")
+        if arguments.expect_class:
+            require_class(mutated, arguments.expect_class, "mutated")
         if arguments.expect_frame:
             require_frame(mutated, arguments.expect_frame, "mutated")
+        if arguments.verify_reproducer:
+            replay_reproducer(manifest, reproducer_dir, "mutated")
 
         if baseline_artifact is not None:
             if baseline_artifact == mutated_artifact:

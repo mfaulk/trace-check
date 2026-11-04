@@ -57,19 +57,31 @@ clean sweep.
 ## Mutating the real library
 
 The decisive evidence is that changing the *library* — not the harness —
-changes the verdict:
+changes the verdict. Three mutations do, in three different upstream files:
+
+| Mutation | Where | Contract | Finding |
+| --- | --- | --- | --- |
+| A | a branch on the carry in `Uint::carrying_add` (`src/uint/add.rs`) | `add::wrapping_add_secret_left` | branch, at `src/uint/add.rs:31` |
+| B | a branch inside the library's own `CtSelect` (`src/uint/ct.rs`) | `select::ct_select` | branch, at `src/uint/ct.rs:78` |
+| C | a secret-indexed load in the Montgomery reduction (`src/modular/mul.rs`) | `monty::mul_secret_left` | **address**, at `src/modular/mul.rs:106` |
 
 ```sh
-python3 ci/mutate-m9.py --mutation mutation-a-carry-branch \
-  --contract cbaudit::add::wrapping_add_secret_left \
-  --expect-outcome LEAK_DETECTED --expect-frame src/uint/add.rs --compare-clean
+python3 ci/mutate-m9.py --mutation mutation-c-indexed-reduction \
+  --contract cbaudit::monty::mul_secret_left \
+  --expect-outcome LEAK_DETECTED --expect-frame src/modular/mul.rs \
+  --expect-class address --verify-reproducer --compare-clean
 ```
 
 The driver stages the pinned source into an isolated copy, applies the patch,
 runs this crate's own functional tests against the mutated dependency, and
-checks the **unchanged** contract. The finding's leaf frame is
-`carrying_add<4> (src/uint/add.rs:31)` — upstream source, at the patched line.
-The clean and mutated artifact hashes must differ, or the run fails.
+checks the **unchanged** contract. Each finding's leaf frame is upstream
+source, at the patched line; the adapter appears only as its caller. The clean
+and mutated artifact hashes must differ, or the run fails.
+
+`--expect-class` earns its place on C. Every secret executes the same
+instruction sequence through a secret-indexed load, so a tool that modelled
+only control flow would report that mutated library clean — which is why the
+acceptance criterion is "at least one address finding", not "three findings".
 
 Two negative controls guard the experiment itself:
 `negative-stale-patch.patch` must fail to apply, and
@@ -137,9 +149,10 @@ own test build.
 
 ## Scope
 
-All three operations are implemented and analyzed. One of the three upstream
-mutations M9.5 requires exists; the address-dependency mutation does not yet.
-See [`docs/adapter-guide.md`](../../docs/adapter-guide.md) for how to write an
+All three operations are implemented and analyzed, and all three upstream
+mutations are in place. What is outstanding is the symbolic feasibility spike
+(M9.6), the M6-versus-M7 detection comparison (M9.7) and the adoption report
+(M9.8). See [`docs/adapter-guide.md`](../../docs/adapter-guide.md) for how to write an
 adapter for a different library,
 [`docs/MILESTONE-09.md`](../../docs/MILESTONE-09.md) for the state of each work
 package, and
