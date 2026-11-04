@@ -1144,6 +1144,8 @@ ci/benchmark-m9.py               M6 against M7 on the external integration
 ci/mutate-m9.py                  one upstream-mutation experiment, with the
                                  validity checks that make its outcome earned
 ci/verify-m9-integration.py      asserts the M9 audit report, not its exit code
+ci/verify-workflow.py            refuses a CI step that selects a workspace
+                                 package from inside an out-of-workspace example
 ci/mutations/                    the explicit patches those experiments apply
 docs/adapter-guide.md            writing an audit adapter for another library
 .github/workflows/ci.yml         pinned Linux CI (M1-M3/M6-M9 job + M4/M5 analyzer job)
