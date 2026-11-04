@@ -813,6 +813,12 @@ jobs:
       # The policy is overlaid rather than committed into the audit library's
       # own configuration: the M9 acceptance steps read that file, and this
       # must not change what they measure.
+      # M10.1 adds the two backend-disagreement fixtures to the overlay, so
+      # this step also proves that a fixture declaring NO_LEAK_OBSERVED for
+      # generated checking and LEAK_DETECTED for symbolic verification has both
+      # declarations enforced independently. The validator refuses a report
+      # containing no such fixture, because without one nothing here would
+      # notice a backend's result being judged against another's declaration.
       - name: Two backends discharge two obligations in one invocation
         env:
           TRACE_CHECK_REQUIRE_SYMBOLIC: "1"

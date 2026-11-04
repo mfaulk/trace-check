@@ -16,3 +16,15 @@ default_required = ["generated"]
 
 [policy.contracts."cbaudit::monty::mul_both_secret"]
 required = ["generated", "symbolic"]
+
+# M10.1 adds the two backend-disagreement fixtures. Each declares a *different*
+# outcome per backend in the audit configuration — `NO_LEAK_OBSERVED` for
+# generated checking, which never guesses the public gate, and `LEAK_DETECTED`
+# for symbolic verification, which solves for it. Requiring both analyses is
+# what makes the per-analysis expectation model load-bearing: under one
+# expectation per contract these two could only be reported as a gap.
+[policy.contracts."cbaudit::hidden::magic_gate"]
+required = ["generated", "symbolic"]
+
+[policy.contracts."cbaudit::hidden::nested_modes_wide"]
+required = ["generated", "symbolic"]

@@ -191,6 +191,10 @@ silently tolerating is the fail-open.
 
 ### One expectation per contract cannot hold the M9 disagreement fixtures
 
+> **Resolved in M10.1.** Expectations are now modelled per analysis and both
+> fixtures are enforceable; the gap status described below no longer occurs.
+> This section records what the gate found, and is left as written.
+
 This is the problem M10.1 exists for, and the spike confirmed it is real in
 `main` rather than hypothetical.
 
@@ -307,7 +311,7 @@ Deliberately out of scope, each belonging to a later package:
 * No M3 dynamic-test integration (M10.4). A `dynamic` requirement is still
   reported as evidence this command does not produce, pointing at
   `cargo trace-check test`.
-* No per-analysis expectations (M10.1) — see the defect above.
+* No per-analysis expectations — M10.1, now done; see the defect above.
 * No report schema change (M10.7). The unified report is still schema 2, with
   symbolic evidence added as a new field rather than a reinterpretation of an
   existing one. `--ci` is now honoured on the `--all-contracts` path, where it
