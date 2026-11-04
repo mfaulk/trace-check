@@ -921,3 +921,47 @@ fn an_unreachable_analyzer_is_reported_when_it_is_the_problem() {
     );
     assert!(!message.contains("#[constant_time]"), "{message}");
 }
+
+/// The verification artifact's hash is a function of its inputs, not of the
+/// random directory it was built in.
+///
+/// `debug = true` bakes the generated harness's absolute path into the DWARF,
+/// and the work directory is randomly named -- so without `--remap-path-prefix`
+/// two runs of the same contract against the same library produce two different
+/// hashes. That matters because the hash *is* the artifact's identity in every
+/// report and in M8/M10 enforcement: evidence is accepted only when it names the
+/// artifact its obligation is about, and an identity that changes every run
+/// cannot be compared to anything.
+///
+/// M6's generated harness has remapped since it was written. This is the
+/// symbolic harness, found unremapped by the M10.0 spike: two consecutive
+/// `verify` runs reported different artifacts for identical inputs. No analyzer
+/// is needed to show it, so this test is not gated on one.
+#[test]
+fn the_verification_artifact_hash_is_reproducible() {
+    let contract_id = "crypto::tag::verify_tag";
+    let library = Library::resolve(&manifest(), &[]).expect("the bundled library resolves");
+
+    let build_once = || {
+        let workspace = Workspace::ephemeral().expect("a private workspace");
+        let (work_dir, target_dir) = workspace.directories_for(contract_id).expect("directories");
+        let contract = harness::probe_contract(&library, contract_id, &work_dir, &target_dir)
+            .expect("the contract is declared");
+        let generated = harness::generate(&library, &contract).expect("a harness");
+        let artifact = harness::build(&library, &generated, contract_id, &work_dir, &target_dir)
+            .expect("the harness builds");
+        (generated.source_sha256.clone(), artifact.sha256.clone())
+    };
+
+    let (first_source, first) = build_once();
+    let (second_source, second) = build_once();
+    assert_eq!(
+        first_source, second_source,
+        "the generated source must be identical, or the artifacts are not comparable"
+    );
+    assert_eq!(
+        first, second,
+        "two builds of one contract from one library produced different artifacts; the \
+         artifact hash is the identity every report and every enforcement decision uses"
+    );
+}

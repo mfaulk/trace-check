@@ -848,13 +848,27 @@ pub fn build(
     // Target-scoped rather than in `RUSTFLAGS`, and `--target` is passed
     // explicitly below, so freestanding link flags never reach a host build
     // script or proc-macro crate.
+    //
+    // `--remap-path-prefix` is here for the same reason M6's generated harness
+    // carries it. The work directory is randomly named and `debug = true` bakes
+    // the generated source's absolute path into the DWARF, so without it two
+    // builds of one contract against one library produce two different
+    // artifact hashes. That hash *is* the artifact's identity in every report
+    // and in every enforcement decision -- M10 accepts symbolic evidence only
+    // when it names the artifact its obligation is about -- and an identity
+    // that changes every run cannot be compared to anything.
     let cargo_config = format!(
-        "[target.{SUPPORTED_TARGET}]\nrustflags = [{}]\n",
+        "[target.{SUPPORTED_TARGET}]\nrustflags = [{}, \"--remap-path-prefix\", {:?}]\n",
         RUSTFLAGS
             .iter()
             .map(|flag| format!("{flag:?}"))
             .collect::<Vec<_>>()
-            .join(", ")
+            .join(", "),
+        format!(
+            "{}={}",
+            crate_dir.display(),
+            crate::dynamic_harness::REMAPPED_HARNESS_DIR
+        )
     );
     write(&crate_dir.join("Cargo.toml"), &manifest)?;
     write(&crate_dir.join(".cargo/config.toml"), &cargo_config)?;
