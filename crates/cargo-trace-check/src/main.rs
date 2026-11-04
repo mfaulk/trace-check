@@ -527,6 +527,21 @@ fn check(request: CheckRequest) -> Result<u8, String> {
     // compiler-derived inventory and reports a status for every declaration,
     // including ones no configuration mentions and ones it cannot analyze.
     if all_contracts {
+        // Advisory mode reports gaps without failing, which is what makes it
+        // useful for adoption and exactly what makes it wrong under `--ci`: a
+        // project that set it once and forgot would get a green build over a
+        // report of un-analyzed requirements. Refused rather than resolved in
+        // either direction -- silently enforcing would break the adoption
+        // workflow, and silently tolerating is the fail-open.
+        if ci && config.policy.mode == trace_check::enforcement::Mode::Advisory {
+            return Err(format!(
+                "`--ci` requires strict enforcement and {} sets `policy.mode = \"advisory\"`. \
+                 Advisory mode reports gaps without failing, so this run would pass whatever \
+                 the report said. Set `mode = \"strict\"`, or drop `--ci` to keep the advisory \
+                 adoption workflow",
+                config_path.display()
+            ));
+        }
         let report = trace_check::run_contract_coverage(
             &library,
             &config,

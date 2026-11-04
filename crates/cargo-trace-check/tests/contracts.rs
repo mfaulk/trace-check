@@ -746,3 +746,50 @@ fn the_json_report_separates_inventory_from_enforcement() {
         .expect("a caveat")
         .contains("not the proportion of secret inputs"));
 }
+
+/// Advisory mode cannot be the reason a strict CI job passes.
+///
+/// Advisory mode exists for adoption: it reports gaps without failing. That
+/// makes it precisely the wrong thing to combine with `--ci`, because a project
+/// that set it once and forgot would get a green CI job over a report full of
+/// NOT_ANALYZED requirements -- a passing build that establishes nothing. The
+/// two are refused together rather than silently resolved in either direction,
+/// because guessing which one the developer meant is how a fail-open happens.
+#[test]
+fn ci_refuses_an_advisory_policy() {
+    let staged = Staged::new("advisory-ci");
+    // Advisory, and requiring an analysis this command cannot produce, so the
+    // report would be full of gaps that advisory mode declines to block on.
+    staged.write_config(
+        "schema_version = 1\n\n[policy]\nmode = \"advisory\"\n\
+         default_required = [\"dynamic\"]\n",
+    );
+
+    let refused = staged.run(&["--all-contracts", "--ci"]);
+    assert_ne!(
+        refused.status.code(),
+        Some(0),
+        "advisory mode must not produce a passing strict-CI run:\n{}",
+        both(&refused)
+    );
+    let text = both(&refused);
+    assert!(
+        text.contains("advisory"),
+        "the refusal must name the incompatible mode:\n{text}"
+    );
+
+    // Without --ci the same configuration is the adoption workflow it is for:
+    // it still reports every unmet requirement, and declines to fail on them.
+    let advisory = staged.run(&["--all-contracts"]);
+    let text = stdout(&advisory);
+    assert_eq!(
+        advisory.status.code(),
+        Some(0),
+        "advisory mode without --ci is the adoption workflow:\n{}",
+        both(&advisory)
+    );
+    assert!(
+        text.contains("UNSUPPORTED"),
+        "advisory mode still reports its gaps:\n{text}"
+    );
+}
