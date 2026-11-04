@@ -181,7 +181,7 @@ about one of four stages, and which one is a question only the stack answers.
 ### Using it
 
 ```sh
-# thirteen contracts, 100% enforcement, exit 0
+# eighteen contracts, 100% enforcement, exit 0
 cargo trace-check check --all-contracts --ci \
   --manifest-path examples/crypto-bigint-audit/Cargo.toml
 

@@ -11,8 +11,8 @@ cargo trace-check verify --all-contracts \
   --manifest-path examples/crypto-bigint-audit/Cargo.toml
 ```
 
-All thirteen contracts, every declared expectation reproduced, **zero
-`INCONCLUSIVE`**, 13.3 s wall and 186 MB peak RSS for the whole matrix.
+All eighteen contracts, every declared expectation reproduced, **zero
+`INCONCLUSIVE`**, 18 s wall and 184 MB peak RSS for the whole matrix.
 
 | Contract | Outcome | Paths | Control-flow checks | Memory checks | Max depth |
 | --- | --- | --- | --- | --- | --- |
@@ -22,13 +22,18 @@ All thirteen contracts, every declared expectation reproduced, **zero
 | `monty::mul_secret_left` | `VERIFIED_BOUNDED` | 1 | 7 / 7 | 479 / 479 | 1511 |
 | `monty::mul_both_secret` | `VERIFIED_BOUNDED` | 1 | 7 / 7 | 479 / 479 | 1511 |
 | `controls::public_operand_branch` | `VERIFIED_BOUNDED` | 2 | 9 / 9 | 320 / 320 | 434 |
+| `hidden::nested_modes_clean` | `VERIFIED_BOUNDED` | 4 | 10 / 10 | 291 / 291 | 501 |
 | `controls::pre_decode_first_byte` | `LEAK_DETECTED` | 2 | 8 / 9 | 313 / 313 | 424 |
 | `controls::decoded_high_limb_branch` | `LEAK_DETECTED` | 2 | 8 / 9 | 320 / 320 | 434 |
 | `controls::decoded_interior_limb_branch` | `LEAK_DETECTED` | 2 | 8 / 9 | 320 / 320 | 434 |
 | `controls::decoded_last_byte_branch` | `LEAK_DETECTED` | 2 | 8 / 9 | 320 / 320 | 434 |
 | `controls::carry_branch` | `LEAK_DETECTED` | 2 | 8 / 9 | 310 / 310 | 428 |
-| `controls::decoded_address_probe` | `LEAK_DETECTED` | 1 | 4 / 4 | **256 / 257** | 418 |
 | `controls::branch_selected` | `LEAK_DETECTED` | 2 | 8 / 9 | 331 / 331 | 392 |
+| `controls::decoded_address_probe` | `LEAK_DETECTED` | 1 | 4 / 4 | **256 / 257** | 418 |
+| `hidden::boundary_gate` | `LEAK_DETECTED` | 2 | 8 / 8 | **298 / 299** | 421 |
+| `hidden::magic_gate` | `LEAK_DETECTED` | 2 | 8 / 8 | **299 / 300** | 421 |
+| `hidden::nested_modes` | `LEAK_DETECTED` | 4 | 10 / 10 | **291 / 292** | 439 |
+| `hidden::nested_modes_wide` | `LEAK_DETECTED` | 4 | 10 / 10 | **291 / 292** | 440 |
 
 `unknown_queries` is 0 for every row: the solver never gave up on a query, so
 no result rests on an unresolved one.
@@ -70,9 +75,21 @@ behaves correctly at the level of the mechanism, not just the verdict.
 **The five propagation controls — `LEAK_DETECTED`, every one.** This matters
 more than the clean rows. A `VERIFIED_BOUNDED` on any of them would mean the
 secret stopped being symbolic somewhere in `U256::from_be_slice`, and then every
-clean result in the table would be worthless. The symbolic backend reaches the
-same conclusion as Memcheck on all thirteen contracts — two backends, two
-artifacts, two methods, no disagreement.
+clean result in the table would be worthless. On every contract whose
+vulnerable path the dynamic backend's inputs actually reach, the two backends
+agree — two artifacts, two methods, no disagreement about any code they both
+executed. They differ only on the four `hidden` fixtures, and that is a
+difference about which inputs were reached, not about what the code does.
+
+**The four `hidden` fixtures — `LEAK_DETECTED`, all of them, including the two
+no dynamic strategy reaches.** The gate bytes are symbolic and held equal
+between the paired executions, so the analyzer *explores* the guarded paths
+rather than guessing inputs that reach them. A solver does not guess the
+32-bit constant `magic_gate` demands, it solves for one; and
+`nested_modes_wide`'s wide public operand costs nothing, because dilution is a
+property of mutation-based search and not of symbolic exploration. All four
+findings are address findings with every control-flow check passing — the
+bolded rows in the table above.
 
 **`select::ct_select` — `VERIFIED_BOUNDED` over 520 symbolic secret bits.** The
 open question was whether the analyzer models the `cmovne` that the `cmov`
