@@ -1,0 +1,16 @@
+--- a/src/modular/mul.rs
++++ b/src/modular/mul.rs
+@@ -97,6 +97,13 @@
+         // Write B = 2^Word::BITS. Then axy <= (B - 1)^2 + (B - 1) = B^2 - B.
+         let axy = (xi.0 as WideWord) * (y[0].0 as WideWord) + out[0].0 as WideWord;
+         let u = (axy as Word).wrapping_mul(mod_neg_inv.0);
++        // M9 MUTATION C: route the low nibble of the Montgomery factor through
++        // an identity table. `M9_IDENTITY[n] == n`, so the arithmetic result is
++        // unchanged -- but the load's address now depends on a secret-derived
++        // value, which is a side channel no control-flow-only analysis sees.
++        // A `const` rather than a `static` because this is a `const fn`.
++        const M9_IDENTITY: [Word; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
++        let u = (u & !0xf) | M9_IDENTITY[(u & 0xf) as usize];
+ 
+         // Add the low halves separately: lo <= 2B - 2 fits in WideWord. This keeps
+         // the carry in arithmetic form without a double-width overflow flag.

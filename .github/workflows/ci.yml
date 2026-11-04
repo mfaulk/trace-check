@@ -480,51 +480,8 @@ jobs:
             > "$GITHUB_WORKSPACE/m9-contracts.json"
           python3 "$GITHUB_WORKSPACE/ci/verify-m8-contracts.py" \
             "$GITHUB_WORKSPACE/m9-contracts.json" --expect-declared 13
-          python3 - "$GITHUB_WORKSPACE/m9-contracts.json" <<'PY'
-          import json, sys
-
-          report = json.load(open(sys.argv[1]))
-          outcomes = {
-              contract["id"]: evidence["outcome"]
-              for contract in report["contracts"]
-              for evidence in contract["evidence"]
-          }
-          # Six propagation controls plus the branchy selection. The ones that
-          # are about propagation rather than marking are the decoded limbs,
-          # the final secret byte alone, the carry the library returned, and an
-          # address derived from the decoded sum.
-          detected = [
-              "cbaudit::controls::decoded_high_limb_branch",
-              "cbaudit::controls::decoded_interior_limb_branch",
-              "cbaudit::controls::decoded_last_byte_branch",
-              "cbaudit::controls::carry_branch",
-              "cbaudit::controls::decoded_address_probe",
-              "cbaudit::controls::pre_decode_first_byte",
-              "cbaudit::controls::branch_selected",
-          ]
-          clean = [
-              "cbaudit::add::wrapping_add_secret_left",
-              "cbaudit::add::wrapping_add_both_secret",
-              "cbaudit::select::ct_select",
-              "cbaudit::monty::mul_secret_left",
-              "cbaudit::monty::mul_both_secret",
-              "cbaudit::controls::public_operand_branch",
-          ]
-          for contract in detected:
-              if outcomes.get(contract) != "LEAK_DETECTED":
-                  sys.exit(
-                      f"{contract} is {outcomes.get(contract)}, not LEAK_DETECTED: "
-                      "the propagation gate has stopped working, so a clean "
-                      "result on the real operations establishes nothing"
-                  )
-          for contract in clean:
-              if outcomes.get(contract) != "NO_LEAK_OBSERVED":
-                  sys.exit(f"{contract} is {outcomes.get(contract)}, not NO_LEAK_OBSERVED")
-          missing = set(outcomes) - set(detected) - set(clean)
-          if missing:
-              sys.exit(f"contracts with no expectation in this check: {sorted(missing)}")
-          print(f"7 controls detected, 6 clean, {len(outcomes)} accounted for")
-          PY
+          python3 "$GITHUB_WORKSPACE/ci/verify-m9-integration.py" \
+            "$GITHUB_WORKSPACE/m9-contracts.json"
 
       - name: Reproduce the demonstration
         run: cargo run --locked --release -p trace-check -- demo mac-compare
@@ -577,15 +534,44 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # The decisive experiment: the library's own source changes, the adapter
+      # The decisive experiments: the library's own source changes, the adapter
       # and its contract do not, and the verdict has to flip. `--compare-clean`
-      # also requires the two runs to have analyzed different artifacts.
+      # also requires the two runs to have analyzed different artifacts, and
+      # `--expect-frame` requires the finding to name the file the patch
+      # touched -- a finding in the adapter would not satisfy it.
+      #
+      # `--expect-class` is not decoration. A tool that only saw branches would
+      # report mutation C's secret-indexed load as clean, so the three
+      # experiments are required to cover both halves of the observation model.
       - name: Mutation A -- a branch on the carry inside Uint::carrying_add
         run: |
           python3 ci/mutate-m9.py --mutation mutation-a-carry-branch \
             --contract cbaudit::add::wrapping_add_secret_left \
             --expect-outcome LEAK_DETECTED \
             --expect-frame src/uint/add.rs \
+            --expect-class branch \
+            --compare-clean
+
+      - name: Mutation B -- a branch inside the library's own CtSelect
+        run: |
+          python3 ci/mutate-m9.py --mutation mutation-b-branch-select \
+            --contract cbaudit::select::ct_select \
+            --expect-outcome LEAK_DETECTED \
+            --expect-frame src/uint/ct.rs \
+            --expect-class branch \
+            --compare-clean
+
+      # The address-dependency experiment, and the one whose finding is also
+      # replayed: a reproducer that does not reproduce against the same
+      # artifact reads as an actionable diagnostic and is not one.
+      - name: Mutation C -- a secret-indexed load inside the Montgomery reduction
+        run: |
+          python3 ci/mutate-m9.py --mutation mutation-c-indexed-reduction \
+            --contract cbaudit::monty::mul_secret_left \
+            --expect-outcome LEAK_DETECTED \
+            --expect-frame src/modular/mul.rs \
+            --expect-class address \
+            --verify-reproducer \
             --compare-clean
 
       # Two ways the experiment above could report an outcome it did not earn.

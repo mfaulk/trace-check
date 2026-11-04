@@ -1,0 +1,20 @@
+--- a/src/uint/ct.rs
++++ b/src/uint/ct.rs
+@@ -70,7 +70,16 @@
+ impl<const LIMBS: usize> CtSelect for Uint<LIMBS> {
+     #[inline]
+     fn ct_select(&self, other: &Self, choice: Choice) -> Self {
+-        Self::from_words(self.as_words().ct_select(other.as_words(), choice))
++        // M9 MUTATION B: select with a branch instead of a conditional move.
++        // The returned value is identical; only the observable execution
++        // differs. `to_bool_vartime` is the accessor whose own name says it is
++        // not constant-time, and `black_box` keeps the branch from being
++        // if-converted straight back into the `cmov` it replaced.
++        if choice.to_bool_vartime() {
++            *core::hint::black_box(other)
++        } else {
++            *self
++        }
+     }
+ }
+ 

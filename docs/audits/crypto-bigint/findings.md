@@ -108,9 +108,61 @@ this finding in the adapter. The full stack is the disambiguation; the
 basenames alone are not, since `src/uint/add.rs` and the adapter's `add.rs`
 collide.
 
-Mutations B (a branchy selection inside the library's own `CtSelect`) and C (a
-secret-dependent address inside the modular arithmetic) are outstanding —
-M9.5 requires three, and one of them must be an address finding.
+### Mutation B — a branch inside the library's own `CtSelect`
+
+`ci/mutations/mutation-b-branch-select.patch`, against `src/uint/ct.rs`.
+Replaces the per-limb conditional move with `if choice.to_bool_vartime()` —
+the accessor whose own name says it is not constant-time. Same returned value.
+
+| | |
+| --- | --- |
+| Contract | `cbaudit::select::ct_select`, unchanged |
+| Clean dependency tree | `814cb6a994fd9b74…` → `NO_LEAK_OBSERVED` |
+| Mutated dependency tree | `85aa2897287dc215…` → `LEAK_DETECTED` |
+| Classification | secret-dependent branch |
+| Leaf frame | `ct_select<4> (src/uint/ct.rs:78)` |
+| Caller | `cbaudit::select::ct_select (select.rs:40)` |
+
+This is the most legible of the three for a cryptographic developer: the
+library's own constant-time selection is replaced with the obvious
+implementation, nothing else changes, and the audit notices.
+
+### Mutation C — a secret-indexed load inside the Montgomery reduction
+
+`ci/mutations/mutation-c-indexed-reduction.patch`, against
+`src/modular/mul.rs`. Routes the low nibble of the Montgomery factor `u`
+through a 16-entry identity table, so `M9_IDENTITY[n] == n` and the arithmetic
+is unchanged — but the load's address now depends on a secret-derived value.
+
+| | |
+| --- | --- |
+| Contract | `cbaudit::monty::mul_secret_left`, unchanged |
+| Clean dependency tree | `814cb6a994fd9b74…` → `NO_LEAK_OBSERVED` |
+| Mutated dependency tree | `a8017eeb080cc67d…` → `LEAK_DETECTED` |
+| Classification | **secret-dependent address** (`secret_dependent_value`) |
+| Leaf frame | `montgomery_multiply_inner (src/modular/mul.rs:106)` |
+| Caller | `mul_montgomery_form::<4> (src/modular/mul.rs:147)` |
+| Reproducer | replayed, `reproduced` against the same artifact |
+
+Every secret executes the same instruction sequence here, so a tool that
+modelled only control flow would report this mutated library clean. That is why
+M9.5 requires an address finding and not merely three findings, and why
+`ci/mutate-m9.py --expect-class` checks the classification rather than the
+outcome alone.
+
+A `const` table rather than a `static`, because `montgomery_multiply_inner` is
+a `const fn` and a `const fn` body may not read a `static`. The same constraint
+rules out `black_box` and `read_volatile` as barriers here — which is why this
+mutation had to be built out of a data dependency the optimizer keeps rather
+than an explicit barrier.
+
+### Acceptance
+
+M9.5 asks for three independently designed upstream mutations, at least one
+branch finding and at least one address finding, with the adapter unchanged.
+A, B and C satisfy that: three different files, three different contracts, two
+branch findings and one address finding, and the adapter and its
+`trace-check.toml` are byte-identical across all six runs.
 
 ## A tooling finding
 

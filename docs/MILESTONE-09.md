@@ -1,6 +1,6 @@
 # Milestone 09 — Real-World Cryptography Integration and Audit Validation
 
-**Status:** M9.0–M9.2 implemented, M9.3 and M9.4 largely so; M9.5–M9.8 outstanding
+**Status:** M9.0–M9.5 implemented; M9.6–M9.8 outstanding
 **Branch:** `feat/m9-real-world-crypto`
 **Prerequisite:** Milestone 8, merged
 **Reference library:** RustCrypto `crypto-bigint` `0.7.10`
@@ -68,8 +68,9 @@ attribute. That is what M8's fail-closed accounting is for, observed on a case
 nobody designed for it.
 
 The fix is one `xor` with a per-contract compile-time constant. The rule it
-implies is general and belongs in M9.2's adapter guide: **an adapter set must
-be distinguishable in the compiled artifact, not merely in its source.**
+implies is general, and is now one of the rules in
+[`docs/adapter-guide.md`](adapter-guide.md): **an adapter set must be
+distinguishable in the compiled artifact, not merely in its source.**
 
 ### Finding two: `site` names the contract, the stack names the leak
 
@@ -114,8 +115,11 @@ examples/crypto-bigint-audit/     an out-of-workspace crate, own lockfile
 
 ci/gen-m9-vectors.py              the independent oracle; --check guards drift
 ci/mutate-m9.py                   one upstream-mutation experiment, with validity checks
+ci/verify-m9-integration.py       validates the report's own audit claims
 ci/mutations/
   mutation-a-carry-branch.patch         a branch on the carry inside Uint::carrying_add
+  mutation-b-branch-select.patch        a branch inside the library's own CtSelect
+  mutation-c-indexed-reduction.patch    a secret-indexed load in the Montgomery reduction
   negative-stale-patch.patch            must fail to apply
   negative-unreached-branch.patch       the same branch, in a function never called
 
@@ -144,14 +148,15 @@ about one of four stages, and which one is a question only the stack answers.
 ### Using it
 
 ```sh
-# nine contracts, 100% enforcement, exit 0
+# thirteen contracts, 100% enforcement, exit 0
 cargo trace-check check --all-contracts --ci \
   --manifest-path examples/crypto-bigint-audit/Cargo.toml
 
 # change the library, not the harness, and watch the verdict flip
-python3 ci/mutate-m9.py --mutation mutation-a-carry-branch \
-  --contract cbaudit::add::wrapping_add_secret_left \
-  --expect-outcome LEAK_DETECTED --expect-frame src/uint/add.rs --compare-clean
+python3 ci/mutate-m9.py --mutation mutation-c-indexed-reduction \
+  --contract cbaudit::monty::mul_secret_left \
+  --expect-outcome LEAK_DETECTED --expect-frame src/modular/mul.rs \
+  --expect-class address --verify-reproducer --compare-clean
 ```
 
 ---
@@ -168,7 +173,7 @@ python3 ci/mutate-m9.py --mutation mutation-a-carry-branch \
 | Operations clean on unmodified library code | 5 contracts over 3 operations |
 | Controls detected | 7 of 7, covering first / interior / last secret byte, a library-produced carry, an address, and a branchy selection |
 | Negative control | `NO_LEAK_OBSERVED`, as required |
-| Upstream mutations detected | 1 of 1 attempted (M9.5 requires three) |
+| Upstream mutations detected | 3 of 3 — two branch findings, one address finding |
 | Unsupported Rust constructs encountered | none |
 
 Experiment C's disassembly evidence is in
@@ -188,8 +193,6 @@ something a source review establishes — and the same function written with an
 
 ## 5. Limitations
 
-* One upstream mutation of the three M9.5 requires, and it is a branch
-  mutation; the address-dependency mutation does not exist yet.
 * The symbolic backend was not exercised: BINSEC is not installed on the
   development host, so M9.6 has not started.
 * The artifact hash is not comparable across invocations, because the staging
@@ -210,7 +213,7 @@ something a source review establishes — and the same function written with an
 | M9.2 | Three adapters, functional oracles, adapter guide | **done** |
 | M9.3 | Real-library dynamic checks and M8 enforcement | **done** for all three targets; no M7 exploration yet |
 | M9.4 | Mutation infrastructure | **done** — isolation, provenance and validity checks in place |
-| M9.5 | Three upstream mutation regressions | 1 of 3 |
+| M9.5 | Three upstream mutation regressions | **done** — 2 branch, 1 address |
 | M9.6 | Symbolic feasibility spike | not started (no BINSEC on this host) |
 | M9.7 | M6-versus-M7 detection comparison and benchmarks | not started |
 | M9.8 | CI integration and adoption report | Level 1 CI only |
@@ -236,17 +239,20 @@ something a source review establishes — and the same function written with an
       artifact, by disassembly.
 - [x] Adapter findings and upstream findings are distinguished, with the
       ambiguity in `site` recorded rather than papered over.
-- [ ] Three deliberately vulnerable upstream changes detected. *(1 of 3)*
-- [ ] At least one branch leak and one address leak injected upstream.
-      *(branch only; both exist as adapter-local controls)*
+- [x] Three deliberately vulnerable upstream changes detected, in three
+      different files, against three different contracts.
+- [x] At least one branch leak and one address leak injected upstream — two
+      branch findings and one address finding.
 - [x] Mutations leave the adapter and its contract unchanged.
 - [x] Every mutation reproducible from a pinned source and an explicit patch,
       with validity controls for a stale patch, an unexecuted mutation and a
       reused artifact.
 - [ ] M6 versus M7 detection effectiveness measured on this integration.
 - [ ] Symbolic feasibility evaluated.
-- [ ] CI validates artifact identity, instrumentation, findings and completion.
-      *(Level 1 only)*
+- [x] CI validates artifact identity, instrumentation, findings and
+      completion, at both levels. `ci/verify-m9-integration.py` checks the
+      report's own claims; `ci/mutate-m9.py` checks artifact difference,
+      finding class, upstream attribution and reproducer replay.
 - [x] Developer integration cost and analysis performance measured for what
       exists.
 - [x] The reports document limitations without claiming full security.

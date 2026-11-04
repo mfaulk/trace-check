@@ -22,7 +22,8 @@ the formal noninterference property, and the roadmap.
 | M6 | Generated constant-time testing and CI enforcement | complete, experimental |
 | M7 | Coverage-guided leakage discovery | complete, experimental |
 | M8 | Complete contract coverage and enforcement | complete, experimental |
-| M9 | Hardware-oriented validation — statistical timing | future |
+| M9 | Real-world cryptography integration — auditing `crypto-bigint` | in progress |
+| M10 | Hardware-oriented validation — statistical timing | future |
 
 `trace-check` turns that idea into reproducible analysis, from five directions:
 
@@ -682,21 +683,28 @@ expected values were computed in Python's arbitrary-precision integers, which
 share no code with the library under audit.
 
 The decisive evidence is that changing the **library**, not the harness, flips
-the verdict:
+the verdict. Three mutations do, in three different files:
 
 ```sh
-python3 ci/mutate-m9.py --mutation mutation-a-carry-branch \
-  --contract cbaudit::add::wrapping_add_secret_left \
-  --expect-outcome LEAK_DETECTED --expect-frame src/uint/add.rs --compare-clean
+python3 ci/mutate-m9.py --mutation mutation-c-indexed-reduction \
+  --contract cbaudit::monty::mul_secret_left \
+  --expect-outcome LEAK_DETECTED --expect-frame src/modular/mul.rs \
+  --expect-class address --verify-reproducer --compare-clean
 ```
 
 The driver stages the pinned source into an isolated copy, applies an explicit
 patch, requires the adapter's own functional tests to still pass, and runs the
-unchanged contract. The finding's leaf frame is
-`carrying_add<4> (src/uint/add.rs:31)` — upstream source, at the patched line —
-and the clean and mutated artifact hashes must differ or the run fails. A stale
-patch and a mutation in a function that is never called both fail as invalid
-experiments instead of being reported as clean.
+unchanged contract. For the one above, the finding's leaf frame is
+`montgomery_multiply_inner (src/modular/mul.rs:106)` — upstream source, at the
+patched line — classified as a secret-dependent **address**, with its
+reproducer replayed against the same artifact. A branch in `Uint::carrying_add`
+and a branch inside the library's own `CtSelect` are the other two.
+
+`--expect-class` is not decoration: a tool that modelled only control flow
+would report that secret-indexed load as clean. And the clean and mutated
+artifact hashes must differ or the run fails. A stale patch and a mutation in a
+function that is never called both fail as invalid experiments instead of being
+reported as clean.
 
 The one integration hazard this turned up: two adapters whose bodies compile
 identically are folded to one symbol, and a finding in either then cannot be
@@ -1111,6 +1119,7 @@ ci/gen-m9-vectors.py             the independent Python oracle for the M9
                                  adapters; --check guards fixture drift
 ci/mutate-m9.py                  one upstream-mutation experiment, with the
                                  validity checks that make its outcome earned
+ci/verify-m9-integration.py      asserts the M9 audit report, not its exit code
 ci/mutations/                    the explicit patches those experiments apply
 docs/adapter-guide.md            writing an audit adapter for another library
 .github/workflows/ci.yml         pinned Linux CI (M1-M3/M6-M9 job + M4/M5 analyzer job)
