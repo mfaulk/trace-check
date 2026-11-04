@@ -12,21 +12,30 @@ cargo trace-check check --all-contracts --ci \
   --manifest-path examples/crypto-bigint-audit/Cargo.toml
 ```
 
-Nine declarations, 100% enforcement, exit 0 — because the six expected-to-leak
-controls are declared as such in `trace-check.toml`. About 77 s and 173 MB on
-one x86-64 host.
+Thirteen declarations, 100% enforcement, exit 0 — because the seven
+expected-to-leak controls are declared as such in `trace-check.toml`. About
+107 s and 174 MB on one x86-64 host.
 
 | Contract | What it is | Outcome |
 | --- | --- | --- |
-| `add::wrapping_add_secret_left` | `U256::wrapping_add`, secret left operand | `NO_LEAK_OBSERVED` |
+| `add::wrapping_add_secret_left` | **Target A:** `U256::wrapping_add`, secret left operand | `NO_LEAK_OBSERVED` |
 | `add::wrapping_add_both_secret` | the same, both operands secret | `NO_LEAK_OBSERVED` |
+| `select::ct_select` | **Target B:** `CtSelect::ct_select`, all three inputs secret | `NO_LEAK_OBSERVED` |
+| `monty::mul_secret_left` | **Target C:** `ConstMontyForm::mul` mod p-256 | `NO_LEAK_OBSERVED` |
+| `monty::mul_both_secret` | the same, both operands secret | `NO_LEAK_OBSERVED` |
 | `controls::pre_decode_first_byte` | B1: branch on `secret[0]` before decoding | `LEAK_DETECTED` |
 | `controls::decoded_high_limb_branch` | B2: branch on decoded `secret[0..8]` | `LEAK_DETECTED` |
 | `controls::decoded_interior_limb_branch` | B3: branch on decoded `secret[8..16]` | `LEAK_DETECTED` |
 | `controls::decoded_last_byte_branch` | B4: branch on `secret[31]` alone | `LEAK_DETECTED` |
 | `controls::carry_branch` | B5: branch on the carry the library returned | `LEAK_DETECTED` |
 | `controls::decoded_address_probe` | B6: secret-derived load address | `LEAK_DETECTED`, address |
+| `controls::branch_selected` | B7: Target B's selection written with an `if` | `LEAK_DETECTED` |
 | `controls::public_operand_branch` | negative control: public operand only | `NO_LEAK_OBSERVED` |
+
+`select::ct_select` clean beside `controls::branch_selected` detected is the
+pair worth looking at first: the library's selection compiles to four
+`test`/`cmovne` pairs through the `cmov` crate, and the same function written
+with a branch is found.
 
 ## Why the controls are the point
 
@@ -100,15 +109,26 @@ Measurements in
 | File | |
 | --- | --- |
 | `src/add.rs` | Target A, `U256::wrapping_add`, two secret roles |
-| `src/controls.rs` | the six propagation controls and the negative control |
+| `src/select.rs` | Target B, `CtSelect::ct_select` for `U256` |
+| `src/monty.rs` | Target C, `ConstMontyForm::mul` modulo the P-256 prime |
+| `src/controls.rs` | the seven controls and the negative control |
 | `src/sink.rs` | the fixed-work 32-byte fold |
+| `tests/functional.rs` | all three operations against the independent oracle |
+| `tests/vectors/generated.rs` | 1012 committed vectors, from `ci/gen-m9-vectors.py` |
 | `trace-check.toml` | per-contract description, rationale and expected outcome |
 | `Cargo.lock` | committed; the audit's claim is about one resolved graph |
 
-`cargo test` runs the functional and structural tests — the arithmetic against
-an independently written schoolbook reference, the limb layout of a big-endian
-decode, and the sink's all-bytes property. No side-channel result in this
-example is interpreted before those pass.
+`cargo test` runs the functional and structural tests: 1012 vectors whose
+expected values were computed in Python's arbitrary-precision integers, a
+schoolbook addition reference, the limb layout of a big-endian decode, the
+P-256 prime assembled arithmetically rather than copied from the hex literal,
+and the sink's all-bytes property. **No side-channel result in this example is
+interpreted before those pass** — an adapter that mishandles byte order or
+builds the wrong Montgomery value leaves the checker reporting on a function
+nobody asked about.
+
+Regenerate the fixture with `python3 ci/gen-m9-vectors.py`; CI runs
+`--check` so it cannot drift from the generator.
 
 `dynamic = false` on every annotation: this crate wants its contracts *checked*
 by `cargo trace-check check`, which needs no hand-written `#[ct_test]`, so it
@@ -117,8 +137,10 @@ own test build.
 
 ## Scope
 
-Three operations are planned; **Target A is implemented.** `CtSelect` (Target
-B) and `ConstMontyForm::mul` (Target C) are M9.2 work. See
+All three operations are implemented and analyzed. One of the three upstream
+mutations M9.5 requires exists; the address-dependency mutation does not yet.
+See [`docs/adapter-guide.md`](../../docs/adapter-guide.md) for how to write an
+adapter for a different library,
 [`docs/MILESTONE-09.md`](../../docs/MILESTONE-09.md) for the state of each work
 package, and
 [`docs/audits/crypto-bigint/threat-model.md`](../../docs/audits/crypto-bigint/threat-model.md)

@@ -658,19 +658,28 @@ cargo trace-check check --all-contracts --ci \
   --manifest-path examples/crypto-bigint-audit/Cargo.toml
 ```
 
-A thin adapter decodes a declared-secret `&[u8; 32]` with the library's own
-`U256::from_be_slice`, calls the library's own `wrapping_add`, and folds all 32
-result bytes. A contract covers that **whole invocation** — decoding, the
-library's types, its operation, and the result consumption — so a clean result
-on the adapter, read alone, is indistinguishable from a harness that marked
-nothing.
+Thin adapters decode a declared-secret `&[u8; 32]` with the library's own
+`U256::from_be_slice`, call the library's own operation, and fold all 32 result
+bytes. Three operations are covered: `U256::wrapping_add`,
+`CtSelect::ct_select`, and `ConstMontyForm::mul` modulo the P-256 prime. A
+contract covers that **whole invocation** — decoding, the library's types, its
+operation, and the result consumption — so a clean result on the adapter, read
+alone, is indistinguishable from a harness that marked nothing.
 
-Six controls are what make it mean something, and all six are detected: a branch
-on a decoded limb, on an interior limb, on the final secret byte alone, on the
-`Limb` carry `Uint::carrying_add` *returned*, and a load address derived from the
-decoded sum. They are declared `expected_outcome = "LEAK_DETECTED"`, so if one
-stops being detected the run fails on an unmet expectation rather than reporting
-a clean sweep.
+Seven controls are what make it mean something, and all seven are detected: a
+branch on a decoded limb, on an interior limb, on the final secret byte alone,
+on the `Limb` carry `Uint::carrying_add` *returned*, a load address derived from
+the decoded sum, and a selection written with an `if` instead of `CtSelect`.
+They are declared `expected_outcome = "LEAK_DETECTED"`, so if one stops being
+detected the run fails on an unmet expectation rather than reporting a clean
+sweep.
+
+That last pair is the demonstration worth looking at first: the library's
+selection compiles to four `test`/`cmovne` pairs through the `cmov` crate and
+is clean, while the same function written with a branch is found. And nothing is
+read as a security result before `cargo test` passes — 1012 vectors whose
+expected values were computed in Python's arbitrary-precision integers, which
+share no code with the library under audit.
 
 The decisive evidence is that changing the **library**, not the harness, flips
 the verdict:
@@ -693,10 +702,12 @@ The one integration hazard this turned up: two adapters whose bodies compile
 identically are folded to one symbol, and a finding in either then cannot be
 attributed — reported as `INCONCLUSIVE`, never as clean. See
 [docs/MILESTONE-09.md](docs/MILESTONE-09.md) for that and the other three
-findings, and [docs/audits/crypto-bigint/](docs/audits/crypto-bigint/threat-model.md)
-for the analysis boundary. **None of it is a claim that `crypto-bigint` is
-secure:** it is one operation of three, under two modeled observations, on one
-artifact.
+findings, [docs/adapter-guide.md](docs/adapter-guide.md) for how to write an
+adapter for a different library, and
+[docs/audits/crypto-bigint/](docs/audits/crypto-bigint/threat-model.md) for the
+analysis boundary. **None of it is a claim that `crypto-bigint` is secure:** it
+is three operations, under two modeled observations, on one artifact, over 64
+generated inputs each.
 
 ### `native` — secret-dependency analysis of native code
 
@@ -1078,7 +1089,8 @@ examples/external-library/       the same workflow for a crate outside this
                                  workspace, with its own lockfile (M5)
 examples/crypto-bigint-audit/    audit adapters over RustCrypto crypto-bigint
                                  0.7.10, consumed unmodified as a pinned
-                                 dependency, with the propagation controls (M9)
+                                 dependency, with the propagation controls and
+                                 1012 independently computed vectors (M9)
 examples/legacy-branch-demo/     original proof of concept, kept for context
 docs/                            milestone plan, methodology, limitations
 docs/audits/crypto-bigint/       the M9 target selection, threat model and
@@ -1095,9 +1107,12 @@ ci/benchmark-m7.py               M6-versus-M7 discovery benchmark and acceptance
 ci/verify-m8-contracts.py        asserts the M8 coverage report, not its exit code
 ci/benchmark-m8.py               contract-discovery overhead at 0/10/50/100 declarations
 ci/benchmark-m6.py               generated vs hand-written effectiveness benchmark
+ci/gen-m9-vectors.py             the independent Python oracle for the M9
+                                 adapters; --check guards fixture drift
 ci/mutate-m9.py                  one upstream-mutation experiment, with the
                                  validity checks that make its outcome earned
 ci/mutations/                    the explicit patches those experiments apply
+docs/adapter-guide.md            writing an audit adapter for another library
 .github/workflows/ci.yml         pinned Linux CI (M1-M3/M6-M9 job + M4/M5 analyzer job)
 ```
 

@@ -72,7 +72,11 @@ jobs:
           cargo fmt --all -- --check
           rustfmt --edition 2021 --check examples/symbolic/src/targets.rs
           rustfmt --edition 2021 --check examples/external-library/src/lib.rs
+          # Not tests/vectors/generated.rs: it is reached through `include!`,
+          # which rustfmt does not follow, and reformatting it would put the
+          # committed fixture out of step with its generator.
           rustfmt --edition 2021 --check examples/crypto-bigint-audit/src/*.rs
+          rustfmt --edition 2021 --check examples/crypto-bigint-audit/tests/functional.rs
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -100,6 +104,12 @@ jobs:
         run: |
           cargo clippy --locked --all-targets \
             --manifest-path examples/crypto-bigint-audit/Cargo.toml -- -D warnings
+
+      # The fixture must be what the generator produces. A hand-edited vector
+      # would be an oracle that agrees with the adapter by construction, which
+      # is the one thing an independent oracle must not be.
+      - name: The oracle fixture matches its generator
+        run: python3 ci/gen-m9-vectors.py --check
 
       - name: The audit adapters compute the right arithmetic
         run: |
@@ -469,7 +479,7 @@ jobs:
             --all-contracts --ci --format json \
             > "$GITHUB_WORKSPACE/m9-contracts.json"
           python3 "$GITHUB_WORKSPACE/ci/verify-m8-contracts.py" \
-            "$GITHUB_WORKSPACE/m9-contracts.json" --expect-declared 9
+            "$GITHUB_WORKSPACE/m9-contracts.json" --expect-declared 13
           python3 - "$GITHUB_WORKSPACE/m9-contracts.json" <<'PY'
           import json, sys
 
@@ -479,9 +489,10 @@ jobs:
               for contract in report["contracts"]
               for evidence in contract["evidence"]
           }
-          # The four that are about propagation rather than marking: a decoded
-          # limb, an interior limb, the final secret byte alone, the carry the
-          # library returned, and an address derived from the decoded sum.
+          # Six propagation controls plus the branchy selection. The ones that
+          # are about propagation rather than marking are the decoded limbs,
+          # the final secret byte alone, the carry the library returned, and an
+          # address derived from the decoded sum.
           detected = [
               "cbaudit::controls::decoded_high_limb_branch",
               "cbaudit::controls::decoded_interior_limb_branch",
@@ -489,10 +500,14 @@ jobs:
               "cbaudit::controls::carry_branch",
               "cbaudit::controls::decoded_address_probe",
               "cbaudit::controls::pre_decode_first_byte",
+              "cbaudit::controls::branch_selected",
           ]
           clean = [
               "cbaudit::add::wrapping_add_secret_left",
               "cbaudit::add::wrapping_add_both_secret",
+              "cbaudit::select::ct_select",
+              "cbaudit::monty::mul_secret_left",
+              "cbaudit::monty::mul_both_secret",
               "cbaudit::controls::public_operand_branch",
           ]
           for contract in detected:
@@ -500,12 +515,15 @@ jobs:
                   sys.exit(
                       f"{contract} is {outcomes.get(contract)}, not LEAK_DETECTED: "
                       "the propagation gate has stopped working, so a clean "
-                      "result on the real operation establishes nothing"
+                      "result on the real operations establishes nothing"
                   )
           for contract in clean:
               if outcomes.get(contract) != "NO_LEAK_OBSERVED":
                   sys.exit(f"{contract} is {outcomes.get(contract)}, not NO_LEAK_OBSERVED")
-          print(f"6 controls detected, 3 clean, {len(outcomes)} accounted for")
+          missing = set(outcomes) - set(detected) - set(clean)
+          if missing:
+              sys.exit(f"contracts with no expectation in this check: {sorted(missing)}")
+          print(f"7 controls detected, 6 clean, {len(outcomes)} accounted for")
           PY
 
       - name: Reproduce the demonstration

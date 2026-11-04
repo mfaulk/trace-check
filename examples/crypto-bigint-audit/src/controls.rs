@@ -1,4 +1,5 @@
-//! Deliberate controls for the M9.1 feasibility gate.
+//! Deliberate controls. B1–B6 are the M9.1 propagation gate; B7 is Target B's
+//! branchy counterexample, and the last one is a negative control.
 //!
 //! None of these is a cryptographic operation. Each exists to make one
 //! specific way of being wrong fail visibly, and the one question they answer
@@ -138,6 +139,35 @@ pub fn decoded_address_probe(secret: &[u8; 32], public: &[u8; 32]) -> u8 {
     // SAFETY: the mask keeps the index inside the 16-byte table.
     let selected = unsafe { core::ptr::read_volatile(&SBOX[index]) };
     selected ^ consume_all_bytes(sum.to_be_bytes().as_slice())
+}
+
+/// Control B7 — the branchy alternative to `select::ct_select`.
+///
+/// Selection written the way a developer reaches for first: look at the
+/// secret, then pick. It computes the same function as the library's
+/// `CtSelect` and is the whole reason `CtSelect` exists, so a checker that
+/// cannot tell the two apart cannot say anything useful about constant-time
+/// selection.
+///
+/// Read together with `select::ct_select`'s clean result, this pair is the
+/// milestone's most direct statement to a cryptographic developer: the idiom
+/// is checkable, and abandoning it is detected.
+#[constant_time(
+    secret = "first",
+    secret = "second",
+    secret = "choice",
+    dynamic = false
+)]
+pub fn branch_selected(first: &[u8; 32], second: &[u8; 32], choice: u8) -> u8 {
+    let a = U256::from_be_slice(first);
+    let b = U256::from_be_slice(second);
+    let selected = if choice & 1 == 1 {
+        record(7);
+        b
+    } else {
+        a
+    };
+    consume_all_bytes(selected.to_be_bytes().as_slice())
 }
 
 /// Negative control — a branch on the **public** operand only, with the secret

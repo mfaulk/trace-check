@@ -79,7 +79,8 @@ Three properties, in the order they mattered:
 | B | `U256`'s `CtSelect::ct_select` | conditional selection is the constant-time idiom cryptographic code is built out of | **total** — any two candidates, any `Choice` |
 | C | `ConstMontyForm::mul` with a pinned odd modulus | multi-limb multiplication, Montgomery representation, modular reduction, fixed cryptographic parameters | **total** — see below |
 
-Target A is implemented and analyzed. Targets B and C are M9.2 work.
+All three are implemented and analyzed; see
+[`findings.md`](findings.md) for what each artifact was found to contain.
 
 ### Input domains, and the operation that was rejected
 
