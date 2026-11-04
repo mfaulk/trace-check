@@ -35,7 +35,7 @@ are two results about two binaries, not one result about the function.
 | --- | --- | --- |
 | M10.0 | Real two-backend feasibility gate and integration seams | complete |
 | M10.1 | Per-analysis expectations and security-policy semantics | complete |
-| M10.2 | Typed artifact-bound evidence model | partial — see §5 |
+| M10.2 | Typed artifact-bound evidence model | complete |
 | M10.3 | Refactor and integrate the M5 symbolic runner | partial — see §5 |
 | M10.4 | Integrate M3 developer-written dynamic tests | not started |
 | M10.5 | Unified execution planner and backend deduplication | not started |
@@ -195,15 +195,127 @@ deliberate schema migration.
 
 ---
 
-## 5. What is not done
+## 5. M10.2 — every result names the executable it describes
 
-* **M10.2** — evidence is typed and artifact-bound, and symbolic evidence
-  carries its full provenance, but the identity is not yet the complete list
-  the plan specifies. In particular the recorded `rustc_version` is read from
-  trace-check's own working directory while generated harnesses build under
-  `/tmp`, where the repository's `rust-toolchain.toml` does not apply. The two
-  resolved to the same compiler on the development machine, so no mismatch has
-  been observed; it is a latent provenance risk, not a measured defect.
+### The problem
+
+A security result is a claim about one compiled artifact, never about a function
+in general. M8's evidence carried a bare `artifact_sha256`, which is enough to
+say two results are about different bytes and not enough to say *why* — and a
+developer looking at a clean generated result beside a symbolic one needs that
+before deciding what either establishes.
+
+Worse, one of the fields that decides those bytes was **recorded wrong**.
+
+### The provenance defect
+
+`rustup` resolves a toolchain by walking up from the working directory.
+trace-check runs in the developer's project and sees its `rust-toolchain.toml`;
+the harnesses it generates are built in a private work directory, which for an
+ephemeral workspace is under `/tmp` and sees no such file. So:
+
+* `rustc --version` was measured where trace-check runs — the pinned toolchain
+  — and recorded as the artifact's compiler;
+* the artifact was built where the harness lives — the **default** toolchain.
+
+Reproduced against a staged copy of `examples/crypto-library` pinning 1.88.0 on
+a machine whose default was 1.97.0:
+
+| run | recorded | artifact |
+| --- | --- | --- |
+| relying on the library's pin | `1.88.0` | `e3b4a92fb9786d5b…` |
+| 1.88.0 forced everywhere | `1.88.0` | `4d71088ab29dddd0…` |
+| 1.97.0 forced everywhere | `1.97.0` | `e3b4a92fb9786d5b…` |
+
+The first row reports 1.88.0 and is byte-identical to the 1.97.0 build. The
+recorded compiler was not the compiler that ran.
+
+It is also wrong on its own terms, independently of reporting: a developer who
+pins a toolchain pins the code their project compiles, and verifying a build by
+a different compiler analyzes code they do not ship.
+
+`crate::toolchain` now resolves the toolchain once from the **library's**
+manifest directory and forces it on every generated build — the probe, the
+inventory, the generated harness and the verification harness — through
+`RUSTUP_TOOLCHAIN`. The version is then measured through that same toolchain,
+so the recorded compiler is the one that ran. With the fix the first row
+produces `4d71088ab29dddd0…`, matching the pinned build.
+
+The ambient `RUSTUP_TOOLCHAIN` is **cleared** during resolution, which is a
+deliberate choice with a cost. rustup's cargo shim sets that variable for every
+child process, so `cargo trace-check` inherits the toolchain resolved from the
+*invocation* directory — not the library's. `--manifest-path` pointing at a
+differently-pinned project is exactly the shape this repository's own CI uses,
+and the inherited value would silently win. The library's pin is the authority
+because the library is the code being analyzed. The cost is that
+`cargo +1.99 trace-check verify` no longer selects 1.99 for the analysis build;
+`rustup override set` and `rust-toolchain.toml` both still work, because both
+are directory resolution.
+
+### The identity
+
+`evidence::ArtifactIdentity` is one shape for every backend, carrying the
+inputs that decide the artifact's bytes:
+
+| Field | Why it is part of the identity |
+| --- | --- |
+| `contract` | which declaration the artifact was built to analyze |
+| `descriptor_sha256` | the annotation's own output: a changed secret role or parameter width changes it, and a result recorded against one descriptor says nothing about a contract that now declares something else |
+| `library_package`, `library_version` | the code under analysis |
+| `features` | another feature combination is another library |
+| `target` | another architecture is another artifact |
+| `toolchain` | the compiler that built it, measured through itself |
+| `profile` | the build settings, including the panic strategy and link flags |
+| `artifact_sha256` | the analyzed executable |
+| `lockfile_sha256` | the resolved dependency graph |
+| `harness_sha256` | the generated surroundings |
+| `backend`, `backend_version` | which analyzer, and what it reports about itself |
+| `analyzer_image` | symbolic only, by digest: the image *is* the analyzer and its bundled solver |
+
+`ArtifactIdentity::differences` reports how two identities for one contract
+differ by **naming the inputs**, because "these are two different binaries" is
+not actionable and "they were built with different profiles by different
+compilers" is.
+
+Writing the identity surfaced a smaller defect of its own: `harness::PROFILE`
+and `dynamic_harness::PROFILE` are the *same string*, so the two backends'
+build settings were described identically despite one being a freestanding
+`panic=abort` `-nostdlib` build and the other a hosted unwinding one. The
+identity spells out the difference; the test that compares two backends' inputs
+is what caught it.
+
+### Validation at the enforcement boundary
+
+Both backends' evidence now goes through a constructor that refuses to promote
+a clean outcome the record does not support, and neither can be bypassed —
+there is no way to build evidence without passing through one.
+
+* `from_symbolic` checks identity (contract, symbol binding, artifact)
+  unconditionally, then coverage (target reached, observation classes). See §4.
+* `from_generated` checks that the record is about this contract, that both
+  positive controls fired, and that every planned case completed.
+
+`check::run` already gates `NO_LEAK_OBSERVED` behind both controls and behind
+every batch completing, so the generated states are unreachable from the
+backend today. That is precisely why they are checked here: the policy layer
+reads only an outcome, and a record whose own fields contradict it must not be
+able to discharge a requirement. A detected leak is never downgraded by either.
+
+The identity is also now the **authority** on what an obligation is about. It
+is built from the executable this run produced, before the analyzer runs, and
+the backend's report is checked against it rather than the reverse.
+
+### Scope limitation, kept
+
+Only evidence produced and validated in the current unified execution can
+discharge a requirement. Nothing imports historical reports, and there is no
+cross-run evidence cache — the identity is now rich enough to key one, which is
+a reason to design it deliberately rather than a reason to add it here.
+
+---
+
+## 6. What is not done
+
 * **M10.3** — the per-contract symbolic seam exists (`stage_symbolic` /
   `verify_staged`) and the standalone command uses it. Observation-model policy
   is validated against the `[verify]` configuration, not declarable in policy.

@@ -23,7 +23,7 @@ the formal noninterference property, and the roadmap.
 | M7 | Coverage-guided leakage discovery | complete, experimental |
 | M8 | Complete contract coverage and enforcement | complete, experimental |
 | M9 | Real-world cryptography integration — auditing `crypto-bigint` | complete, experimental |
-| M10 | Unified multi-backend verification and CI enforcement | in progress — M10.0, M10.1 complete |
+| M10 | Unified multi-backend verification and CI enforcement | in progress — M10.0–M10.2 complete |
 | M11 | Hardware-oriented validation — statistical timing | future |
 
 `trace-check` turns that idea into reproducible analysis, from five directions:
@@ -293,6 +293,16 @@ Observed event counts for `early_exit_opaque`, by mismatch position:
   LLVM of another version cannot read this compiler's profiles — so they are
   located from the sysroot and never from `PATH`.
   `TRACE_CHECK_LLVM_TOOLS` overrides the directory.
+
+  **Your analyzed library's own pin is what gets used.** The harnesses
+  trace-check generates are built outside your project, where `rustup` would
+  resolve the machine default rather than your `rust-toolchain.toml` — so the
+  toolchain is resolved from the library's manifest directory and forced on
+  every generated build. Verifying a project pinned at 1.88 with a 1.99
+  compiler would analyze code the project does not produce. One consequence:
+  `cargo +1.99 trace-check verify` does not select 1.99 for the analysis build.
+  Use `rustup override set` or the project's `rust-toolchain.toml`, both of
+  which are directory resolution and are honoured.
 * **WABT 1.0.42** — the trace grammar and instruction offsets are specific to
   this release, so the version is checked at startup:
 
@@ -611,9 +621,14 @@ required = ["generated", "symbolic"]
 ```
 
 The two results are **not** merged. Each backend builds its own executable from
-its own generated harness with its own flags, so each result carries its own
-artifact hash, and evidence is checked against the obligation's artifact before
-it can discharge it — a `VERIFIED_BOUNDED` from another contract, another
+its own generated harness with its own flags, so each result carries a full
+**artifact identity** — the contract, the descriptor fingerprint, the library
+and its features, the compiler, the dependency lockfile, the harness source,
+the build settings, the backend and (for symbolic) the analyzer image digest.
+A hash says two results are about different bytes; the identity says why, which
+is what you need before deciding what either establishes.
+
+Evidence is checked against the obligation's artifact before it can discharge it — a `VERIFIED_BOUNDED` from another contract, another
 artifact, or a run that never reached the contract's symbol is rejected rather
 than read as a pass. A symbolic requirement additionally needs a
 `[verify."…"]` entry: a bounded search has no declared depth or observation

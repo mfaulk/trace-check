@@ -723,13 +723,32 @@ jobs:
           cargo test --locked -p trace-check --test symbolic
           cargo test --locked -p cargo-trace-check --test verify
 
+      # A second toolchain, so the artifact-provenance guard has something to
+      # contrast the pinned one with. M10.2 reproduced a library pinning 1.88.0
+      # whose report said `rustc 1.88.0` while the analyzed executable was
+      # byte-identical to the default toolchain's build. With one toolchain
+      # installed there is no difference to detect and the test would skip, so
+      # TRACE_CHECK_REQUIRE_ALT_TOOLCHAIN below turns a skip into a failure.
+      #
+      # `--profile minimal` and no extra targets: this toolchain only ever
+      # compiles a staged copy of examples/crypto-library for the host.
+      - name: Install a contrasting toolchain
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup run 1.88.0 rustc --version
+
       # M5: contract verification against a real Cargo library. Includes
       # `the_verdict_follows_the_library_implementation`, which rewrites one
       # function body in a copy of the library and requires the verdict to flip
       # while the configuration and the generated harness design stay the same.
+      #
+      # And `the_artifact_is_built_by_the_library_s_pinned_toolchain`, the M10.2
+      # provenance guard: the analyzed executable must be the one the library's
+      # own pin produces, not the machine default's.
       - name: Contract verification tests
         env:
           TRACE_CHECK_REQUIRE_SYMBOLIC: "1"
+          TRACE_CHECK_REQUIRE_ALT_TOOLCHAIN: "1"
           EXPECTED_CONTAINER_RUNTIME: docker
         run: cargo test --locked -p trace-check --test library
 
