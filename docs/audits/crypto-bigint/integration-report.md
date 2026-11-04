@@ -213,17 +213,55 @@ comparable across invocations, because the staging directory's absolute path is
 baked into the debug info the harness build keeps on purpose; it is compared
 within a single `--compare-clean` run, which is the comparison that matters.
 
+## M9.2 — the other two targets, and the oracle
+
+Targets B and C were added after the gate passed, with no change to the
+machinery above. `objdump` evidence for both, and the full outcome table, are
+in [`findings.md`](findings.md); the parts worth repeating here are the two
+that could have gone differently.
+
+**Selection compiles to conditional moves, not branches.**
+`Choice::from_u8_lsb` is `and $0x1,%dl`, and the per-limb selection is four
+`test`/`cmovne` pairs through `<u64 as cmov::Cmov>::cmovnz`. So the idiom
+survives `opt-level = 3` — which is not automatic, and is the kind of thing a
+source review cannot establish. `controls::branch_selected`, the same function
+written with an `if`, is detected. That pair is the clearest demonstration this
+work produces.
+
+**Montgomery multiplication has a distinct symbol.**
+`crypto_bigint::modular::mul::mul_montgomery_form::<4>` is out of line, 1199
+bytes, called three times per adapter invocation, with 28 `mul` / 41 `adc` /
+45 `add` and no conditional jumps. Experiment C is easiest here: there is a
+named upstream symbol to point at rather than an inlining argument to make.
+
+**No input domain needed restricting.** `ConstMontyForm::new` reduces its
+argument, so every 256-bit value is valid for Target C, and `ct_select`
+constrains nothing. All three adapters are total, there is no `assume`
+constraint anywhere in the example, and no adapter carries a validity branch.
+`U256::add_mod`, whose precondition would have forced one, is deliberately not
+a target.
+
+**The arithmetic is checked against something that is not the library.**
+`ci/gen-m9-vectors.py` computes 1012 expected values in Python's
+arbitrary-precision integers — the carry, reduction and limb-edge boundaries
+crossed with each other, plus a SHA-256 counter stream over a fixed seed — and
+`tests/functional.rs` checks all three operations against them. Both
+statements of the P-256 prime (a hex literal in `monty.rs`, an arithmetic
+expression in the generator) are required to agree. All 1012 pass, which is
+what licenses reading the side-channel results at all.
+
 ## Cost, measured
 
 | | |
 | --- | --- |
-| Adapter code for Target A, outside tests | 17 lines |
+| Adapter code, three targets, outside tests | 17 + 16 + 27 lines |
 | Sink | 15 lines, with 3 tests |
-| Controls | 75 lines for six controls and one negative control |
+| Controls | seven controls and one negative control |
 | Upstream source changes in the clean integration | **0** |
-| Manual configuration entries | 9 (`trace-check.toml`), none of which assigns a secret role |
-| `check --all-contracts --ci`, 9 contracts, 64 cases each | 77 s wall, 173 MB peak RSS |
-| Unsupported Rust constructs encountered | none for Target A |
+| Manual configuration entries | 13 (`trace-check.toml`), none of which assigns a secret role |
+| Independent oracle vectors | 1012, all passing |
+| `check --all-contracts --ci`, 13 contracts, 64 cases each | 107 s wall, 174 MB peak RSS |
+| Unsupported Rust constructs encountered | none |
 | Compiler or dependency configuration changes | none beyond `default-features = false` |
 
 The one real integration cost was not a type-system limitation. It was the

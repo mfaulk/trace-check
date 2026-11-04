@@ -23,8 +23,8 @@ use trace_check_macros::constant_time;
 /// distinct. It has no branch and no address dependency, so it cannot change
 /// what the contract observes; `docs/audits/crypto-bigint/integration-report.md`
 /// records the measurement.
-const SECRET_LEFT_TAG: u8 = 0x5a;
-const BOTH_SECRET_TAG: u8 = 0xa5;
+pub const SECRET_LEFT_TAG: u8 = 0x5a;
+pub const BOTH_SECRET_TAG: u8 = 0xa5;
 
 /// `left + right mod 2^256`, with `left` secret and `right` public.
 ///

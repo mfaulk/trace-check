@@ -27,6 +27,28 @@ description = "the same operation with both operands secret"
 rationale = "a separate claim, not a separate implementation: safety for a public operand does not imply safety for a secret one"
 
 # ------------------------------------------------------------------
+# Target B — constant-time selection. Read with
+# `controls::branch_selected`, which is the same function written with
+# a branch and is expected to be detected.
+# ------------------------------------------------------------------
+
+[check."cbaudit::select::ct_select"]
+description = "U256 selection through the library's CtSelect, with all three inputs secret"
+rationale = "the adapter's one obligation is to build the Choice without branching, and `Choice::from_u8_lsb` is `value & 1`. The selection itself is the library's, which goes per-limb through `Limb::select` and the `cmov` crate -- a conditional move, so no branch and no secret-derived address. `choice` is a secret byte with two meaningful values and 256 valid ones; the generated corpus supplies all of them, and `only_the_low_bit_of_the_choice_matters` is the functional test that the other 254 are not a different function"
+
+# ------------------------------------------------------------------
+# Target C — Montgomery modular multiplication modulo the P-256 prime.
+# ------------------------------------------------------------------
+
+[check."cbaudit::monty::mul_secret_left"]
+description = "ConstMontyForm::mul modulo the P-256 prime, secret left operand"
+rationale = "exercises multi-limb multiplication, carry propagation, Montgomery representation and modular reduction at once. `ConstMontyForm::new` multiplies by R^2 mod p and so reduces its argument, which is why every 256-bit value is a valid input and the adapter carries no validity branch"
+
+[check."cbaudit::monty::mul_both_secret"]
+description = "the same operation with both operands secret"
+rationale = "the configuration a field multiplication in a scalar multiplication actually sees, where neither operand is public"
+
+# ------------------------------------------------------------------
 # M9.1 controls. Each is expected to be detected, and each names the
 # way of being wrong it rules out.
 # ------------------------------------------------------------------
@@ -64,6 +86,12 @@ expected_outcome = "LEAK_DETECTED"
 [check."cbaudit::controls::decoded_address_probe"]
 description = "control B6: a secret-derived load address after decoding"
 rationale = "every secret executes the same instructions here, so a control-flow-only analysis reports it clean. It is the evidence that the address half of the observation model also survives decoding"
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"
+
+[check."cbaudit::controls::branch_selected"]
+description = "control B7: Target B's selection written with a branch instead of CtSelect"
+rationale = "the same function as `select::ct_select`, written the way a developer reaches for first. A checker that cannot tell these two apart cannot say anything useful about constant-time selection, so this pair is the most direct demonstration the milestone produces"
 expectation = "analyzer-regression"
 expected_outcome = "LEAK_DETECTED"
 

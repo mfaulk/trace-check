@@ -1,6 +1,6 @@
 # Milestone 09 — Real-World Cryptography Integration and Audit Validation
 
-**Status:** M9.0 and M9.1 implemented; M9.2–M9.8 outstanding
+**Status:** M9.0–M9.2 implemented, M9.3 and M9.4 largely so; M9.5–M9.8 outstanding
 **Branch:** `feat/m9-real-world-crypto`
 **Prerequisite:** Milestone 8, merged
 **Reference library:** RustCrypto `crypto-bigint` `0.7.10`
@@ -104,21 +104,32 @@ same reason. A control whose branch the compiler erases is not a control.
 ```text
 examples/crypto-bigint-audit/     an out-of-workspace crate, own lockfile
   src/add.rs                      Target A: U256::wrapping_add, two secret roles
-  src/controls.rs                 six propagation controls + one negative control
+  src/select.rs                   Target B: CtSelect::ct_select for U256
+  src/monty.rs                    Target C: ConstMontyForm::mul mod the P-256 prime
+  src/controls.rs                 seven controls + one negative control
   src/sink.rs                     the fixed-work 32-byte fold
+  tests/functional.rs             all three operations against the oracle
+  tests/vectors/generated.rs      1012 committed vectors
   trace-check.toml                description, rationale, expected outcome per contract
 
+ci/gen-m9-vectors.py              the independent oracle; --check guards drift
 ci/mutate-m9.py                   one upstream-mutation experiment, with validity checks
 ci/mutations/
   mutation-a-carry-branch.patch         a branch on the carry inside Uint::carrying_add
   negative-stale-patch.patch            must fail to apply
   negative-unreached-branch.patch       the same branch, in a function never called
 
+docs/adapter-guide.md             how to write an adapter for another library
 docs/audits/crypto-bigint/
   target-selection.md             the pin, the three targets, the rejected operation
   threat-model.md                 the analysis boundary and what is out of scope
-  integration-report.md           the gate's measurements
+  integration-report.md           the gate's measurements and M9.2's additions
+  findings.md                     every outcome, with its attribution
 ```
+
+There is no separate `limitations.md`: scope limits live in `threat-model.md`
+and per-result limits in `findings.md`, and a third file restating them would
+be the one that goes stale.
 
 ### The analysis boundary, in one picture
 
@@ -150,23 +161,33 @@ python3 ci/mutate-m9.py --mutation mutation-a-carry-branch \
 | | |
 | --- | --- |
 | Upstream source changes in the clean integration | **0** |
-| Adapter code for Target A, outside tests | 17 lines |
-| Configuration entries, none assigning a secret role | 9 |
-| `check --all-contracts --ci`, 9 contracts × 64 cases | 77 s wall, 173 MB peak RSS |
-| Controls detected | 6 of 6, covering first / interior / last secret byte, a library-produced carry, and an address |
+| Adapter code, three targets, outside tests | 17 + 16 + 27 lines |
+| Configuration entries, none assigning a secret role | 13 |
+| Independent oracle vectors | 1012, all passing |
+| `check --all-contracts --ci`, 13 contracts × 64 cases | 107 s wall, 174 MB peak RSS |
+| Operations clean on unmodified library code | 5 contracts over 3 operations |
+| Controls detected | 7 of 7, covering first / interior / last secret byte, a library-produced carry, an address, and a branchy selection |
 | Negative control | `NO_LEAK_OBSERVED`, as required |
 | Upstream mutations detected | 1 of 1 attempted (M9.5 requires three) |
-| Unsupported Rust constructs encountered | none for Target A |
+| Unsupported Rust constructs encountered | none |
 
-Experiment C's disassembly evidence — the inlined `from_be_slice`, the four-limb
-`add`/`adc` chain from `primitives::carrying_add`, and `EncodedUint::new_be` —
-is reproduced in the integration report.
+Experiment C's disassembly evidence is in
+[`findings.md`](audits/crypto-bigint/findings.md): the inlined `from_be_slice`
+and four-limb `add`/`adc` chain for Target A; `Choice::from_u8_lsb` as
+`and $0x1,%dl` and four `test`/`cmovne` pairs through the `cmov` crate for
+Target B; and `mul_montgomery_form::<4>` as a distinct 1199-byte out-of-line
+symbol with 28 `mul`, 41 `adc` and no conditional jumps for Target C.
+
+The pair worth singling out is `select::ct_select` clean beside
+`controls::branch_selected` detected. The library's selection survives
+`opt-level = 3` as conditional moves — which is not automatic and is not
+something a source review establishes — and the same function written with an
+`if` is found.
 
 ---
 
 ## 5. Limitations
 
-* One operation of three. `CtSelect` and `ConstMontyForm::mul` are M9.2.
 * One upstream mutation of the three M9.5 requires, and it is a branch
   mutation; the address-dependency mutation does not exist yet.
 * The symbolic backend was not exercised: BINSEC is not installed on the
@@ -186,9 +207,9 @@ is reproduced in the integration report.
 | --- | --- | --- |
 | M9.0 | Target selection and source pinning | **done** |
 | M9.1 | Secret-propagation feasibility gate | **done** — passed |
-| M9.2 | Three adapters, functional oracles, adapter guide | outstanding |
-| M9.3 | Real-library dynamic checks and M8 enforcement | partly done for Target A |
-| M9.4 | Mutation infrastructure | **done** for one mutation; isolation and validity checks in place |
+| M9.2 | Three adapters, functional oracles, adapter guide | **done** |
+| M9.3 | Real-library dynamic checks and M8 enforcement | **done** for all three targets; no M7 exploration yet |
+| M9.4 | Mutation infrastructure | **done** — isolation, provenance and validity checks in place |
 | M9.5 | Three upstream mutation regressions | 1 of 3 |
 | M9.6 | Symbolic feasibility spike | not started (no BINSEC on this host) |
 | M9.7 | M6-versus-M7 detection comparison and benchmarks | not started |
@@ -203,8 +224,10 @@ is reproduced in the integration report.
 - [x] An external audit crate invokes the original implementation without
       rewriting it.
 - [x] The clean integration requires no upstream changes.
-- [ ] Three meaningfully different operations covered. *(1 of 3)*
-- [x] Input and output adapters have independent functional tests.
+- [x] Three meaningfully different operations covered — multi-limb addition,
+      constant-time selection, Montgomery modular multiplication.
+- [x] Input and output adapters have independent functional tests — 1012
+      vectors from a Python oracle, plus the sink's all-bytes property.
 - [x] Input-domain assumptions documented and validated — all three targets are
       total, so none is restricted.
 - [x] Secret marking works through the library's own cryptographic type.
