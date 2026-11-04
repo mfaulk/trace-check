@@ -1,0 +1,18 @@
+--- a/src/uint/add.rs
++++ b/src/uint/add.rs
+@@ -22,6 +22,15 @@
+         while i < LIMBS {
+             let (w, c) = self.limbs[i].carrying_add(rhs.limbs[i], carry);
+             limbs[i] = w;
++            // M9 MUTATION A: a branch on the running carry, which is derived
++            // from both operands. The arithmetic result is unchanged; only the
++            // observable control flow differs. `black_box` is an opaque
++            // barrier, so the branch cannot be if-converted into a `cmov` --
++            // without it the optimizer erases the mutation and the experiment
++            // measures nothing.
++            if c.0 != 0 {
++                core::hint::black_box(i);
++            }
+             carry = c;
+             i += 1;
+         }

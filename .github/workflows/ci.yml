@@ -72,6 +72,7 @@ jobs:
           cargo fmt --all -- --check
           rustfmt --edition 2021 --check examples/symbolic/src/targets.rs
           rustfmt --edition 2021 --check examples/external-library/src/lib.rs
+          rustfmt --edition 2021 --check examples/crypto-bigint-audit/src/*.rs
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -89,6 +90,21 @@ jobs:
         run: |
           cargo test --locked --all-targets \
             --manifest-path examples/external-library/Cargo.toml
+
+      # M9 level 1: the audit crate is lint-clean against the real dependency,
+      # and its functional tests pass. No side-channel result in M9 is
+      # interpreted before these do -- an adapter that decodes the wrong byte
+      # order or consumes part of the result leaves trace-check analyzing
+      # something that is not the operation the contract names.
+      - name: Clippy the crypto-bigint audit adapters
+        run: |
+          cargo clippy --locked --all-targets \
+            --manifest-path examples/crypto-bigint-audit/Cargo.toml -- -D warnings
+
+      - name: The audit adapters compute the right arithmetic
+        run: |
+          cargo test --locked --all-targets \
+            --manifest-path examples/crypto-bigint-audit/Cargo.toml
 
       # A missing backend must fail rather than silently skip the end-to-end
       # tests. The fast suite runs first so an ordinary regression surfaces
@@ -436,6 +452,62 @@ jobs:
       - name: Contract discovery overhead is bounded
         run: python3 ci/benchmark-m8.py
 
+      # ------------------------------------------------------------------
+      # M9 level 1: the real-library integration, on every PR.
+      # ------------------------------------------------------------------
+
+      # The gate that makes a clean result on the real operation mean anything.
+      # All six controls must be *detected*: they are declared
+      # `expected_outcome = "LEAK_DETECTED"`, so a control that stops being
+      # detected fails on an unmet expectation rather than inflating the clean
+      # count. The report's own claims are asserted, not the exit code.
+      - name: Secrets survive decoding into crypto-bigint's own types
+        working-directory: examples/crypto-bigint-audit
+        run: |
+          set -euo pipefail
+          cargo run --locked --release -p cargo-trace-check -- check \
+            --all-contracts --ci --format json \
+            > "$GITHUB_WORKSPACE/m9-contracts.json"
+          python3 "$GITHUB_WORKSPACE/ci/verify-m8-contracts.py" \
+            "$GITHUB_WORKSPACE/m9-contracts.json" --expect-declared 9
+          python3 - "$GITHUB_WORKSPACE/m9-contracts.json" <<'PY'
+          import json, sys
+
+          report = json.load(open(sys.argv[1]))
+          outcomes = {
+              contract["id"]: evidence["outcome"]
+              for contract in report["contracts"]
+              for evidence in contract["evidence"]
+          }
+          # The four that are about propagation rather than marking: a decoded
+          # limb, an interior limb, the final secret byte alone, the carry the
+          # library returned, and an address derived from the decoded sum.
+          detected = [
+              "cbaudit::controls::decoded_high_limb_branch",
+              "cbaudit::controls::decoded_interior_limb_branch",
+              "cbaudit::controls::decoded_last_byte_branch",
+              "cbaudit::controls::carry_branch",
+              "cbaudit::controls::decoded_address_probe",
+              "cbaudit::controls::pre_decode_first_byte",
+          ]
+          clean = [
+              "cbaudit::add::wrapping_add_secret_left",
+              "cbaudit::add::wrapping_add_both_secret",
+              "cbaudit::controls::public_operand_branch",
+          ]
+          for contract in detected:
+              if outcomes.get(contract) != "LEAK_DETECTED":
+                  sys.exit(
+                      f"{contract} is {outcomes.get(contract)}, not LEAK_DETECTED: "
+                      "the propagation gate has stopped working, so a clean "
+                      "result on the real operation establishes nothing"
+                  )
+          for contract in clean:
+              if outcomes.get(contract) != "NO_LEAK_OBSERVED":
+                  sys.exit(f"{contract} is {outcomes.get(contract)}, not NO_LEAK_OBSERVED")
+          print(f"6 controls detected, 3 clean, {len(outcomes)} accounted for")
+          PY
+
       - name: Reproduce the demonstration
         run: cargo run --locked --release -p trace-check -- demo mac-compare
 
@@ -457,6 +529,72 @@ jobs:
             native-memcheck.json
             m6-generated.json
             m8-contracts.json
+            m9-contracts.json
+
+  # M9 level 2: the upstream-mutation experiments. A separate job because each
+  # one stages its own copy of the dependency and analyzes it under Valgrind,
+  # and because a mutation regression must not be able to mask an M1-M8
+  # regression or be masked by one.
+  #
+  # Never a shared dependency directory: each experiment stages into its own
+  # temporary tree, so no run can be compiling a source file another run is
+  # rewriting, and the clean baseline can never reuse the mutated build.
+  mutate:
+    name: Upstream mutation experiments (crypto-bigint)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+
+      - name: Install Valgrind
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y valgrind
+          valgrind --version
+          test -f /usr/include/valgrind/memcheck.h
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The decisive experiment: the library's own source changes, the adapter
+      # and its contract do not, and the verdict has to flip. `--compare-clean`
+      # also requires the two runs to have analyzed different artifacts.
+      - name: Mutation A -- a branch on the carry inside Uint::carrying_add
+        run: |
+          python3 ci/mutate-m9.py --mutation mutation-a-carry-branch \
+            --contract cbaudit::add::wrapping_add_secret_left \
+            --expect-outcome LEAK_DETECTED \
+            --expect-frame src/uint/add.rs \
+            --compare-clean
+
+      # Two ways the experiment above could report an outcome it did not earn.
+      # Both must fail, and a `python3` exit of 1 is the pass condition here.
+      - name: A stale patch fails rather than reporting a clean result
+        run: |
+          set +e
+          python3 ci/mutate-m9.py --mutation negative-stale-patch \
+            --contract cbaudit::add::wrapping_add_secret_left \
+            --expect-outcome LEAK_DETECTED > /tmp/m9-stale.txt 2>&1
+          code=$?
+          set -e
+          cat /tmp/m9-stale.txt
+          test "$code" = "1" || { echo "a stale patch must fail, got $code"; exit 1; }
+          grep -q "does not apply to crypto-bigint 0.7.10" /tmp/m9-stale.txt
+
+      - name: A mutation in code that never runs cannot be claimed as a finding
+        run: |
+          set +e
+          python3 ci/mutate-m9.py --mutation negative-unreached-branch \
+            --contract cbaudit::add::wrapping_add_secret_left \
+            --expect-outcome LEAK_DETECTED > /tmp/m9-unreached.txt 2>&1
+          code=$?
+          set -e
+          cat /tmp/m9-unreached.txt
+          test "$code" = "1" || { echo "an unexecuted mutation must fail, got $code"; exit 1; }
+          grep -q "expected LEAK_DETECTED, got NO_LEAK_OBSERVED" /tmp/m9-unreached.txt
 
   # M4: bounded relational verification. A separate job because its backend is
   # a container image rather than a package, and because it must not be able to

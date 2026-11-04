@@ -1,0 +1,126 @@
+# crypto-bigint-audit — auditing somebody else's cryptographic library
+
+This crate analyzes [RustCrypto `crypto-bigint`](https://github.com/RustCrypto/crypto-bigint)
+`0.7.10`, consumed as an ordinary pinned crates.io dependency. **No upstream
+source is modified in the clean integration.** Nothing here reimplements a
+cryptographic operation: each adapter decodes trace-check's supported input
+shapes into the library's own types, calls the library's own function, and
+consumes the whole result.
+
+```sh
+cargo trace-check check --all-contracts --ci \
+  --manifest-path examples/crypto-bigint-audit/Cargo.toml
+```
+
+Nine declarations, 100% enforcement, exit 0 — because the six expected-to-leak
+controls are declared as such in `trace-check.toml`. About 77 s and 173 MB on
+one x86-64 host.
+
+| Contract | What it is | Outcome |
+| --- | --- | --- |
+| `add::wrapping_add_secret_left` | `U256::wrapping_add`, secret left operand | `NO_LEAK_OBSERVED` |
+| `add::wrapping_add_both_secret` | the same, both operands secret | `NO_LEAK_OBSERVED` |
+| `controls::pre_decode_first_byte` | B1: branch on `secret[0]` before decoding | `LEAK_DETECTED` |
+| `controls::decoded_high_limb_branch` | B2: branch on decoded `secret[0..8]` | `LEAK_DETECTED` |
+| `controls::decoded_interior_limb_branch` | B3: branch on decoded `secret[8..16]` | `LEAK_DETECTED` |
+| `controls::decoded_last_byte_branch` | B4: branch on `secret[31]` alone | `LEAK_DETECTED` |
+| `controls::carry_branch` | B5: branch on the carry the library returned | `LEAK_DETECTED` |
+| `controls::decoded_address_probe` | B6: secret-derived load address | `LEAK_DETECTED`, address |
+| `controls::public_operand_branch` | negative control: public operand only | `NO_LEAK_OBSERVED` |
+
+## Why the controls are the point
+
+A contract here covers the **whole adapter invocation** — decoding, the
+library's types, the library's operation, and the result consumption. So a
+clean result on `wrapping_add_secret_left`, read alone, is indistinguishable
+from a harness that marked nothing or a secret that stopped being tracked at
+the first type conversion.
+
+The six controls are what make it mean something. B2–B6 are driven by values
+the *library* produced from the secret bytes — decoded limbs, and in B5 the
+`Limb` carry returned by `Uint::carrying_add`. B1 is deliberately listed first
+and deliberately weak: it only shows the array was marked at all.
+
+They are declared `expected_outcome = "LEAK_DETECTED"`, so if one ever stops
+being detected the run fails on an unmet expectation instead of reporting a
+clean sweep.
+
+## Mutating the real library
+
+The decisive evidence is that changing the *library* — not the harness —
+changes the verdict:
+
+```sh
+python3 ci/mutate-m9.py --mutation mutation-a-carry-branch \
+  --contract cbaudit::add::wrapping_add_secret_left \
+  --expect-outcome LEAK_DETECTED --expect-frame src/uint/add.rs --compare-clean
+```
+
+The driver stages the pinned source into an isolated copy, applies the patch,
+runs this crate's own functional tests against the mutated dependency, and
+checks the **unchanged** contract. The finding's leaf frame is
+`carrying_add<4> (src/uint/add.rs:31)` — upstream source, at the patched line.
+The clean and mutated artifact hashes must differ, or the run fails.
+
+Two negative controls guard the experiment itself:
+`negative-stale-patch.patch` must fail to apply, and
+`negative-unreached-branch.patch` puts the same branch in a function the
+adapters never call, so it reports `NO_LEAK_OBSERVED` and cannot be claimed as
+a detection.
+
+## The sink, and why it is not decoration
+
+The generated checker returns one scalar and a 256-bit result does not fit in
+one. Whatever reduces it decides what the compiler may discard: a sink reading
+four of the thirty-two bytes licenses the optimizer to compute one limb, and
+then the artifact no longer contains the operation the contract names.
+
+`sink::consume_all_bytes` folds all 32 bytes with `acc * 31 + byte`.
+Multiplying by 31 is invertible mod 256, so no byte's contribution can be
+cancelled, and `every_byte_changes_the_result` asserts exactly that. It is not
+a hash and carries no cryptographic property.
+
+## Two contracts, one operation, and a lesson about symbols
+
+`wrapping_add_secret_left` and `wrapping_add_both_secret` differ only in which
+parameters are *declared* secret, and a declaration does not change codegen.
+Written identically they compiled to one function with both symbols at one
+address, and a leak inside the dependency then came back `INCONCLUSIVE`: the
+finding was correct and correctly located, but Valgrind named the other
+contract's folded symbol, so attribution refused it.
+
+Each adapter now xors a distinct compile-time constant into its result — no
+branch, no address dependency, one instruction. The general rule: **an adapter
+set must be distinguishable in the compiled artifact, not just in its source.**
+Measurements in
+[`docs/audits/crypto-bigint/integration-report.md`](../../docs/audits/crypto-bigint/integration-report.md).
+
+## Layout
+
+| File | |
+| --- | --- |
+| `src/add.rs` | Target A, `U256::wrapping_add`, two secret roles |
+| `src/controls.rs` | the six propagation controls and the negative control |
+| `src/sink.rs` | the fixed-work 32-byte fold |
+| `trace-check.toml` | per-contract description, rationale and expected outcome |
+| `Cargo.lock` | committed; the audit's claim is about one resolved graph |
+
+`cargo test` runs the functional and structural tests — the arithmetic against
+an independently written schoolbook reference, the limb layout of a big-endian
+decode, and the sink's all-bytes property. No side-channel result in this
+example is interpreted before those pass.
+
+`dynamic = false` on every annotation: this crate wants its contracts *checked*
+by `cargo trace-check check`, which needs no hand-written `#[ct_test]`, so it
+carries no dev-dependency on `trace-check-test` and stays `no_std` outside its
+own test build.
+
+## Scope
+
+Three operations are planned; **Target A is implemented.** `CtSelect` (Target
+B) and `ConstMontyForm::mul` (Target C) are M9.2 work. See
+[`docs/MILESTONE-09.md`](../../docs/MILESTONE-09.md) for the state of each work
+package, and
+[`docs/audits/crypto-bigint/threat-model.md`](../../docs/audits/crypto-bigint/threat-model.md)
+for what the results do and do not establish — in particular, that none of this
+is a claim that `crypto-bigint` is secure.
