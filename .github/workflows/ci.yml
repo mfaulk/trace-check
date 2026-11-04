@@ -21,6 +21,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # First, because it needs nothing installed and it guards a mistake that
+      # already reached `main` once: a step that `cd`s into an
+      # out-of-workspace example and then selects a workspace package. Those
+      # examples are their own workspace on purpose, so `-p` cannot resolve
+      # from inside them, and the failure is invisible locally where one runs
+      # from the root with `--manifest-path`.
+      - name: Lint the workflow itself
+        run: python3 ci/verify-workflow.py
+
       # rust-toolchain.toml pins the channel, the wasm32 target and the
       # llvm-tools component M7's coverage feedback reads.
       - name: Install the pinned Rust toolchain
@@ -467,21 +476,26 @@ jobs:
       # ------------------------------------------------------------------
 
       # The gate that makes a clean result on the real operation mean anything.
-      # All six controls must be *detected*: they are declared
+      # Every propagation control must be *detected*: they are declared
       # `expected_outcome = "LEAK_DETECTED"`, so a control that stops being
       # detected fails on an unmet expectation rather than inflating the clean
       # count. The report's own claims are asserted, not the exit code.
+      #
+      # Run from the repository root with `--manifest-path`, NOT with
+      # `working-directory`. The audit crate is deliberately its own workspace
+      # — that is the whole point of the example — so `-p cargo-trace-check`
+      # does not resolve from inside it. The M8 step above can use
+      # `working-directory` only because `examples/crypto-library` is a
+      # workspace member.
       - name: Secrets survive decoding into crypto-bigint's own types
-        working-directory: examples/crypto-bigint-audit
         run: |
           set -euo pipefail
           cargo run --locked --release -p cargo-trace-check -- check \
             --all-contracts --ci --format json \
-            > "$GITHUB_WORKSPACE/m9-contracts.json"
-          python3 "$GITHUB_WORKSPACE/ci/verify-m8-contracts.py" \
-            "$GITHUB_WORKSPACE/m9-contracts.json" --expect-declared 18
-          python3 "$GITHUB_WORKSPACE/ci/verify-m9-integration.py" \
-            "$GITHUB_WORKSPACE/m9-contracts.json"
+            --manifest-path examples/crypto-bigint-audit/Cargo.toml \
+            > m9-contracts.json
+          python3 ci/verify-m8-contracts.py m9-contracts.json --expect-declared 18
+          python3 ci/verify-m9-integration.py m9-contracts.json
 
       - name: Reproduce the demonstration
         run: cargo run --locked --release -p trace-check -- demo mac-compare
