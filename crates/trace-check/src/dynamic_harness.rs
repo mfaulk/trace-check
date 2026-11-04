@@ -850,6 +850,9 @@ pub fn build(
             "build",
             "--release",
             "--message-format=json-render-diagnostics",
+            // See `native::compiler_diagnostics`: the ambient
+            // `CARGO_TERM_COLOR` is not ours to rely on.
+            "--color=never",
         ])
         .arg("--target-dir")
         .arg(target_dir)
@@ -1208,12 +1211,7 @@ impl fmt::Display for DynamicError {
             DynamicError::Build { stderr } => write!(
                 f,
                 "building the generated harness failed:\n{}",
-                stderr
-                    .lines()
-                    .filter(|line| !line.trim_start().starts_with("Compiling"))
-                    .take(12)
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                crate::native::compiler_diagnostics(stderr, 24)
             ),
             DynamicError::Memcheck(message) => write!(f, "{message}"),
             DynamicError::NothingSelected => write!(

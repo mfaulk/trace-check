@@ -306,6 +306,111 @@ pub fn over_bool(flag: bool) -> u8 {
     );
 }
 
+/// A library that does not compile reports the compiler's own diagnostic, not
+/// just "the build failed".
+///
+/// The inventory build runs Cargo with `--message-format=json-render-diagnostics`,
+/// which renders to stderr interleaved with progress lines. Selecting the first
+/// lines of stderr showed only `Compiling`/`Finished` noise, and under
+/// `CARGO_TERM_COLOR=always` the progress prefixes carry ANSI escapes, so a
+/// prefix match for them matched nothing and the real error was truncated away.
+/// A developer whose library does not build has to be told why.
+#[test]
+fn a_library_that_does_not_compile_reports_the_compilers_diagnostic() {
+    let staged = Staged::new("broken-build");
+    staged.append(
+        r#"
+
+/// Does not compile: `missing_helper` does not exist.
+#[constant_time(secret = "index", dynamic = false)]
+pub fn broken(index: u8) -> u8 {
+    missing_helper(index)
+}
+"#,
+    );
+    // Colour forced on, which is how CI runs it.
+    let output = Command::new(cli())
+        .args(["list", "--contracts", "--manifest-path"])
+        .arg(&staged.manifest)
+        .env(
+            "CARGO_TARGET_DIR",
+            std::env::temp_dir().join("trace-check-m8-cli-tests"),
+        )
+        .env("CARGO_TERM_COLOR", "always")
+        .output()
+        .expect("the CLI runs");
+    assert_ne!(output.status.code(), Some(0), "{}", both(&output));
+    let message = both(&output);
+    assert!(
+        message.contains("cannot find function `missing_helper`"),
+        "the compiler's diagnostic was not surfaced:\n{message}"
+    );
+    assert!(
+        message.contains("E0425") || message.contains("src/lib.rs"),
+        "the diagnostic names neither a code nor a location:\n{message}"
+    );
+}
+
+/// A contract on a function that is not `pub` is inventoried, reported
+/// `UNSUPPORTED`, and does not stop the other contracts being checked.
+///
+/// The generated harness is a separate crate that calls the real function, so
+/// a private one cannot be named from it. Before this was settled during
+/// policy resolution the whole run aborted on the link error, which hid the
+/// other declarations' results behind an unrelated failure.
+#[test]
+fn a_private_declaration_is_unsupported_without_stopping_the_run() {
+    if !valgrind_available() {
+        return;
+    }
+    let staged = Staged::new("private-contract");
+    staged.append(
+        r#"
+
+/// Constant-time, but not callable from a generated harness.
+#[constant_time(secret = "index", dynamic = false)]
+fn private_masked(index: u8) -> u8 {
+    masked(index)
+}
+
+/// Keeps the private function from being dead code.
+pub fn reachable(index: u8) -> u8 {
+    private_masked(index)
+}
+"#,
+    );
+    // It is inventoried: an unanalyzable contract is visible, not absent.
+    let listed = stdout(&staged.list());
+    assert!(listed.contains("3 contract declaration(s)"), "{listed}");
+    assert!(listed.contains("fixture::private_masked"), "{listed}");
+
+    let output = staged.run(&["--all-contracts", "--ci"]);
+    let text = stdout(&output);
+    assert!(text.contains("fixture::private_masked"), "{text}");
+    assert!(text.contains("UNSUPPORTED"), "{text}");
+    assert!(text.contains("not `pub`"), "{text}");
+    // The other two were still analyzed, which is the regression: one
+    // uncallable declaration must not take the run down with it.
+    assert!(
+        text.contains("declared: 3 contract(s)"),
+        "the inventory is short:\n{text}"
+    );
+    for checked in ["fixture::masked", "fixture::mixed"] {
+        assert!(text.contains(checked), "{checked} is missing:\n{text}");
+    }
+    assert!(
+        text.contains("CHECKED"),
+        "no contract was checked, so the run did abort:\n{text}"
+    );
+    // A gap, not a violation: exit 2.
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "an unanalyzable declaration must not pass:\n{}",
+        both(&output)
+    );
+}
+
 /// An annotation the *macro* refuses never compiles, so it cannot pass either.
 ///
 /// The earlier line of defence. A `&[u8]` secret is rejected at expansion with

@@ -430,12 +430,7 @@ mod tests {
         for (id, analysis, outcome) in evidence {
             coverage.fold(
                 id,
-                AnalysisEvidence {
-                    analysis: *analysis,
-                    outcome: *outcome,
-                    artifact_sha256: "artifact0000".to_string(),
-                    detail: "detail".to_string(),
-                },
+                AnalysisEvidence::summary(*analysis, *outcome, "artifact0000", "detail"),
             );
         }
         build(

@@ -736,7 +736,7 @@ fn explore_contract(
 }
 
 use coverage_report::CoverageReport;
-use enforcement::{Analysis, AnalysisEvidence, Available, Coverage, Plan};
+use enforcement::{Analysis, AnalysisEvidence, Available, Coverage, Plan, Status};
 use inventory::{ContractInventory, InventoryError};
 
 /// How `check` chose its contracts.
@@ -855,12 +855,7 @@ pub fn run_contract_coverage(
     } else {
         None
     };
-    let available = Available {
-        generated: valgrind.is_some(),
-        explore: valgrind.is_some() && tools.is_some(),
-        symbolic: false,
-        dynamic: valgrind.is_some(),
-    };
+    let available = check_capabilities(valgrind.is_some(), tools.is_some());
 
     let plan = Plan::resolve(&found, config, policy, &selected, &available, today);
     let mut coverage = Coverage::from_plan(&plan, &found);
@@ -894,7 +889,20 @@ pub fn run_contract_coverage(
             .validate(&entry.id)
             .map_err(HarnessError::Contract)?;
 
-        let analysed = analyse_one(
+        // A failure analysing one contract becomes that contract's status, not
+        // the end of the run. An earlier revision propagated it, so a single
+        // private annotated function -- inventoried correctly, but not
+        // reachable from an external probe harness -- abandoned the whole
+        // enforcement run: no report, no status for the contract that caused
+        // it, and every other declaration left unchecked. M8's whole claim is
+        // that every declaration gets an explicit status, which an aborted run
+        // cannot deliver.
+        //
+        // Errors that are not about *this contract* -- a missing analyzer, a
+        // broken inventory -- are still propagated, because they would recur
+        // identically for every contract and reporting them 18 times is not
+        // more useful than reporting them once.
+        let analysed = match analyse_one(
             library,
             workspace,
             declaration,
@@ -902,33 +910,27 @@ pub fn run_contract_coverage(
             valgrind_path,
             tools.as_ref(),
             reproducer_dir,
-        )?;
+        ) {
+            Ok(analysed) => analysed,
+            Err(error) if per_contract(&error) => {
+                for analysis in outstanding {
+                    coverage.note(
+                        &entry.id,
+                        analysis,
+                        Status::Unsupported {
+                            reason: error.to_string(),
+                        },
+                    );
+                }
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         for analysis in outstanding {
             if !matches!(analysis, Analysis::Generated | Analysis::Explore) {
                 continue;
             }
-            // `explore` is only discharged by a run that actually explored.
-            if analysis == Analysis::Explore && !analysed.explored {
-                coverage.fold(
-                    &entry.id,
-                    AnalysisEvidence {
-                        analysis,
-                        outcome: security::Outcome::Inconclusive,
-                        artifact_sha256: analysed.artifact_sha256.clone(),
-                        detail: "coverage-guided exploration did not complete".to_string(),
-                    },
-                );
-                continue;
-            }
-            coverage.fold(
-                &entry.id,
-                AnalysisEvidence {
-                    analysis,
-                    outcome: analysed.outcome,
-                    artifact_sha256: analysed.artifact_sha256.clone(),
-                    detail: analysed.message.clone(),
-                },
-            );
+            coverage.fold(&entry.id, fold_analysis(analysis, &analysed));
         }
     }
 
@@ -984,12 +986,7 @@ pub fn report_contract_coverage(
     // Backends are probed, because "the analyzer is missing" is part of the
     // answer to "what is outstanding".
     let valgrind = native::prepare_valgrind().is_ok();
-    let available = Available {
-        generated: valgrind,
-        explore: valgrind && coverage::LlvmTools::locate().is_ok(),
-        symbolic: false,
-        dynamic: valgrind,
-    };
+    let available = check_capabilities(valgrind, coverage::LlvmTools::locate().is_ok());
     let plan = Plan::resolve(&found, config, policy, &selected, &available, today);
     let coverage = Coverage::from_plan(&plan, &found);
     let provenance = coverage_report::Provenance {
@@ -1022,13 +1019,115 @@ pub fn read_contract_inventory(
     Ok(inventory::build_and_read(library, &target)?)
 }
 
+/// What `check` can do, as distinct from what this machine has.
+///
+/// `check` runs the generated family. `symbolic` evidence comes from
+/// `cargo trace-check verify` and `dynamic` from `cargo trace-check test`, so a
+/// requirement for either is reported as un-analyzed *and told where to get
+/// it*, rather than as a missing analyzer. An earlier revision hard-coded
+/// `symbolic: false`, which reported BACKEND_UNAVAILABLE for an analyzer that
+/// may well be installed -- a claim about the machine when the truth was a
+/// claim about the command.
+fn check_capabilities(valgrind: bool, tools: bool) -> Available {
+    let mut elsewhere = std::collections::BTreeMap::new();
+    elsewhere.insert(
+        Analysis::Symbolic,
+        "cargo trace-check verify --contract <id>".to_string(),
+    );
+    elsewhere.insert(Analysis::Dynamic, "cargo trace-check test".to_string());
+    Available {
+        generated: valgrind,
+        explore: valgrind && tools,
+        // Not probed, because this command does not run it either way.
+        symbolic: false,
+        dynamic: valgrind,
+        performs: vec![Analysis::Generated, Analysis::Explore],
+        elsewhere,
+    }
+}
+
 /// What analysing one contract produced.
 struct Analysed {
     outcome: security::Outcome,
     message: String,
     artifact_sha256: String,
-    /// Whether coverage-guided exploration ran and completed.
-    explored: bool,
+    /// Why requested exploration did not complete, when it did not.
+    ///
+    /// `Some` downgrades an otherwise-clean outcome for **every** requirement,
+    /// not just an `explore` one. See `fold_analysis`.
+    explore_incomplete: Option<String>,
+    /// The generated check's whole result, kept so the report can show finding
+    /// stacks, isolation, shrinking, controls and case counts rather than one
+    /// sentence about them.
+    check: check::ContractCheck,
+    /// Exploration evidence, when exploration ran.
+    discovery: Option<DiscoveryEvidence>,
+    /// Reproducers written for this contract's findings.
+    reproducers: Vec<String>,
+}
+
+/// Whether a failure is about one contract rather than about the run.
+///
+/// A contract whose descriptor cannot be read, whose harness cannot be
+/// generated, or whose harness will not compile is a fact about that
+/// declaration: the usual cause is a signature the generator cannot model or a
+/// function an external probe cannot reach. Those become that contract's
+/// status. A missing analyzer or an unreadable inventory is a fact about the
+/// run and would recur identically for every contract, so it still aborts.
+fn per_contract(error: &CheckRunError) -> bool {
+    matches!(
+        error,
+        CheckRunError::Harness(harness::HarnessError::Contract(_))
+            | CheckRunError::Harness(harness::HarnessError::Build { .. })
+            | CheckRunError::Harness(harness::HarnessError::SymbolMissing { .. })
+            | CheckRunError::Harness(harness::HarnessError::SymbolAmbiguous { .. })
+            | CheckRunError::Dynamic(dynamic_harness::DynamicError::Contract(_))
+            | CheckRunError::Dynamic(dynamic_harness::DynamicError::Build { .. })
+            | CheckRunError::Generate(_)
+            | CheckRunError::DescriptorDrift { .. }
+    )
+}
+
+/// One analysis's evidence from a completed run of one contract.
+///
+/// # Incomplete exploration downgrades every requirement
+///
+/// If exploration was requested and did not finish, a clean outcome becomes
+/// `INCONCLUSIVE` for whatever requirement it was about -- not only for an
+/// `explore` obligation. An earlier revision checked that flag solely when
+/// folding `Analysis::Explore`, so a contract whose policy required only
+/// `generated` while its configuration enabled exploration could have its
+/// search die early, fold a clean generated outcome, and pass strict CI. That
+/// is a regression from M7, where an incomplete required exploration turned
+/// satisfied into incomplete.
+///
+/// A detected leak is never downgraded. A finding from the security artifact
+/// does not depend on how its input was chosen, so it stands whatever the
+/// search did.
+fn fold_analysis(analysis: Analysis, analysed: &Analysed) -> AnalysisEvidence {
+    let leaked = analysed.outcome == security::Outcome::LeakDetected;
+    let (outcome, detail) = match &analysed.explore_incomplete {
+        _ if leaked => (analysed.outcome, analysed.message.clone()),
+        Some(reason) => (
+            security::Outcome::Inconclusive,
+            format!(
+                "coverage-guided exploration was requested and did not complete, so the inputs \
+                 this result describes are not the inputs the run was configured to search \
+                 for: {reason}. The security analysis itself was: {}",
+                analysed.message
+            ),
+        ),
+        None => (analysed.outcome, analysed.message.clone()),
+    };
+    AnalysisEvidence {
+        analysis,
+        outcome,
+        artifact_sha256: analysed.artifact_sha256.clone(),
+        detail,
+        check: Some(analysed.check.clone()),
+        discovery: analysed.discovery.clone(),
+        reproducers: analysed.reproducers.clone(),
+    }
 }
 
 fn apply_overrides(settings: &mut contract::CheckSettings, overrides: &CheckOverrides) {
@@ -1089,7 +1188,8 @@ fn analyse_one(
         &settings.generation(),
     )?;
 
-    let mut explored = false;
+    let mut explore_incomplete = None;
+    let mut discovery = None;
     let corpus = if settings.explore.enabled {
         // Unreachable by construction -- the caller locates the tools when any
         // contract asks for exploration -- and an error rather than a silent
@@ -1109,7 +1209,10 @@ fn analyse_one(
             &work_dir,
             &target_dir,
         )?;
-        explored = evidence.complete();
+        if !evidence.complete() {
+            explore_incomplete = Some(evidence.termination_detail.clone());
+        }
+        discovery = Some(evidence);
         corpus
     } else {
         baseline
@@ -1133,6 +1236,7 @@ fn analyse_one(
         generated.marked_bytes,
         &settings.budget(),
     )?;
+    let mut reproducers = Vec::new();
     if let Some(directory) = reproducer_dir {
         for (index, finding) in outcome.findings.iter().enumerate() {
             let record = Reproducer::from_finding(
@@ -1143,17 +1247,22 @@ fn analyse_one(
                 &artifact.sha256,
                 dynamic_harness::PROFILE,
             );
-            record.save(&directory.join(format!(
+            let path = directory.join(format!(
                 "{}-{index}.json",
                 declaration.id.replace("::", "-")
-            )))?;
+            ));
+            record.save(&path)?;
+            reproducers.push(path.display().to_string());
         }
     }
     Ok(Analysed {
         outcome: outcome.outcome,
-        message: outcome.message,
+        message: outcome.message.clone(),
         artifact_sha256: artifact.sha256,
-        explored,
+        explore_incomplete,
+        check: outcome,
+        discovery,
+        reproducers,
     })
 }
 
@@ -1258,4 +1367,113 @@ pub fn replay_reproducer(
         verdict,
         detail,
     ))
+}
+
+#[cfg(test)]
+mod fold_tests {
+    use super::*;
+
+    fn analysed(outcome: security::Outcome, explore_incomplete: Option<&str>) -> Analysed {
+        Analysed {
+            outcome,
+            message: "the security analysis said this".to_string(),
+            artifact_sha256: "artifact".to_string(),
+            explore_incomplete: explore_incomplete.map(str::to_string),
+            check: check::ContractCheck {
+                contract: "crypto::a::probe".to_string(),
+                function: "probe".to_string(),
+                secret_parameters: vec!["key".to_string()],
+                marked_bytes: 1,
+                outcome,
+                message: "the security analysis said this".to_string(),
+                calibration: check::Control::Confirmed,
+                binding: check::Control::Confirmed,
+                cases_planned: 64,
+                cases_executed: 64,
+                cases_completed: 64,
+                analyzer_runs: 2,
+                findings: Vec::new(),
+                unattributed: Vec::new(),
+                other_diagnostics: Vec::new(),
+            },
+            discovery: None,
+            reproducers: vec!["/tmp/a-0.json".to_string()],
+        }
+    }
+
+    /// An incomplete exploration downgrades a clean result for **every**
+    /// requirement, not only an `explore` one.
+    ///
+    /// The regression this pins: with `default_required = ["generated"]` and
+    /// exploration enabled in `[check]`, a search that died early folded a
+    /// clean generated outcome and passed strict CI. M7 downgraded a satisfied
+    /// result when required exploration was incomplete, and M8 must not undo
+    /// that.
+    #[test]
+    fn an_incomplete_exploration_downgrades_a_clean_generated_result() {
+        let evidence = fold_analysis(
+            Analysis::Generated,
+            &analysed(
+                security::Outcome::NoLeakObserved,
+                Some("the wall-clock limit was reached"),
+            ),
+        );
+        assert_eq!(evidence.outcome, security::Outcome::Inconclusive);
+        assert!(
+            evidence.detail.contains("did not complete"),
+            "{}",
+            evidence.detail
+        );
+        assert!(
+            evidence.detail.contains("wall-clock"),
+            "{}",
+            evidence.detail
+        );
+        // The security analysis's own words are kept, so the report says what
+        // was observed as well as why it is not enough.
+        assert!(
+            evidence.detail.contains("the security analysis said this"),
+            "{}",
+            evidence.detail
+        );
+    }
+
+    /// A detected leak is never downgraded by an incomplete search: a finding
+    /// does not depend on how its input was chosen.
+    #[test]
+    fn an_incomplete_exploration_never_downgrades_a_leak() {
+        let evidence = fold_analysis(
+            Analysis::Generated,
+            &analysed(security::Outcome::LeakDetected, Some("it died early")),
+        );
+        assert_eq!(evidence.outcome, security::Outcome::LeakDetected);
+        assert_eq!(evidence.detail, "the security analysis said this");
+    }
+
+    /// A complete exploration leaves the outcome alone.
+    #[test]
+    fn a_complete_exploration_does_not_downgrade_anything() {
+        for analysis in [Analysis::Generated, Analysis::Explore] {
+            let evidence =
+                fold_analysis(analysis, &analysed(security::Outcome::NoLeakObserved, None));
+            assert_eq!(evidence.outcome, security::Outcome::NoLeakObserved);
+            assert_eq!(evidence.detail, "the security analysis said this");
+        }
+    }
+
+    /// The backend's own evidence rides along, so a report can show findings,
+    /// controls, case counts and reproducers rather than a sentence about them.
+    #[test]
+    fn the_backends_evidence_is_preserved() {
+        let evidence = fold_analysis(
+            Analysis::Generated,
+            &analysed(security::Outcome::NoLeakObserved, None),
+        );
+        let check = evidence.check.expect("the generated result is attached");
+        assert_eq!(check.cases_completed, 64);
+        assert_eq!(check.analyzer_runs, 2);
+        assert_eq!(check.calibration, check::Control::Confirmed);
+        assert_eq!(check.binding, check::Control::Confirmed);
+        assert_eq!(evidence.reproducers, vec!["/tmp/a-0.json".to_string()]);
+    }
 }

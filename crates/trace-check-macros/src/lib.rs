@@ -165,7 +165,18 @@ fn expand_constant_time(args: SecretArgs, function: ItemFn) -> proc_macro2::Toke
     // The inventory record. Emitted unconditionally -- including under
     // `dynamic = false`, which is the whole point: a declaration must not
     // become invisible because its owner opted out of the test adapter.
-    let inventory = inventory_record(&name_literal, &descriptor, args.dynamic);
+    // `pub` is necessary for an external harness to name the function, and not
+    // sufficient -- a `pub fn` in a private module is unreachable too, which
+    // only the compiler knows. Recorded as a *necessary* condition so the
+    // read-only `coverage` command can report an obviously-unreachable
+    // contract without building a probe; the probe remains the authority.
+    let externally_nameable = matches!(function.vis, syn::Visibility::Public(_));
+    let inventory = inventory_record(
+        &name_literal,
+        &descriptor,
+        args.dynamic,
+        externally_nameable,
+    );
 
     let adapter_parts = match adapter_signature(&function, &args.secrets) {
         Ok(parts) => parts,
@@ -307,7 +318,12 @@ const INVENTORY_SCHEMA: u16 = 1;
 /// carries no such section, which is what makes "find the section" an exact
 /// question rather than a byte search that could also match a copy of the text
 /// held somewhere else.
-fn inventory_record(name: &str, descriptor: &str, dynamic: bool) -> proc_macro2::TokenStream {
+fn inventory_record(
+    name: &str,
+    descriptor: &str,
+    dynamic: bool,
+    externally_nameable: bool,
+) -> proc_macro2::TokenStream {
     let magic = INVENTORY_MAGIC;
     let schema = INVENTORY_SCHEMA;
     // As text for the JSON payload: an interpolated `u16` would `stringify!`
@@ -316,6 +332,7 @@ fn inventory_record(name: &str, descriptor: &str, dynamic: bool) -> proc_macro2:
     let header = magic.len() + 2 + 4;
     let section = INVENTORY_SECTION;
     let dynamic_literal = if dynamic { "true" } else { "false" };
+    let nameable_literal = if externally_nameable { "true" } else { "false" };
     quote! {
         // Anonymous, so the record text is not part of the crate's exported
         // metadata and the static's name cannot collide with anything.
@@ -330,6 +347,7 @@ fn inventory_record(name: &str, descriptor: &str, dynamic: bool) -> proc_macro2:
                 r#"","file":""#, file!(),
                 r#"","line":"#, line!(),
                 r#","dynamic":"#, #dynamic_literal,
+                r#","public":"#, #nameable_literal,
                 r#","descriptor":"#, #descriptor,
                 "}"
             );

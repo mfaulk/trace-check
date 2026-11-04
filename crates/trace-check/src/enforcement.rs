@@ -128,8 +128,7 @@ pub enum Status {
     Unsupported { reason: String },
     /// A known applicable contract was left out of the requested run.
     NotSelected,
-    /// Required, selected, supported, with its backend present -- and no
-    /// analysis reported a result for it.
+    /// Required, and no analysis reported a result for it.
     ///
     /// Every required analysis is given this status up front, so the status map
     /// is **total** over the requirements. An earlier revision left an
@@ -138,7 +137,12 @@ pub enum Status {
     /// `symbolic`, given only a generated run, reported no gaps and passed.
     /// A requirement that is silently absent from the accounting is the exact
     /// failure this milestone exists to prevent.
-    NotAnalyzed,
+    ///
+    /// `detail` distinguishes *nothing ran* from *this command does not run
+    /// it*. Reporting the second as [`Status::BackendUnavailable`] would be a
+    /// claim about the machine rather than about the command, and would send a
+    /// developer to install an analyzer they may already have.
+    NotAnalyzed { detail: String },
     /// The analyzer or instrumentation this analysis needs is absent.
     BackendUnavailable { backend: String },
     /// An explicit, policy-approved waiver of the *obligation*.
@@ -154,6 +158,25 @@ pub enum Status {
 }
 
 impl Status {
+    /// The default un-analyzed status: required, and nothing reported.
+    pub fn not_analyzed() -> Status {
+        Status::NotAnalyzed {
+            detail: "this analysis was required and no backend reported a result for it"
+                .to_string(),
+        }
+    }
+
+    /// Required, but not something this command performs.
+    pub fn not_performed(analysis: Analysis, command: &str) -> Status {
+        Status::NotAnalyzed {
+            detail: format!(
+                "`{analysis}` is required and this command does not run it; its evidence comes \
+                 from `{command}`. That is not the same as the analyzer being absent, which \
+                 would be reported as BACKEND_UNAVAILABLE"
+            ),
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Status::Checked => "CHECKED",
@@ -161,7 +184,7 @@ impl Status {
             Status::Inconclusive { .. } => "INCONCLUSIVE",
             Status::Unsupported { .. } => "UNSUPPORTED",
             Status::NotSelected => "NOT_SELECTED",
-            Status::NotAnalyzed => "NOT_ANALYZED",
+            Status::NotAnalyzed { .. } => "NOT_ANALYZED",
             Status::BackendUnavailable { .. } => "BACKEND_UNAVAILABLE",
             Status::Exempted { .. } => "EXEMPTED",
             Status::Inactive { .. } => "INACTIVE",
@@ -193,9 +216,7 @@ impl Status {
             Status::NotSelected => {
                 "this contract is applicable but was not part of the requested run".to_string()
             }
-            Status::NotAnalyzed => {
-                "this analysis was required and no backend reported a result for it".to_string()
-            }
+            Status::NotAnalyzed { detail } => detail.clone(),
             Status::BackendUnavailable { backend } => {
                 format!("{backend} is required for this analysis and was not available")
             }
@@ -220,7 +241,18 @@ impl Status {
 }
 
 /// What one backend actually observed, kept separate from the obligation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+///
+/// # Generic where the policy reads it, specific where a developer does
+///
+/// The policy layer only ever consults `outcome`, which is what keeps
+/// enforcement backend-independent. But a report that reduced a dynamic result
+/// to one sentence would lose the finding stacks, the leak site, the isolated
+/// input, the shrunk reproducer, the calibration controls, the case counts and
+/// the discovery provenance -- everything a developer needs to act on a
+/// failure. `check --all-contracts` is meant to become the standard CI
+/// interface, so the backend-specific evidence rides along in its own fields
+/// rather than being summarized away.
+#[derive(Debug, Clone, Serialize)]
 pub struct AnalysisEvidence {
     pub analysis: Analysis,
     pub outcome: Outcome,
@@ -228,6 +260,37 @@ pub struct AnalysisEvidence {
     /// build rather than about the library in general.
     pub artifact_sha256: String,
     pub detail: String,
+    /// The generated check's whole result, when a generated analysis produced
+    /// this evidence: findings, isolation, shrinking, controls, case counts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub check: Option<crate::check::ContractCheck>,
+    /// Exploration evidence, when coverage-guided discovery ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<crate::check_report::DiscoveryEvidence>,
+    /// Reproducers written for this contract's findings.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reproducers: Vec<String>,
+}
+
+impl AnalysisEvidence {
+    /// Evidence carrying only an outcome and a sentence, for a backend that
+    /// has nothing more structured to offer.
+    pub fn summary(
+        analysis: Analysis,
+        outcome: Outcome,
+        artifact_sha256: &str,
+        detail: &str,
+    ) -> AnalysisEvidence {
+        AnalysisEvidence {
+            analysis,
+            outcome,
+            artifact_sha256: artifact_sha256.to_string(),
+            detail: detail.to_string(),
+            check: None,
+            discovery: None,
+            reproducers: Vec::new(),
+        }
+    }
 }
 
 /// Enforcement mode.
@@ -350,8 +413,23 @@ fn parse_date(text: &str) -> Result<(u32, u32, u32), String> {
         number(month, "month")?,
         number(day, "day")?,
     );
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return Err(format!("`expires` names an impossible date: {text:?}"));
+    if !(1..=12).contains(&month) {
+        return Err(format!("`expires` names month {month}: {text:?}"));
+    }
+    // Real month lengths, not 1..=31 independently: `2027-02-31` passed the
+    // looser check, and an exemption with an impossible expiry is one whose
+    // lapse nobody will notice.
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let longest = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        _ => 28,
+    };
+    if !(1..=longest).contains(&day) {
+        return Err(format!(
+            "`expires` names day {day} of a month with {longest}: {text:?}"
+        ));
     }
     Ok((year, month, day))
 }
@@ -389,6 +467,19 @@ pub struct PolicyConfig {
     /// is a broken selection that found none, and the two must not look alike.
     #[serde(default)]
     pub allow_empty_inventory: bool,
+    /// Whether configuration naming no active declaration may be tolerated.
+    ///
+    /// False by default, because a typo, a renamed function and a removed one
+    /// all look identical from the configuration's side and only a developer
+    /// can tell which it is.
+    ///
+    /// Set it when **one** configuration file deliberately serves several
+    /// build variants: entries for feature-gated contracts are then reported
+    /// as `inactive` for the variants that do not compile them, rather than
+    /// blocking. It is a statement that the unmatched entries are expected,
+    /// which is why it has to be written down rather than inferred.
+    #[serde(default)]
+    pub allow_inactive_config: bool,
     #[serde(default)]
     pub contracts: BTreeMap<String, ContractPolicy>,
     #[serde(default)]
@@ -405,6 +496,7 @@ impl Default for PolicyConfig {
             mode: Mode::default(),
             default_required: default_required(),
             allow_empty_inventory: false,
+            allow_inactive_config: false,
             contracts: BTreeMap::new(),
             exemptions: Vec::new(),
         }
@@ -687,6 +779,23 @@ fn settle(
         if let Err(reason) = generated_support(&declaration.descriptor) {
             return Some(Status::Unsupported { reason });
         }
+        // A function that is not `pub` cannot be named by the external probe
+        // harness the generated backend builds. Settled here so the read-only
+        // `coverage` command reports it too, and so the declaration gets a
+        // status rather than the run getting an error. `pub` is necessary and
+        // not sufficient -- a `pub fn` in a private module is unreachable as
+        // well -- so the probe remains the authority and reports that case
+        // per contract.
+        if !declaration.externally_nameable {
+            return Some(Status::Unsupported {
+                reason: format!(
+                    "`{}` is not `pub`, so the generated harness -- which is a separate crate \
+                     that calls the real function -- cannot name it. Make it `pub`, or exempt \
+                     the obligation with a reason",
+                    declaration.id
+                ),
+            });
+        }
     }
     // Symbolic verification needs declared bounds -- an exploration depth and
     // an observation model -- which cannot be inferred from a signature. A
@@ -716,6 +825,16 @@ fn settle(
     }
     if !selected {
         return Some(Status::NotSelected);
+    }
+    // Not something this command runs. Distinguished from an absent analyzer
+    // on purpose; see `Available::performs`.
+    if !available.performs(analysis) {
+        let command = available
+            .elsewhere
+            .get(&analysis)
+            .cloned()
+            .unwrap_or_else(|| "another trace-check command".to_string());
+        return Some(Status::not_performed(analysis, &command));
     }
     if !available.has(analysis) {
         return Some(Status::BackendUnavailable {
@@ -794,18 +913,36 @@ pub struct Available {
     pub explore: bool,
     pub symbolic: bool,
     pub dynamic: bool,
+    /// Analyses the *command* performs, as distinct from backends present.
+    ///
+    /// `check` runs the generated family; `symbolic` evidence comes from
+    /// `verify` and `dynamic` from `test`. Conflating the two would report
+    /// BACKEND_UNAVAILABLE for an analyzer that is installed and simply not
+    /// invoked here, sending a developer to fix their machine instead of
+    /// running the other command.
+    pub performs: Vec<Analysis>,
+    /// The command that would run an analysis this one does not, named in the
+    /// status so the report is actionable.
+    pub elsewhere: BTreeMap<Analysis, String>,
 }
 
 impl Available {
-    /// Everything present. The usual case on a developer machine with the
-    /// backends installed.
+    /// Everything present, and every analysis performed. The shape a test
+    /// uses when the question is not about availability.
     pub fn all() -> Available {
         Available {
             generated: true,
             explore: true,
             symbolic: true,
             dynamic: true,
+            performs: Analysis::all().to_vec(),
+            elsewhere: BTreeMap::new(),
         }
+    }
+
+    /// Whether this command runs `analysis` at all.
+    pub fn performs(&self, analysis: Analysis) -> bool {
+        self.performs.contains(&analysis)
     }
 
     pub fn has(&self, analysis: Analysis) -> bool {
@@ -879,7 +1016,7 @@ impl ContractCoverage {
                     .status
                     .get(analysis)
                     .cloned()
-                    .unwrap_or(Status::NotAnalyzed);
+                    .unwrap_or_else(Status::not_analyzed);
                 (!status.satisfied() && !status.violation()).then_some((*analysis, status))
             })
             .collect()
@@ -928,7 +1065,7 @@ impl Coverage {
                                 .settled
                                 .get(analysis)
                                 .cloned()
-                                .unwrap_or(Status::NotAnalyzed);
+                                .unwrap_or_else(Status::not_analyzed);
                             (*analysis, status)
                         })
                         .collect(),
@@ -986,6 +1123,25 @@ impl Coverage {
             contract.status.insert(analysis, status);
         }
         contract.evidence.push(evidence);
+    }
+
+    /// Records a status for one requirement without any backend evidence.
+    ///
+    /// For a failure that *is* the answer: a contract whose harness cannot be
+    /// built has no outcome to fold, and its status is the reason why. A
+    /// recorded leak is still never overwritten.
+    pub fn note(&mut self, id: &str, analysis: Analysis, status: Status) {
+        let Some(contract) = self.contracts.iter_mut().find(|entry| entry.id == id) else {
+            return;
+        };
+        if contract
+            .status
+            .get(&analysis)
+            .is_some_and(Status::violation)
+        {
+            return;
+        }
+        contract.status.insert(analysis, status);
     }
 
     pub fn contract(&self, id: &str) -> Option<&ContractCoverage> {
@@ -1076,11 +1232,13 @@ impl Coverage {
                 ));
             }
         }
-        for entry in &self.stale {
-            blocking.push(format!(
-                "[{}.\"{}\"]: {}",
-                entry.source, entry.contract, entry.detail
-            ));
+        if !policy.allow_inactive_config {
+            for entry in &self.stale {
+                blocking.push(format!(
+                    "[{}.\"{}\"]: {}",
+                    entry.source, entry.contract, entry.detail
+                ));
+            }
         }
         blocking
     }
@@ -1142,6 +1300,7 @@ pub mod test_support {
             source_file: "src/lib.rs".to_string(),
             source_line: 7,
             dynamic_adapter_enabled: true,
+            externally_nameable: true,
             descriptor: crate::contract::Descriptor::parse(json).expect("parses"),
             descriptor_json: json.to_string(),
             descriptor_sha256: "sha".to_string(),
@@ -1198,6 +1357,7 @@ mod tests {
             source_file: "src/lib.rs".to_string(),
             source_line: 7,
             dynamic_adapter_enabled: true,
+            externally_nameable: true,
             descriptor: descriptor(secret_bool),
             descriptor_json: "{}".to_string(),
             descriptor_sha256: "sha".to_string(),
@@ -1230,12 +1390,7 @@ mod tests {
     }
 
     fn evidence(analysis: Analysis, outcome: Outcome) -> AnalysisEvidence {
-        AnalysisEvidence {
-            analysis,
-            outcome,
-            artifact_sha256: "artifact".to_string(),
-            detail: "detail".to_string(),
-        }
+        AnalysisEvidence::summary(analysis, outcome, "artifact", "detail")
     }
 
     fn resolved(
@@ -1727,6 +1882,128 @@ mod tests {
         );
     }
 
+    /// A contract on a function that is not `pub` is reported UNSUPPORTED for
+    /// its generated requirement, and the other contracts are still checked.
+    #[test]
+    fn a_private_contract_is_unsupported_rather_than_fatal() {
+        let private = ContractDeclaration {
+            externally_nameable: false,
+            ..declaration("crypto::inner::probe", false)
+        };
+        let found = inventory_with(vec![declaration("crypto::a::probe", false), private]);
+        let policy = PolicyConfig::default();
+        let plan = Plan::resolve(
+            &found,
+            &VerifyConfig::empty(),
+            &policy,
+            &[
+                "crypto::a::probe".to_string(),
+                "crypto::inner::probe".to_string(),
+            ],
+            &Available::all(),
+            TODAY,
+        );
+        let inner = plan
+            .entries
+            .iter()
+            .find(|entry| entry.id == "crypto::inner::probe")
+            .expect("the private declaration is in the plan");
+        match inner.settled.get(&Analysis::Generated) {
+            Some(Status::Unsupported { reason }) => {
+                assert!(reason.contains("not `pub`"), "{reason}")
+            }
+            other => panic!("expected UNSUPPORTED, got {other:?}"),
+        }
+        // The public one is still asked for, so one unanalyzable declaration
+        // does not stop the run.
+        let outer = plan
+            .entries
+            .iter()
+            .find(|entry| entry.id == "crypto::a::probe")
+            .expect("the public declaration is in the plan");
+        assert!(!outer.settled.contains_key(&Analysis::Generated));
+        assert!(outer.required.contains(&Analysis::Generated));
+    }
+
+    /// A date that passes a digit-range check but does not exist is rejected.
+    #[test]
+    fn an_impossible_calendar_date_is_rejected() {
+        for bad in [
+            "2027-02-31",
+            "2027-02-29",
+            "2027-04-31",
+            "2027-06-31",
+            "2027-09-31",
+            "2027-11-31",
+        ] {
+            let exemption = Exemption {
+                contract: "crypto::a::probe".to_string(),
+                analyses: vec![Analysis::Generated],
+                reason: "a reason".to_string(),
+                tracking: None,
+                never_expires: false,
+                expires: Some(bad.to_string()),
+            };
+            assert!(
+                exemption.validate(Mode::Strict).is_err(),
+                "{bad:?} was accepted as a date"
+            );
+        }
+        // A leap day that does exist is accepted.
+        let leap = Exemption {
+            contract: "crypto::a::probe".to_string(),
+            analyses: vec![Analysis::Generated],
+            reason: "a reason".to_string(),
+            tracking: None,
+            never_expires: false,
+            expires: Some("2028-02-29".to_string()),
+        };
+        assert!(leap.validate(Mode::Strict).is_ok());
+    }
+
+    /// Configuration naming no active declaration blocks by default, and is
+    /// tolerated only when the policy says one file serves several variants.
+    #[test]
+    fn inactive_configuration_is_tolerated_only_when_declared() {
+        let mut config = VerifyConfig::empty();
+        config
+            .check
+            .insert("crypto::gated::probe".to_string(), Default::default());
+        let found = inventory(&["crypto::a::probe"]);
+        let resolve = |policy: &PolicyConfig| {
+            let plan = Plan::resolve(
+                &found,
+                &config,
+                policy,
+                &["crypto::a::probe".to_string()],
+                &Available::all(),
+                TODAY,
+            );
+            let mut coverage = Coverage::from_plan(&plan, &found);
+            coverage.fold(
+                "crypto::a::probe",
+                evidence(Analysis::Generated, Outcome::NoLeakObserved),
+            );
+            coverage.blocking(&found, policy)
+        };
+        let strict = PolicyConfig::default();
+        assert!(
+            resolve(&strict)
+                .iter()
+                .any(|reason| reason.contains("crypto::gated::probe")),
+            "unmatched configuration must block by default"
+        );
+        let permissive = PolicyConfig {
+            allow_inactive_config: true,
+            ..PolicyConfig::default()
+        };
+        assert!(
+            resolve(&permissive).is_empty(),
+            "{:?}",
+            resolve(&permissive)
+        );
+    }
+
     /// An empty inventory does not pass strict enforcement unless the policy
     /// says the emptiness is intentional.
     #[test]
@@ -1941,8 +2218,14 @@ mod tests {
         // `generated` and `dynamic` await a backend; `symbolic` was already
         // settled, because it needs declared bounds this configuration has
         // none of. Either way, none of them is absent.
-        assert_eq!(contract.status[&Analysis::Generated], Status::NotAnalyzed);
-        assert_eq!(contract.status[&Analysis::Dynamic], Status::NotAnalyzed);
+        assert!(matches!(
+            contract.status[&Analysis::Generated],
+            Status::NotAnalyzed { .. }
+        ));
+        assert!(matches!(
+            contract.status[&Analysis::Dynamic],
+            Status::NotAnalyzed { .. }
+        ));
         assert!(matches!(
             contract.status[&Analysis::Symbolic],
             Status::Inconclusive { .. }
@@ -2071,6 +2354,91 @@ mod tests {
             other => panic!("unexpected status: {other:?}"),
         }
         assert!(!coverage.blocking(&found, &policy).is_empty());
+    }
+
+    /// An analysis this command does not run is NOT_ANALYZED and says where to
+    /// get it, rather than BACKEND_UNAVAILABLE.
+    ///
+    /// The two are different claims: the first is about the command, the
+    /// second about the machine. An earlier revision hard-coded `symbolic` as
+    /// unavailable, which sent a developer to install an analyzer they may
+    /// already have had.
+    #[test]
+    fn an_analysis_this_command_does_not_run_says_where_to_get_it() {
+        let mut policy = PolicyConfig::default();
+        policy.contracts.insert(
+            "crypto::a::probe".to_string(),
+            ContractPolicy {
+                required: Some(vec![Analysis::Generated, Analysis::Symbolic]),
+            },
+        );
+        // What `check` can do: the generated family, with symbolic evidence
+        // coming from `verify`.
+        let mut elsewhere = BTreeMap::new();
+        elsewhere.insert(Analysis::Symbolic, "cargo trace-check verify".to_string());
+        let capabilities = Available {
+            generated: true,
+            explore: true,
+            symbolic: false,
+            dynamic: true,
+            performs: vec![Analysis::Generated, Analysis::Explore],
+            elsewhere,
+        };
+        // A `[verify]` entry exists, so the requirement is not settled for
+        // want of declared bounds.
+        let mut config = VerifyConfig::empty();
+        // Deserialized rather than constructed: `CheckFeature` is private to
+        // the contract module, and a settings value built field-by-field here
+        // would drift from what a real configuration means.
+        config.verify.insert(
+            "crypto::a::probe".to_string(),
+            toml::from_str(
+                "max_depth = 4000\nchecks = [\"control-flow\"]\n\
+                 expected_outcome = \"VERIFIED_BOUNDED\"\n",
+            )
+            .expect("the fixture settings parse"),
+        );
+
+        let found = inventory(&["crypto::a::probe"]);
+        let plan = Plan::resolve(
+            &found,
+            &config,
+            &policy,
+            &["crypto::a::probe".to_string()],
+            &capabilities,
+            TODAY,
+        );
+        let coverage = Coverage::from_plan(&plan, &found);
+        let contract = coverage.contract("crypto::a::probe").expect("the contract");
+        match &contract.status[&Analysis::Symbolic] {
+            Status::NotAnalyzed { detail } => {
+                assert!(detail.contains("cargo trace-check verify"), "{detail}");
+                assert!(
+                    detail.contains("not the same as the analyzer being absent"),
+                    "{detail}"
+                );
+            }
+            other => panic!("expected NOT_ANALYZED with a pointer, got {other:?}"),
+        }
+        // And a genuinely absent backend still reports as absent.
+        let absent = Available {
+            generated: false,
+            performs: vec![Analysis::Generated],
+            ..capabilities.clone()
+        };
+        let plan = Plan::resolve(
+            &found,
+            &config,
+            &policy,
+            &["crypto::a::probe".to_string()],
+            &absent,
+            TODAY,
+        );
+        let coverage = Coverage::from_plan(&plan, &found);
+        assert!(matches!(
+            coverage.contract("crypto::a::probe").expect("c").status[&Analysis::Generated],
+            Status::BackendUnavailable { .. }
+        ));
     }
 
     /// Every analysis name round-trips, so a configuration cannot silently
