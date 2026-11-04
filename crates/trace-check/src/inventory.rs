@@ -88,6 +88,15 @@ pub struct ContractDeclaration {
     /// `dynamic = false` contract is inventoried like any other, which is the
     /// asymmetry M8 exists to remove.
     pub dynamic_adapter_enabled: bool,
+    /// Whether the function itself is `pub`.
+    ///
+    /// A **necessary** condition for an external harness to name it, and not a
+    /// sufficient one: a `pub fn` inside a private module is unreachable too,
+    /// and the macro cannot see the module's visibility. So this lets the
+    /// read-only `coverage` command report an obviously-unreachable contract
+    /// without building a probe, while the probe stays the authority on
+    /// reachability.
+    pub externally_nameable: bool,
     /// The descriptor the macro derived from this function's own signature.
     pub descriptor: Descriptor,
     /// That descriptor's exact bytes, so a report can pin what was read.
@@ -238,6 +247,10 @@ fn build_library(library: &Library, target_dir: &Path) -> Result<PathBuf, Invent
             "--release",
             "--lib",
             "--message-format=json-render-diagnostics",
+            // Predictable text whatever `CARGO_TERM_COLOR` is set to. The
+            // ambient setting is not ours -- this project's own CI sets
+            // `always` -- and ANSI escapes made the diagnostic unselectable.
+            "--color=never",
         ])
         .arg("--manifest-path")
         .arg(&library.manifest_path)
@@ -494,6 +507,9 @@ fn decode(payload: &str) -> Result<ContractDeclaration, SectionError> {
         dynamic_adapter_enabled: value["dynamic"]
             .as_bool()
             .ok_or_else(|| SectionError::MissingField("dynamic".to_string()))?,
+        externally_nameable: value["public"]
+            .as_bool()
+            .ok_or_else(|| SectionError::MissingField("public".to_string()))?,
         descriptor_sha256: format!("{:x}", Sha256::digest(descriptor_json.as_bytes())),
         descriptor,
         descriptor_json,
@@ -756,12 +772,7 @@ impl fmt::Display for InventoryError {
             InventoryError::Build { stderr } => write!(
                 f,
                 "building the library for its contract inventory failed:\n{}",
-                stderr
-                    .lines()
-                    .filter(|line| !line.trim_start().starts_with("Compiling"))
-                    .take(12)
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                crate::native::compiler_diagnostics(stderr, 24)
             ),
             InventoryError::NoArtifact {
                 package,
@@ -831,7 +842,7 @@ mod tests {
 
     fn payload(id: &str) -> String {
         format!(
-            r#"{{"schema_version":1,"id":"{id}","module":"crypto::shadow","function":"probe","file":"src/shadow.rs","line":7,"dynamic":false,"descriptor":{DESCRIPTOR}}}"#
+            r#"{{"schema_version":1,"id":"{id}","module":"crypto::shadow","function":"probe","file":"src/shadow.rs","line":7,"dynamic":false,"public":true,"descriptor":{DESCRIPTOR}}}"#
         )
     }
 
@@ -901,7 +912,7 @@ mod tests {
     /// no usable signature behind it is not a declaration.
     #[test]
     fn an_unusable_descriptor_is_refused() {
-        let broken = r#"{"schema_version":1,"id":"a::b","module":"a","function":"b","file":"f","line":1,"dynamic":true,"descriptor":{"schema_version":99}}"#;
+        let broken = r#"{"schema_version":1,"id":"a::b","module":"a","function":"b","file":"f","line":1,"dynamic":true,"public":true,"descriptor":{"schema_version":99}}"#;
         let section = framed(1, broken);
         let error = parse_records(&section).expect_err("a bad descriptor must be refused");
         assert!(error.describe().contains("descriptor"), "{error:?}");

@@ -923,6 +923,63 @@ fn run_bounded_with_env(
     })
 }
 
+/// Extracts the compiler's own diagnostics from a failed `cargo build`'s
+/// stderr.
+///
+/// With `--message-format=json-render-diagnostics`, Cargo renders rustc's
+/// diagnostics itself and writes them to **stderr**, interleaved after its
+/// progress lines. Two things made a naive reader lose them, and CI caught
+/// both at once:
+///
+/// * `CARGO_TERM_COLOR=always` -- which this project's own workflow sets --
+///   prefixes every progress line with ANSI escapes, so filtering on
+///   `starts_with("Compiling")` matched nothing;
+/// * taking the first N lines truncated before the diagnostic, because a busy
+///   machine emits any number of `Blocking waiting for file lock` lines first.
+///
+/// So this selects **from the first diagnostic line onward** rather than from
+/// the top, and callers pass `--color=never` so the text is predictable
+/// regardless of the ambient setting. A developer whose annotation does not
+/// compile has to be told why.
+pub fn compiler_diagnostics(stderr: &str, limit: usize) -> String {
+    // Cargo's progress vocabulary. Anything else at the start of a line is
+    // either a diagnostic or part of one.
+    const PROGRESS: [&str; 8] = [
+        "Compiling",
+        "Blocking",
+        "Updating",
+        "Locking",
+        "Downloading",
+        "Downloaded",
+        "Adding",
+        "Finished",
+    ];
+    let interesting = |line: &str| {
+        let trimmed = line.trim_start();
+        !trimmed.is_empty() && !PROGRESS.iter().any(|word| trimmed.starts_with(word))
+    };
+    let lines: Vec<&str> = stderr.lines().collect();
+    // From the first line that is not Cargo progress. Everything after it is
+    // kept in order, so a multi-line diagnostic stays readable.
+    let start = lines.iter().position(|line| interesting(line));
+    match start {
+        Some(start) => lines[start..]
+            .iter()
+            .take(limit)
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n"),
+        // Nothing but progress lines: say that rather than echoing them, so
+        // the message does not look like a diagnostic that happens to be
+        // unhelpful.
+        None => format!(
+            "cargo reported a build failure but emitted no diagnostic. Its output was {} \
+             progress line(s) only",
+            lines.len()
+        ),
+    }
+}
+
 /// Reads a tool's self-reported version, for provenance.
 ///
 /// Public because the generated-testing backend records the same three tools
@@ -937,6 +994,77 @@ pub fn tool_version(program: &Path, args: &[&str]) -> Result<String, String> {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::compiler_diagnostics;
+
+    /// The diagnostic is selected from after Cargo's progress lines, however
+    /// many of them there are.
+    ///
+    /// The CI failure this pins: a busy machine emitted enough `Blocking
+    /// waiting for file lock` lines to push the real error past a
+    /// first-N-lines reader, which then reported compilation progress as
+    /// though it were the explanation.
+    #[test]
+    fn the_diagnostic_survives_a_long_progress_preamble() {
+        let mut stderr = String::new();
+        for _ in 0..30 {
+            stderr.push_str("    Blocking waiting for file lock on package cache\n");
+        }
+        stderr.push_str("   Compiling syn v2.0.119\n");
+        stderr.push_str("error: the declared secret `bytes` is a slice\n");
+        stderr.push_str("  --> src/lib.rs:4:1\n");
+        let found = compiler_diagnostics(&stderr, 24);
+        assert!(found.starts_with("error: the declared secret"), "{found}");
+        assert!(found.contains("src/lib.rs:4:1"), "{found}");
+        assert!(!found.contains("Blocking"), "{found}");
+        assert!(!found.contains("Compiling"), "{found}");
+    }
+
+    /// Colorized progress lines are still recognized as progress.
+    ///
+    /// `CARGO_TERM_COLOR=always` -- which this project's workflow sets --
+    /// prefixes them with ANSI escapes, which is why matching on
+    /// `starts_with("Compiling")` found nothing and the filter silently did
+    /// not apply. Callers now pass `--color=never`; this keeps the reader
+    /// honest if one forgets.
+    #[test]
+    fn a_colorized_preamble_does_not_hide_the_diagnostic() {
+        let stderr = concat!(
+            "\u{1b}[1m\u{1b}[92m   Compiling\u{1b}[0m tc-diag v0.0.0\n",
+            "error: something went wrong\n",
+        );
+        let found = compiler_diagnostics(stderr, 24);
+        // The colorized line is not matched by the progress words, so it is
+        // kept -- but the diagnostic is present either way, which is the
+        // property that matters.
+        assert!(found.contains("error: something went wrong"), "{found}");
+    }
+
+    /// Output that is nothing but progress says so, rather than echoing it as
+    /// though it were an explanation.
+    #[test]
+    fn progress_only_output_is_reported_as_having_no_diagnostic() {
+        let stderr = "   Compiling a v1.0.0\n    Blocking waiting for file lock\n";
+        let found = compiler_diagnostics(stderr, 24);
+        assert!(found.contains("emitted no diagnostic"), "{found}");
+        assert!(found.contains("2 progress line(s)"), "{found}");
+    }
+
+    /// A long diagnostic is bounded, so a pathological build cannot flood the
+    /// report.
+    #[test]
+    fn a_long_diagnostic_is_bounded() {
+        let mut stderr = String::from("error: first\n");
+        for index in 0..200 {
+            stderr.push_str(&format!("note: line {index}\n"));
+        }
+        let found = compiler_diagnostics(&stderr, 24);
+        assert_eq!(found.lines().count(), 24);
+        assert!(found.starts_with("error: first"));
+    }
 }
 
 #[cfg(test)]

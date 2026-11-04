@@ -39,7 +39,12 @@ the compilation: `#[constant_time]` emits a `#[used]` static into
 magic(8) = "TCCONTR1" | schema(u16 LE) | length(u32 LE) | payload(UTF-8 JSON)
 ```
 
-and the reader parses the `ar` archive and the ELF objects inside it.
+and the reader parses the `ar` archive and the ELF objects inside it. The
+payload carries the declaration's identity, source site, `dynamic` flag,
+whether the function is `pub`, and the same descriptor the contract constant
+holds. A record missing any field refuses the **whole** inventory, so a macro
+and a reader that disagree about the payload fail loudly rather than yielding a
+short inventory.
 
 The spike passes the whole matrix, including the four prerequisites singled out
 as blocking: `dynamic = false`, `no_std`, feature gating, and multiple codegen
@@ -161,7 +166,7 @@ nothing merges their evidence.
 | `INCONCLUSIVE` | it ran but did not establish the required outcome |
 | `UNSUPPORTED` | the declared function cannot be analyzed by that backend |
 | `NOT_SELECTED` | applicable, and left out of the requested run |
-| `NOT_ANALYZED` | required, runnable, and no backend reported a result |
+| `NOT_ANALYZED` | required, runnable, and no backend reported a result — carrying *why*, so an analysis that was never requested is distinguishable from one that ran and reported nothing |
 | `BACKEND_UNAVAILABLE` | the analyzer or instrumentation is absent |
 | `EXEMPTED` | an explicit, policy-approved waiver of the obligation |
 | `INACTIVE` | belongs to another build variant |
@@ -196,6 +201,14 @@ heavyweight backend, so these are all reported up front:
 
 * an unsupported signature — the same conditions `dynamic_harness::generate`
   enforces, asked before anything is built;
+* a function that is not `pub`, which the generated harness — a separate crate
+  calling the real function — cannot name. Recorded by the macro as a
+  *necessary* condition for external callability, not a sufficient one: a
+  `pub fn` in a private module is unreachable too, and only the compiler knows,
+  so the built probe remains the authority and reports that case per contract.
+  Settling it here keeps one uncallable declaration from taking the whole run
+  down with a link error, and lets the read-only `coverage` command report it
+  without building anything;
 * a missing analyzer;
 * a `symbolic` requirement with no `[verify."…"]` entry, since a bounded search
   needs a declared depth and observation model that cannot be inferred from a
@@ -240,9 +253,9 @@ expires = "2027-03-01"
 | empty `analyses` is refused | a blanket waiver has to be written out, not inferred from an omission |
 | a missing `reason` is refused | a waiver without one is indistinguishable from an unenforced contract |
 | strict mode requires `expires` or `never_expires = true` | so a temporary waiver cannot quietly become permanent |
-| a malformed date is a configuration error | otherwise a typo is a waiver that never lapses |
+| a malformed or impossible date is a configuration error | otherwise a typo is a waiver that never lapses. Checked against real month lengths, because `2027-02-31` passes a digit-range test and never arrives |
 | an expired waiver is the gap it always was | reported with its reason and the date it lapsed |
-| a waiver naming no active declaration is **stale** | it waives nothing, and only the developer knows whether that is a typo or a feature-gated contract |
+| a waiver naming no active declaration is **stale** | it waives nothing, and only the developer knows whether that is a typo or a feature-gated contract. `allow_inactive_config = true` is how they say the latter |
 | waived obligations are excluded from the checked total | a waiver cannot inflate the proportion actually checked |
 
 **The central rule:** a waiver is applied at plan time, where no analysis has
@@ -280,7 +293,8 @@ so `--all-contracts` goes through its own orchestration and emits schema 2.
 [policy]
 mode = "strict"                   # or "advisory"
 default_required = ["generated"]  # symbolic is not required of everything
-allow_empty_inventory = false
+allow_empty_inventory = false   # an empty inventory is not silently a pass
+allow_inactive_config = false   # one config file across feature variants
 
 [policy.contracts."crypto::tag::verify_tag"]
 required = ["generated", "symbolic"]

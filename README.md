@@ -560,10 +560,11 @@ declaration gets an explicit status per required analysis:
 | `CHECKED` | the required analysis completed and passed |
 | `LEAK_DETECTED` | the required security property was violated |
 | `INCONCLUSIVE` | it ran and did not establish the required outcome |
-| `UNSUPPORTED` | the signature cannot be analyzed by that backend |
+| `UNSUPPORTED` | the declaration cannot be analyzed by that backend — an unmodellable signature, or a function that is not `pub` and so cannot be named by the generated harness |
 | `NOT_SELECTED` | applicable, and left out of the run |
-| `NOT_ANALYZED` | required, runnable, and no backend reported a result |
+| `NOT_ANALYZED` | required, runnable, and no backend reported a result — carrying why, so "not requested" is distinguishable from "ran and said nothing" |
 | `BACKEND_UNAVAILABLE` | the analyzer or instrumentation is absent |
+| `INACTIVE` | configured, and not compiled into the selected build |
 | `EXEMPTED` | an explicit, policy-approved waiver |
 
 A status is *not* a security outcome. It says whether a required analysis
@@ -586,7 +587,8 @@ cargo trace-check coverage --format json
 [policy]
 mode = "strict"                   # or "advisory"
 default_required = ["generated"]  # symbolic is not required of everything
-allow_empty_inventory = false
+allow_empty_inventory = false   # an empty inventory is not silently a pass
+allow_inactive_config = false   # one config file across feature variants
 
 [policy.contracts."crypto::tag::verify_tag"]
 required = ["generated", "symbolic"]
@@ -607,9 +609,17 @@ unsupported signature otherwise has one way to make CI pass, which is to delete
 the annotation and the security requirement with it. They are deliberately
 awkward to write — an empty `analyses` list is refused rather than read as
 waiving everything, a missing `reason` is refused, strict mode wants an `expires`
-date or an explicit `never_expires`, a malformed date is a configuration error
-rather than a waiver that never lapses, and a waiver naming no active
-declaration is reported as stale.
+date or an explicit `never_expires`, a malformed or impossible date
+(`2027-02-31`, which has no February 31st) is a configuration error rather than
+a waiver that never lapses, and a waiver naming no active declaration is
+reported as stale.
+
+Stale configuration blocks, because a typo, a renamed function and a removed one
+look identical from the configuration's side. `allow_inactive_config = true` is
+for the one case where they do not: a single `trace-check.toml` deliberately
+serving several feature variants, where entries for contracts the selected build
+does not compile are then reported `INACTIVE` rather than blocking. It has to be
+written down because only a developer knows which situation it is.
 
 **A waiver waives the obligation to perform an analysis. It never waives or
 erases what an analysis found.** It is applied before anything runs, evidence is
