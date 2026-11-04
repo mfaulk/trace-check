@@ -166,7 +166,7 @@ Measurements in
 | `src/controls.rs` | the seven controls and the negative control |
 | `src/hidden.rs` | the M9.7 fixtures: leaks behind public predicates |
 | `src/sink.rs` | the fixed-work 32-byte fold |
-| `tests/functional.rs` | all three operations against the independent oracle |
+| `tests/functional.rs` | all three operations against the independent oracle, at full width |
 | `tests/vectors/generated.rs` | 1012 committed vectors, from `ci/gen-m9-vectors.py` |
 | `trace-check.toml` | per-contract description, rationale and expected outcome |
 | `Cargo.lock` | committed; the audit's claim is about one resolved graph |
@@ -179,6 +179,14 @@ and the sink's all-bytes property. **No side-channel result in this example is
 interpreted before those pass** — an adapter that mishandles byte order or
 builds the wrong Montgomery value leaves the checker reporting on a function
 nobody asked about.
+
+The vectors compare the operation's **complete 32-byte result**, not the
+adapter's one-byte return value. The sink maps 2^256 results onto 256 values
+and, being linear, admits exact cancellation between two byte changes — so each
+operation has a helper (`add::wrapping_add_bytes`, `select::ct_select_bytes`,
+`monty::mul_bytes`) returning the full result, the annotated adapter folds that
+helper's output, and the tests compare the helper. One code path, two
+consumers.
 
 Regenerate the fixture with `python3 ci/gen-m9-vectors.py`; CI runs
 `--check` so it cannot drift from the generator.

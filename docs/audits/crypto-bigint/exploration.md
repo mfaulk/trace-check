@@ -36,10 +36,24 @@ expected to be found by nothing.
 | Configuration | Planted found | Which | Total time |
 | --- | --- | --- | --- |
 | `m6-default` | **2 / 5** | `boundary_gate`, `decoded_address_probe` | 93 s |
-| `m6-random-10x` | **1 / 5** | `decoded_address_probe` | 280 s |
-| `m7-explore` | **3 / 5** | the above plus `nested_modes` | 1185 s |
+| `m6-random-10x` | **1 / 5** | `decoded_address_probe` | 280–350 s |
+| `m7-explore` | **3 / 5** | the above plus `nested_modes` | 146–1185 s |
 
 No configuration reported a finding on either clean fixture.
+
+The detection columns are stable across runs; the `m7-explore` total is not,
+and the spread is the whole story about its cost — see below. Both numbers are
+from the same machine on the same fixtures: the difference is whether the
+instrumented artifacts were already built.
+
+These are **asserted**, not just reported. `ci/benchmark-m9.py` exits non-zero
+if `m7-explore` finds nothing `m6-default` missed, if it loses a detection
+either baseline made, if it fails to detect `nested_modes`, if `m6-default`
+*starts* detecting `nested_modes` (which would mean the fixture has stopped
+isolating what coverage guidance adds), or if any configuration reports a
+finding on a clean fixture. Computing the comparison and printing it would have
+let a regression to M6-equivalent detection pass under a job named "coverage
+guidance finds more vulnerable paths".
 
 **Gained by exploration:** `hidden::nested_modes`.
 **Found by no dynamic strategy:** `hidden::magic_gate`, `hidden::nested_modes_wide`.
@@ -74,12 +88,18 @@ the leaky twin — and the security backend still observed nothing. Discovery
 reaching a region is not evidence about that region's security, and here the
 two artifacts say so independently.
 
-The **coverage search itself is cheap**: 1.4–2.7 s per contract. The 12×
-wall-clock difference between `m6-default` and `m7-explore` is almost entirely
-the second, `-C instrument-coverage` artifact that has to be built per
-contract. Per-row times in the measurement range from 16.6 s to 290 s for the
-same work, which is build caching rather than analysis, so the totals above are
-reported as what happened on one host and not as a cost model.
+The **coverage search itself is cheap**: 1.4–2.7 s per contract, consistently,
+across every run. What varies is the second, `-C instrument-coverage` artifact
+that has to be built per contract — and it varies enormously. Two runs of the
+identical benchmark on the same host gave `m7-explore` totals of **1185 s and
+146 s**, with per-row times between 16 s and 290 s for the same work. The
+difference is entirely build caching.
+
+So the honest cost statement is: exploration costs **one extra instrumented
+build per contract** and about two seconds of searching. Whether that reads as
+8× overhead or 1.5× depends on your build cache, not on the method, and the
+totals above should not be used as a cost model. Making those builds cheaper or
+shared is the scheduling work [`adoption.md`](adoption.md) points at.
 
 ## The finding: coverage guidance is sensitive to public surface, not only depth
 

@@ -91,11 +91,17 @@ crypto_bigint::primitives::carrying_add:
     add %r10,%rsi  adc %rcx,%r8
     add %rdi,%r8                                      ; 4-limb carry chain
 
-<crypto_bigint::uint::encoding::EncodedUint<4>>::new_be:
-  .../crypto-bigint-0.7.10/src/uint/encoding.rs:471
-    ...                                               ; result written out
+    bswap %rdx  bswap %rax  bswap %rsi  bswap %r8     ; result, 4 limbs
+
+cbaudit::sink::result_array:
+    mov ... 0x8(%rsp) … 0x20(%rsp)                    ; all 32 bytes stored
     call *...                                         ; cbaudit::sink::consume_all_bytes
 ```
+
+(The stores were attributed to `EncodedUint<4>::new_be`,
+`uint/encoding.rs:471`, before the adapters were routed through the shared
+full-width helper the functional tests compare. Same instruction sequence,
+different source line.)
 
 Which answers each of the questions the gate asks:
 
@@ -105,10 +111,10 @@ Which answers each of the questions the gate asks:
   loaded, swapped, added and written back;
 * **the inputs are not constant-folded** — they are loaded from `(%rdi)` and
   `(%rsi)` at run time;
-* **the whole result is consumed** — `new_be` materializes 32 bytes and the
-  call to `consume_all_bytes` reads them; `sink.rs`'s
-  `every_byte_changes_the_result` test independently establishes that no byte
-  of that fold is dead;
+* **the whole result is consumed** — all four result limbs are byte-swapped,
+  32 bytes are stored, and the out-of-line call to `consume_all_bytes` reads
+  them; `sink.rs`'s `every_byte_changes_the_result` test independently
+  establishes that no byte of that fold is dead;
 * **the mutated code is present** when a mutation is applied — the finding in
   Experiment D names the patched line.
 
@@ -182,7 +188,7 @@ as its caller. So the two cases are distinguishable, in the only place that can
 distinguish them.
 
 One caveat the reports have to carry: the per-contract `site` field is
-`add.rs:38` for this finding — the contract's own frame, which is what the
+`add.rs:54` for this finding — the contract's own frame, which is what the
 contract is attributed to. Reading `site` alone would place an upstream leak in
 the adapter. The stack is what locates the leaking instruction, and the two
 paths are distinguishable there (`src/uint/add.rs` for upstream frames against

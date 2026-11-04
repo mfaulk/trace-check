@@ -13,9 +13,22 @@
 //! `if` on the secret, then picking a candidate — is
 //! `controls::branch_selected`, which is expected to be detected.
 
-use crate::sink::consume_all_bytes;
+use crate::sink::{consume_all_bytes, result_array};
 use crypto_bigint::{Choice, CtSelect, U256};
 use trace_check_macros::constant_time;
+
+/// The selected candidate, as the **complete** 32-byte value.
+///
+/// Shared by the adapter below and by the functional tests; see
+/// `add::wrapping_add_bytes` for why a correctness test cannot compare through
+/// the sink.
+#[inline(always)]
+pub fn ct_select_bytes(first: &[u8; 32], second: &[u8; 32], choice: u8) -> [u8; 32] {
+    let a = U256::from_be_slice(first);
+    let b = U256::from_be_slice(second);
+    let selected = a.ct_select(&b, Choice::from_u8_lsb(choice));
+    result_array(selected.to_be_bytes().as_slice())
+}
 
 /// Per-contract discriminant; see `add::SECRET_LEFT_TAG` for why these exist.
 pub const CT_SELECT_TAG: u8 = 0x3c;
@@ -35,10 +48,7 @@ pub const CT_SELECT_TAG: u8 = 0x3c;
     dynamic = false
 )]
 pub fn ct_select(first: &[u8; 32], second: &[u8; 32], choice: u8) -> u8 {
-    let a = U256::from_be_slice(first);
-    let b = U256::from_be_slice(second);
-    let selected = a.ct_select(&b, Choice::from_u8_lsb(choice));
-    consume_all_bytes(selected.to_be_bytes().as_slice()) ^ CT_SELECT_TAG
+    consume_all_bytes(&ct_select_bytes(first, second, choice)) ^ CT_SELECT_TAG
 }
 
 #[cfg(test)]
@@ -51,6 +61,8 @@ mod tests {
     fn both_selection_outcomes_are_correct() {
         let first = [0x11u8; 32];
         let second = [0x22u8; 32];
+        assert_eq!(ct_select_bytes(&first, &second, 0), first);
+        assert_eq!(ct_select_bytes(&first, &second, 1), second);
         assert_eq!(
             ct_select(&first, &second, 0) ^ CT_SELECT_TAG,
             consume_all_bytes(&first)
@@ -72,8 +84,8 @@ mod tests {
         for byte in 0u8..=u8::MAX {
             let expected = if byte & 1 == 0 { &first } else { &second };
             assert_eq!(
-                ct_select(&first, &second, byte) ^ CT_SELECT_TAG,
-                consume_all_bytes(expected),
+                ct_select_bytes(&first, &second, byte),
+                *expected,
                 "choice byte {byte:#04x}"
             );
         }
@@ -102,10 +114,7 @@ mod tests {
                 ct_select(&first, &second, 1),
                 "a difference at byte {position} was not selected"
             );
-            assert_eq!(
-                ct_select(&first, &second, 1) ^ CT_SELECT_TAG,
-                consume_all_bytes(&second)
-            );
+            assert_eq!(ct_select_bytes(&first, &second, 1), second);
         }
     }
 }

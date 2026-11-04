@@ -610,6 +610,31 @@ jobs:
           test "$code" = "1" || { echo "an unexecuted mutation must fail, got $code"; exit 1; }
           grep -q "expected LEAK_DETECTED, got NO_LEAK_OBSERVED" /tmp/m9-unreached.txt
 
+      # The third way, and the one the oracle exists for: a mutation that
+      # changes the *arithmetic* must be rejected before any side-channel
+      # finding is interpreted. `negative-arithmetic-error.patch` drops the
+      # carry inside `Uint::carrying_add`, so the sum is wrong whenever a limb
+      # overflows. The independent-oracle test must be among the failures --
+      # the inline unit tests alone would be a weaker guarantee than the
+      # workflow claims.
+      - name: A mutation that breaks the arithmetic is rejected, by the oracle
+        run: |
+          set +e
+          python3 ci/mutate-m9.py --mutation negative-arithmetic-error \
+            --contract cbaudit::add::wrapping_add_secret_left \
+            --expect-outcome LEAK_DETECTED > /tmp/m9-arith.txt 2>&1
+          code=$?
+          set -e
+          cat /tmp/m9-arith.txt
+          test "$code" = "1" || {
+            echo "an arithmetic-breaking mutation must fail, got $code"; exit 1; }
+          grep -q "changed the computation rather than only its observable" /tmp/m9-arith.txt
+          grep -q "wrapping_add_matches_the_oracle ... FAILED" /tmp/m9-arith.txt
+          # The unrelated oracles must still pass, or this fixture is not
+          # isolating the arithmetic error it claims to.
+          grep -q "ct_select_matches_the_oracle ... ok" /tmp/m9-arith.txt
+          grep -q "montgomery_multiplication_matches_the_oracle ... ok" /tmp/m9-arith.txt
+
   # M4: bounded relational verification. A separate job because its backend is
   # a container image rather than a package, and because it must not be able to
   # mask an M1-M3 regression or be masked by one.

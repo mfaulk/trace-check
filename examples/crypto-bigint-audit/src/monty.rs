@@ -19,7 +19,7 @@
 //! source rather than assumed; see
 //! `docs/audits/crypto-bigint/target-selection.md`.
 
-use crate::sink::consume_all_bytes;
+use crate::sink::{consume_all_bytes, result_array};
 use crypto_bigint::modular::ConstMontyParams;
 use crypto_bigint::{const_monty_form, const_monty_params, U256};
 use trace_check_macros::constant_time;
@@ -33,6 +33,19 @@ const_monty_params!(
 
 const_monty_form!(Fp, P256Prime);
 
+/// `left * right mod p`, as the **complete** 32-byte result.
+///
+/// Shared by both adapters below and by the functional tests; see
+/// `add::wrapping_add_bytes` for why a correctness test cannot compare through
+/// the sink. This is the helper that would catch a Montgomery conversion
+/// applied in the wrong direction, which a lossy comparison might not.
+#[inline(always)]
+pub fn mul_bytes(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let a = Fp::new(&U256::from_be_slice(left));
+    let b = Fp::new(&U256::from_be_slice(right));
+    result_array(a.mul(&b).retrieve().to_be_bytes().as_slice())
+}
+
 /// Per-contract discriminants; see `add::SECRET_LEFT_TAG` for why these exist.
 pub const MUL_SECRET_LEFT_TAG: u8 = 0x1e;
 pub const MUL_BOTH_SECRET_TAG: u8 = 0xe1;
@@ -44,19 +57,13 @@ pub const MUL_BOTH_SECRET_TAG: u8 = 0xe1;
 /// `retrieve`, and folds the whole result.
 #[constant_time(secret = "left", dynamic = false)]
 pub fn mul_secret_left(left: &[u8; 32], right: &[u8; 32]) -> u8 {
-    let a = Fp::new(&U256::from_be_slice(left));
-    let b = Fp::new(&U256::from_be_slice(right));
-    let product = a.mul(&b).retrieve();
-    consume_all_bytes(product.to_be_bytes().as_slice()) ^ MUL_SECRET_LEFT_TAG
+    consume_all_bytes(&mul_bytes(left, right)) ^ MUL_SECRET_LEFT_TAG
 }
 
 /// The same operation with **both** operands secret.
 #[constant_time(secret = "left", secret = "right", dynamic = false)]
 pub fn mul_both_secret(left: &[u8; 32], right: &[u8; 32]) -> u8 {
-    let a = Fp::new(&U256::from_be_slice(left));
-    let b = Fp::new(&U256::from_be_slice(right));
-    let product = a.mul(&b).retrieve();
-    consume_all_bytes(product.to_be_bytes().as_slice()) ^ MUL_BOTH_SECRET_TAG
+    consume_all_bytes(&mul_bytes(left, right)) ^ MUL_BOTH_SECRET_TAG
 }
 
 #[cfg(test)]
@@ -89,13 +96,10 @@ mod tests {
         one[31] = 1;
         let value = [0x5au8; 32];
 
+        assert_eq!(mul_bytes(&value, &zero), zero);
         assert_eq!(
-            mul_secret_left(&value, &zero) ^ MUL_SECRET_LEFT_TAG,
-            consume_all_bytes(&zero)
-        );
-        assert_eq!(
-            mul_secret_left(&value, &one) ^ MUL_SECRET_LEFT_TAG,
-            consume_all_bytes(&value),
+            mul_bytes(&value, &one),
+            value,
             "multiplying by one must be the identity"
         );
     }
@@ -108,6 +112,7 @@ mod tests {
     fn the_two_secret_roles_compute_the_same_product() {
         let left = [0x5au8; 32];
         let right = [0xa5u8; 32];
+        assert_eq!(mul_bytes(&left, &right), mul_bytes(&right, &left));
         assert_eq!(
             mul_secret_left(&left, &right) ^ MUL_SECRET_LEFT_TAG,
             mul_both_secret(&right, &left) ^ MUL_BOTH_SECRET_TAG
@@ -124,13 +129,9 @@ mod tests {
         let modulus = Fp::MODULUS.get().to_be_bytes();
         let reduced: [u8; 32] = modulus.as_slice().try_into().unwrap();
         // p mod p == 0, so p * 1 == 0 in the field.
-        assert_eq!(
-            mul_secret_left(&reduced, &one) ^ MUL_SECRET_LEFT_TAG,
-            consume_all_bytes(&[0u8; 32])
-        );
+        assert_eq!(mul_bytes(&reduced, &one), [0u8; 32]);
         // The all-ones value is 2^256 - 1, comfortably above p.
         let max = [0xffu8; 32];
-        let product = mul_secret_left(&max, &one) ^ MUL_SECRET_LEFT_TAG;
-        assert_ne!(product, consume_all_bytes(&max));
+        assert_ne!(mul_bytes(&max, &one), max);
     }
 }

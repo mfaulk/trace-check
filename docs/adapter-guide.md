@@ -48,6 +48,18 @@ with no branch and no data-dependent index, and **test that every byte changes
 the result** — `sink::consume_all_bytes` and its
 `every_byte_changes_the_result` test are the pattern.
 
+**Never compare through the sink in a correctness test.** The same fold that
+makes every byte reach the result is lossy: it maps 2^256 results onto 256
+values, and if it is linear — `acc * 31 + byte` is — two byte changes can
+cancel *exactly*. So "the functional tests still pass" proves much less than it
+reads like, which matters most where it matters most: a mutation experiment
+claiming to change observable behavior without changing the arithmetic. Give
+each operation a helper returning the complete result, have the annotated
+adapter fold **that helper's** output, and compare the helper. One code path,
+two consumers — a parallel implementation in the test would validate the wrong
+thing. `sink::the_fold_is_lossy_and_must_not_be_used_for_correctness` pins a
+concrete collision so the point stays true rather than remembered.
+
 **Respect the operation's preconditions, without a secret-dependent branch.**
 Prefer operations that are total over the adapter's input type; then there is
 nothing to restrict and nothing to reject. Where a precondition is real,
@@ -106,8 +118,10 @@ Before any security result is worth reading:
    an inlined operation as a located symbol is not.
 4. A mutation in the **library's** source, with the adapter and its contract
    unchanged, must flip the verdict and name the patched line. `ci/mutate-m9.py`
-   is the harness, including the validity controls that stop a stale patch or
-   an unexecuted mutation from being reported as a result.
+   is the harness, and its validity controls are the point: a stale patch, a
+   mutation in code that never runs, a mutation that breaks the *arithmetic*,
+   a reused artifact and a drifting dependency graph all fail the experiment
+   instead of being reported as a result.
 
 ## When an adapter is the wrong tool
 

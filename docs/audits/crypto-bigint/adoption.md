@@ -17,12 +17,12 @@ BINSEC pinned by digest, `crypto-bigint =0.7.10`.
 | Input-discovery fixtures | 5 contracts |
 | Output sink | 15 lines, 3 tests |
 | Configuration entries | 18 `[check]` + 18 `[verify]`, none assigning a secret role |
-| Independent oracle vectors | 1012, all passing |
+| Independent oracle vectors | 1012, compared at full 32-byte width, all passing |
 | Unsupported Rust constructs encountered | **none** |
 | Compiler or dependency configuration changes | none beyond `default-features = false` |
 | Changes to trace-check itself | one: the `rust_eh_personality` link fix |
 | `check --all-contracts --ci`, 18 contracts | 317 s, 187 MB peak RSS |
-| `benchmark-m9.py`, three configurations × 7 fixtures | ~26 min |
+| `benchmark-m9.py`, three configurations × 7 fixtures | 10–26 min, build-cache dependent |
 | `verify --all-contracts`, 18 contracts | 18 s, 184 MB peak RSS |
 | `cargo test` (functional oracle, 1012 vectors) | under 1 s |
 | One mutation experiment with `--compare-clean` | ~3 min (two staged builds, two Memcheck runs) |
@@ -45,13 +45,23 @@ supplies its own decoder (`from_be_slice`), its own encoder (`to_be_bytes`) and
 its own `Choice` constructor (`from_u8_lsb`), so the adapter never has to
 construct a cryptographic value by hand.
 
-The one real cost was discovering the **output sink** requirement. The checker
-returns one scalar, a 256-bit result does not fit in one, and whatever reduces
-it decides what the compiler may delete. That is not obvious, and getting it
-wrong is silent: a sink reading four of thirty-two bytes would license the
-optimizer to compute one limb, and the artifact would no longer contain the
-operation the contract names. It is now rule two of
-[`docs/adapter-guide.md`](../../adapter-guide.md), with a test pattern.
+The one real cost was discovering the **output sink** requirement, which has
+two halves and both are silent when wrong.
+
+The checker returns one scalar, a 256-bit result does not fit in one, and
+whatever reduces it decides what the compiler may delete: a sink reading four
+of thirty-two bytes would license the optimizer to compute one limb, and the
+artifact would no longer contain the operation the contract names.
+
+The second half is the inverse mistake, and review caught it here rather than
+the author: a sink built so every byte *reaches* the result is still lossy —
+2^256 results onto 256 values — and because this one is linear, two byte
+changes cancel exactly. Correctness tests comparing through it gave randomized
+confidence while reading like proof, which is precisely the wrong property for
+a mutation experiment claiming to preserve arithmetic. Each operation now has a
+helper returning the complete 32-byte result, the adapter folds that helper's
+output, and the oracle compares the helper. Both halves are rules in
+[`docs/adapter-guide.md`](../../adapter-guide.md), each with a test pinning it.
 
 ### Analysis difficulty — one hazard, found twice
 
@@ -147,9 +157,10 @@ address case matters disproportionately — every secret executes the same
 instruction sequence, so a tool modelling only control flow would have reported
 that mutated library clean.
 
-**6. How much did the process cost?** The table above. In CI terms: about five
-minutes for the dynamic matrix, twenty seconds for the symbolic matrix, and
-roughly three minutes per mutation experiment. Peak memory stays under 200 MB
+**6. How much did the process cost?** The table above. In CI terms: five to
+seven minutes for the dynamic matrix, twenty seconds for the symbolic matrix,
+and roughly four minutes per mutation experiment now that each one runs the
+oracle against both staged dependencies. Peak memory stays under 200 MB
 throughout, so this is laptop-scale work.
 
 **7. Which engineering changes would most improve practical usefulness?** In
@@ -173,6 +184,29 @@ order of how much they would have saved here:
 5. **A declared output-sink helper.** Every adapter for a wide result needs the
    same fixed-work fold with the same all-bytes test. Shipping it would remove
    the one integration subtlety that is both non-obvious and silent when wrong.
+
+## What the validation itself cost
+
+Worth separating from the integration cost, because it is the part that is easy
+to under-build and the part review went after.
+
+Four mechanisms, each guarding a specific way a result could be claimed without
+being earned:
+
+| Mechanism | Guards against |
+| --- | --- |
+| 1012 full-width oracle vectors, run against **both** staged dependencies | a mutation that changed the arithmetic being read as a side channel |
+| the committed lockfile staged and built `--locked`, with the clean and mutated dependency graphs required to match | the two compared artifacts differing by more than the patch |
+| `--expect-frame` and `--expect-class` | a finding in the adapter, or a branch finding, being counted as the upstream address finding the acceptance criterion needs |
+| `--verify-reproducer` | a saved reproducer that does not reproduce against the artifact it came from |
+
+And four negative controls that must **fail**: a stale patch, a mutation in a
+function that never runs, a mutation that breaks the arithmetic, and the
+benchmark's own acceptance assertions. The last is a case worth naming: the
+benchmark originally *printed* how many additional vulnerabilities coverage
+guidance found without requiring the number to be nonzero, so a regression to
+M6-equivalent detection would have left a CI job named "coverage guidance finds
+more vulnerable paths" green. Computing a metric is not asserting it.
 
 ## What an adopter should take away
 

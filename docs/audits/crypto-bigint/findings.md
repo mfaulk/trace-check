@@ -26,16 +26,26 @@ cargo trace-check check --all-contracts --ci \
 | `monty::mul_secret_left` | `ConstMontyForm::mul` mod p-256 | `left` | `NO_LEAK_OBSERVED` |
 | `monty::mul_both_secret` | `ConstMontyForm::mul` mod p-256 | `left`, `right` | `NO_LEAK_OBSERVED` |
 | `controls::public_operand_branch` | negative control | `secret` | `NO_LEAK_OBSERVED` |
+| `hidden::nested_modes_clean` | false-positive control | `secret`, `other` | `NO_LEAK_OBSERVED` |
+| `hidden::nested_modes_wide` | a leak input discovery did not reach | `secret` | `NO_LEAK_OBSERVED` |
+| `hidden::magic_gate` | a leak input discovery did not reach | `secret` | `NO_LEAK_OBSERVED` |
 
 Each is `NO_LEAK_OBSERVED` over the inputs that were generated and the paths
-they took. None is a proof.
+they took. None is a proof — and the last two are not clean results at all:
+the leak is there, on a path no dynamic strategy constructed. They are declared
+`expected_outcome = "NO_LEAK_OBSERVED"` so the limit stays measured, and the
+symbolic backend finds both. See [`exploration.md`](exploration.md).
 
 What the artifacts contain, from `objdump -d -l`:
 
 * **Addition** — `Uint<4>::from_be_slice` (`uint/encoding.rs:49`), eight
-  `bswap`, then `primitives::carrying_add` (`primitives.rs:15`) as a four-limb
-  `add`/`adc` chain, then `EncodedUint<4>::new_be` (`uint/encoding.rs:471`).
-  No conditional jump in the adapter.
+  `bswap` for the operands, then `primitives::carrying_add` (`primitives.rs:15`)
+  as a four-limb `add`/`adc` chain, four more `bswap` for the result, and the
+  32 bytes stored to the stack before the out-of-line call to the sink. No
+  conditional jump in the adapter. (Those stores are attributed to
+  `sink::result_array` rather than to `EncodedUint::new_be` since the adapters
+  route through the shared full-width helper; the instruction sequence is the
+  same.)
 * **Selection** — `Choice::from_u8_lsb` (`ctutils-0.4.8/src/choice.rs:119`)
   compiles to `and $0x1,%dl`, and the selection to four
   `test`/`cmovne` pairs through `<u64 as cmov::Cmov>::cmovnz`
@@ -62,7 +72,7 @@ misreported as an upstream one.
 | `decoded_interior_limb_branch` | decoded limb 2 = `secret[8..16]` | branch | `controls.rs:88` |
 | `decoded_last_byte_branch` | decoded limb 0, masked to `secret[31]` | branch | `controls.rs:104` |
 | `carry_branch` | the `Limb` carry `Uint::carrying_add` returned | branch | `controls.rs:121` |
-| `decoded_address_probe` | load index from the decoded sum | **address** | `read_volatile` from `controls.rs:139` |
+| `decoded_address_probe` | load index from the decoded sum | **address** | `read_volatile` from `controls.rs:140` |
 | `branch_selected` | `choice`, selecting with an `if` | branch | `controls.rs:164` |
 
 `pre_decode_first_byte` is the weak one and is listed first for that reason: it
@@ -75,6 +85,18 @@ together they are the most direct statement this work produces for a
 cryptographic developer: the constant-time selection idiom is checkable, and
 abandoning it is detected.
 
+## Deliberately introduced: leaks behind public predicates
+
+The M9.7 fixtures. Same secret handling as everything above; the leak sits
+behind a public gate, so what varies is whether input discovery reaches it.
+
+| Fixture | Detected by | Class | Leaf frame |
+| --- | --- | --- | --- |
+| `hidden::boundary_gate` | M6's boundary stage | **address** | `read_volatile` from `hidden.rs:213` |
+| `hidden::nested_modes` | coverage feedback only | **address** | `hidden.rs:99` |
+| `hidden::nested_modes_wide` | neither dynamic strategy | — | — |
+| `hidden::magic_gate` | neither dynamic strategy | — | — |
+
 ## Deliberately introduced: mutations to the library
 
 Applied to an isolated copy of the pinned source. The adapter, its contract and
@@ -83,8 +105,10 @@ its generated inputs are unchanged.
 ### Mutation A — a branch on the carry inside `Uint::carrying_add`
 
 `ci/mutations/mutation-a-carry-branch.patch`, against `src/uint/add.rs`.
-Preserves the arithmetic result; the adapter's whole functional suite passes
-against the mutated dependency.
+Preserves the arithmetic result, and that is checked rather than asserted: the
+adapter's full suite — including the 1012 independent-oracle vectors, which
+compare the operation's complete 32-byte result — runs against the *mutated*
+dependency before any finding is interpreted.
 
 | | |
 | --- | --- |
@@ -94,7 +118,7 @@ against the mutated dependency.
 | Classification | secret-dependent branch |
 | Leaf frame | `carrying_add<4> (src/uint/add.rs:31)` |
 | Caller | `wrapping_add<4> (src/uint/add.rs:52)` |
-| Contract `site` | `add.rs:38` — the **adapter's** frame, not the leak's |
+| Contract `site` | `add.rs:54` — the **adapter's** frame, not the leak's |
 
 The mutation needs `core::hint::black_box` in the taken arm. Without it the
 branch becomes a `cmov` at `opt-level = 3` and there is nothing to detect — the
@@ -121,7 +145,7 @@ the accessor whose own name says it is not constant-time. Same returned value.
 | Mutated dependency tree | `85aa2897287dc215…` → `LEAK_DETECTED` |
 | Classification | secret-dependent branch |
 | Leaf frame | `ct_select<4> (src/uint/ct.rs:78)` |
-| Caller | `cbaudit::select::ct_select (select.rs:40)` |
+| Caller | `ct_select_bytes (select.rs:29)`, then `cbaudit::select::ct_select` |
 
 This is the most legible of the three for a cryptographic developer: the
 library's own constant-time selection is replaced with the obvious

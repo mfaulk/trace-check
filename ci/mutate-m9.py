@@ -17,8 +17,16 @@ experiment could report a security outcome it did not earn:
 * `patch` must apply cleanly and the named file must actually differ
   afterwards, so a stale patch fails the run instead of silently producing a
   "clean" result;
-* the adapter's own functional tests must still pass, so a mutation that
-  changed the arithmetic is rejected rather than reported as a side channel;
+* the adapter's own tests must still pass -- including the 1012
+  independent-oracle vectors, which compare the operation's *complete* 32-byte
+  result, so a mutation that changed the arithmetic is rejected rather than
+  reported as a side channel. The oracle tests are checked by name, because a
+  suite that silently stopped running them would otherwise report a weak check
+  as a strong one;
+* the staged crate carries the committed lockfile and builds `--locked`, so the
+  transitive graph is the audited one, and the clean and mutated runs must
+  resolve *identical* dependency graphs -- the patch is meant to be the only
+  variable;
 * the clean and mutated analyzed artifacts must have different hashes, so a
   cached build cannot be mistaken for a mutated one;
 * the finding's stack must name the upstream source file the patch touched,
@@ -110,6 +118,60 @@ def stage_dependency(work, source, patch):
     return staged, before, after
 
 
+def staged_lockfile():
+    """The committed lockfile, with `crypto-bigint` turned into a path entry.
+
+    Without this the staged crate resolves its *transitive* graph afresh —
+    `ctutils`, `cmov`, `cpubits`, `num-traits` — so the clean and mutated runs
+    would not be guaranteed to compile the same supporting code, and the
+    experiment's whole claim is a difference between two compiled
+    implementations. Cargo rejects a `source`/`checksum` on a path dependency,
+    so those two lines are dropped from that one package entry and every other
+    pin is preserved verbatim.
+    """
+    lines = (ADAPTER / "Cargo.lock").read_text().splitlines()
+    out = []
+    inside = False
+    dropped = 0
+    for line in lines:
+        if line.strip() == "[[package]]":
+            inside = False
+        if line.strip() == f'name = "{DEPENDENCY}"':
+            inside = True
+        if inside and line.startswith(("source = ", "checksum = ")):
+            dropped += 1
+            continue
+        out.append(line)
+    if dropped != 2:
+        fail(
+            f"expected to drop a source and a checksum line for {DEPENDENCY} in "
+            f"the committed lockfile, dropped {dropped}. The lockfile layout "
+            "changed; update ci/mutate-m9.py with it"
+        )
+    return "\n".join(out) + "\n"
+
+
+def dependency_graph(adapter):
+    """`(name, version)` for every package in the staged lockfile.
+
+    Compared between the clean and mutated runs. If they differ, the two
+    artifacts differ by more than the patch and nothing downstream is a
+    controlled comparison.
+    """
+    graph = []
+    name = None
+    for line in (adapter / "Cargo.lock").read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith('name = "'):
+            name = stripped.split('"')[1]
+        elif stripped.startswith('version = "') and name:
+            graph.append((name, stripped.split('"')[1]))
+            name = None
+    graph.sort()
+    digest = hashlib.sha256(repr(graph).encode()).hexdigest()
+    return graph, digest
+
+
 def stage_adapter(work, dependency):
     """Copies the adapter and repoints it at the staged dependency.
 
@@ -118,11 +180,18 @@ def stage_adapter(work, dependency):
     but it does follow a path dependency transitively. The rewrite is also the
     one place the experiment deviates from the committed configuration, so
     keeping it to a single line keeps it reviewable.
+
+    `tests/` comes too. Without it `cargo test` runs only the adapters' inline
+    unit tests and the 1012 independent-oracle vectors never execute, which
+    would make "the arithmetic survived the mutation" a much weaker claim than
+    the one this script prints.
     """
     staged = work / "adapter"
     staged.mkdir()
     shutil.copytree(ADAPTER / "src", staged / "src")
+    shutil.copytree(ADAPTER / "tests", staged / "tests")
     shutil.copy(ADAPTER / "trace-check.toml", staged / "trace-check.toml")
+    (staged / "Cargo.lock").write_text(staged_lockfile())
 
     manifest = (ADAPTER / "Cargo.toml").read_text()
     pinned_line = (
@@ -145,15 +214,43 @@ def stage_adapter(work, dependency):
     return staged
 
 
+# The oracle tests, by name. Named rather than counted so a suite that silently
+# stops running them fails here instead of reporting a weaker check as a
+# stronger one.
+ORACLE_TESTS = (
+    "wrapping_add_matches_the_oracle",
+    "ct_select_matches_the_oracle",
+    "montgomery_multiplication_matches_the_oracle",
+    "the_adapter_and_the_oracle_share_a_modulus",
+)
+
+
 def functional_tests(adapter, mutated):
-    """The arithmetic must survive the mutation, or the run is invalid."""
-    result = run(["cargo", "test", "--quiet"], cwd=adapter)
+    """The arithmetic must survive the mutation, or the run is invalid.
+
+    `--locked` so the transitive graph is the committed one; `--all-targets`
+    and an explicit check that the oracle tests ran, because the claim being
+    made is about the 1012 independently computed vectors and not about the
+    inline unit tests alone.
+    """
+    # `--no-fail-fast` so a failing lib target does not hide whether the
+    # oracle caught the same mutation; the report names every failure.
+    result = run(
+        ["cargo", "test", "--locked", "--all-targets", "--no-fail-fast"], cwd=adapter
+    )
+    subject = "mutated dependency" if mutated else "staged dependency"
     if result.returncode != 0:
-        subject = "mutated dependency" if mutated else "staged dependency"
         fail(
             f"the adapter's functional tests fail against the {subject}, so the "
             "mutation changed the computation rather than only its observable "
             f"behavior:\n{result.stdout}{result.stderr}"
+        )
+    missing = [name for name in ORACLE_TESTS if name not in result.stdout]
+    if missing:
+        fail(
+            f"the independent-oracle tests did not run against the {subject}: "
+            f"{missing} absent from the test output. A mutation cannot be "
+            "accepted on the strength of the inline unit tests alone"
         )
 
 
@@ -243,6 +340,17 @@ def check_replay(manifest, reproducer):
         fail(f"replaying {reproducer} produced no report:\n{result.stdout}{result.stderr}")
 
 
+class Run:
+    """One staged experiment's results, so callers compare like with like."""
+
+    def __init__(self, artifact, evidence, manifest, reproducer_dir, graph_digest):
+        self.artifact = artifact
+        self.evidence = evidence
+        self.manifest = manifest
+        self.reproducer_dir = reproducer_dir
+        self.graph_digest = graph_digest
+
+
 def experiment(work, source, patch, contract, label, reproducers=False):
     """Stages one dependency tree, checks one contract, returns the evidence."""
     dependency, before, after = stage_dependency(work, source, patch)
@@ -252,8 +360,13 @@ def experiment(work, source, patch, contract, label, reproducers=False):
         print(f"[{label}] mutation:    {patch.name}")
 
     adapter = stage_adapter(work, dependency)
+    graph, graph_digest = dependency_graph(adapter)
+    print(f"[{label}] graph:       {len(graph)} package(s), sha256 {graph_digest[:12]}")
     functional_tests(adapter, mutated=patch is not None)
-    print(f"[{label}] functional:  the staged dependency computes the same values")
+    print(
+        f"[{label}] functional:  inline tests and the 1012 oracle vectors pass "
+        "against the staged dependency"
+    )
 
     reproducer_dir = work / "reproducers" if reproducers else None
     reported = check_contract(adapter / "Cargo.toml", contract, reproducer_dir)
@@ -261,7 +374,13 @@ def experiment(work, source, patch, contract, label, reproducers=False):
     print(f"[{label}] artifact:    {reported['artifact_sha256']}")
     print(f"[{label}] outcome:     {evidence['outcome']}")
     print(f"[{label}] message:     {evidence['message']}")
-    return reported["artifact_sha256"], evidence, adapter / "Cargo.toml", reproducer_dir
+    return Run(
+        artifact=reported["artifact_sha256"],
+        evidence=evidence,
+        manifest=adapter / "Cargo.toml",
+        reproducer_dir=reproducer_dir,
+        graph_digest=graph_digest,
+    )
 
 
 def require_class(evidence, expected, label):
@@ -379,24 +498,24 @@ def main():
 
     try:
         if arguments.clean:
-            _, evidence, _, _ = experiment(
+            baseline = experiment(
                 root / "clean", source, None, arguments.contract, "clean"
             )
-            require_outcome(evidence, arguments.expect_outcome, "clean")
+            require_outcome(baseline.evidence, arguments.expect_outcome, "clean")
             print("PASS")
             return
 
-        baseline_artifact = None
+        baseline = None
         if arguments.compare_clean:
             # A separate staging directory per run: never a shared tree that
             # another build could be reading, and never a target directory the
             # two runs could trade cache entries through.
-            baseline_artifact, baseline, _, _ = experiment(
+            baseline = experiment(
                 root / "clean", source, None, arguments.contract, "clean"
             )
-            require_outcome(baseline, arguments.baseline_outcome, "clean")
+            require_outcome(baseline.evidence, arguments.baseline_outcome, "clean")
 
-        mutated_artifact, mutated, manifest, reproducer_dir = experiment(
+        mutated = experiment(
             root / "mutated",
             source,
             patch,
@@ -404,21 +523,31 @@ def main():
             "mutated",
             reproducers=arguments.verify_reproducer,
         )
-        require_outcome(mutated, arguments.expect_outcome, "mutated")
+        require_outcome(mutated.evidence, arguments.expect_outcome, "mutated")
         if arguments.expect_class:
-            require_class(mutated, arguments.expect_class, "mutated")
+            require_class(mutated.evidence, arguments.expect_class, "mutated")
         if arguments.expect_frame:
-            require_frame(mutated, arguments.expect_frame, "mutated")
+            require_frame(mutated.evidence, arguments.expect_frame, "mutated")
         if arguments.verify_reproducer:
-            replay_reproducer(manifest, reproducer_dir, "mutated")
+            replay_reproducer(mutated.manifest, mutated.reproducer_dir, "mutated")
 
-        if baseline_artifact is not None:
-            if baseline_artifact == mutated_artifact:
+        if baseline is not None:
+            if baseline.artifact == mutated.artifact:
                 fail(
                     "the clean and mutated runs analyzed the same artifact hash, so "
                     "the mutated build was not actually analyzed"
                 )
-            print(f"artifacts:    {baseline_artifact[:12]} != {mutated_artifact[:12]}")
+            # The *dependency graph* must be identical where the artifact must
+            # differ: the patch is meant to be the only variable.
+            if baseline.graph_digest != mutated.graph_digest:
+                fail(
+                    "the clean and mutated runs resolved different dependency "
+                    f"graphs ({baseline.graph_digest[:12]} against "
+                    f"{mutated.graph_digest[:12]}), so the comparison is not "
+                    "controlled"
+                )
+            print(f"artifacts:    {baseline.artifact[:12]} != {mutated.artifact[:12]}")
+            print(f"graphs:       {baseline.graph_digest[:12]} == identical")
 
         print("PASS")
     finally:
