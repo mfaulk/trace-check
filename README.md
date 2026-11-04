@@ -22,7 +22,7 @@ the formal noninterference property, and the roadmap.
 | M6 | Generated constant-time testing and CI enforcement | complete, experimental |
 | M7 | Coverage-guided leakage discovery | complete, experimental |
 | M8 | Complete contract coverage and enforcement | complete, experimental |
-| M9 | Real-world cryptography integration — auditing `crypto-bigint` | in progress |
+| M9 | Real-world cryptography integration — auditing `crypto-bigint` | complete, experimental |
 | M10 | Hardware-oriented validation — statistical timing | future |
 
 `trace-check` turns that idea into reproducible analysis, from five directions:
@@ -716,16 +716,27 @@ that took fixing a real blocker — the freestanding artifact failed to link wit
 dependency, which no in-repo example could have surfaced. See
 [docs/audits/crypto-bigint/symbolic-feasibility.md](docs/audits/crypto-bigint/symbolic-feasibility.md).
 
+Input discovery was measured too, on fixtures where the leak hides behind a
+*public* predicate: `m6-default` finds 2 of 5, `m6-random-10x` finds **1** (ten
+times the budget, random-only, so it never generates the boundary value one
+gate needs), `m7-explore` finds 3, and the symbolic backend finds all 5. The two
+rows no dynamic strategy reaches are declared as such, so the limits stay
+measured — one is an exact 32-bit equality that region coverage has no gradient
+toward, and the other is the *same* gate as a fixture M7 does find, missed only
+because its public surface is 35 bytes instead of 3.
+
 The one integration hazard this turned up: two adapters whose bodies compile
 identically are folded to one symbol, and a finding in either then cannot be
 attributed — reported as `INCONCLUSIVE`, never as clean. See
 [docs/MILESTONE-09.md](docs/MILESTONE-09.md) for that and the other four
 findings, [docs/adapter-guide.md](docs/adapter-guide.md) for how to write an
-adapter for a different library, and
-[docs/audits/crypto-bigint/](docs/audits/crypto-bigint/threat-model.md) for the
-analysis boundary. **None of it is a claim that `crypto-bigint` is secure:** it
-is three operations, under two modeled observations, on one artifact, over 64
-generated inputs each.
+adapter for a different library,
+[docs/audits/crypto-bigint/adoption.md](docs/audits/crypto-bigint/adoption.md)
+for what the whole thing cost and the five engineering changes it points to,
+and [docs/audits/crypto-bigint/](docs/audits/crypto-bigint/threat-model.md) for
+the analysis boundary. **None of it is a claim that `crypto-bigint` is
+secure:** it is three operations, under two modeled observations, on one
+artifact.
 
 ### `native` — secret-dependency analysis of native code
 
@@ -1128,6 +1139,7 @@ ci/benchmark-m8.py               contract-discovery overhead at 0/10/50/100 decl
 ci/benchmark-m6.py               generated vs hand-written effectiveness benchmark
 ci/gen-m9-vectors.py             the independent Python oracle for the M9
                                  adapters; --check guards fixture drift
+ci/benchmark-m9.py               M6 against M7 on the external integration
 ci/mutate-m9.py                  one upstream-mutation experiment, with the
                                  validity checks that make its outcome earned
 ci/verify-m9-integration.py      asserts the M9 audit report, not its exit code
