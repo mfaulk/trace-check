@@ -535,6 +535,7 @@ fn check(request: CheckRequest) -> Result<u8, String> {
             &trace_check::Selection::AllContracts,
             reproducer_dir.as_deref(),
             &today(),
+            None,
         )
         .map_err(|e| e.to_string())?;
         match format {
@@ -687,6 +688,7 @@ fn coverage(
         &workspace,
         &trace_check::Selection::AllContracts,
         &today(),
+        None,
     )
     .map_err(|e| e.to_string())?;
     match format {

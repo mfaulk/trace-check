@@ -181,7 +181,7 @@ pub fn run_symbolic(
 }
 
 use contract::VerifyConfig;
-use harness::{Artifact, Harness, HarnessError, Library, ResolvedSymbol, Workspace};
+use harness::{Artifact, Backend, Harness, HarnessError, Library, ResolvedSymbol, Workspace};
 use library_report::{LibraryReport, Verified};
 
 /// Verifies declared contracts against the real functions in a Cargo library.
@@ -227,19 +227,16 @@ pub fn run_contract_verification(
         let settings = config
             .settings(contract_id)
             .expect("the selection was validated above");
-        let (work_dir, target_dir) = workspace.directories_for(contract_id)?;
-
-        let contract = harness::probe_contract(library, contract_id, &work_dir, &target_dir)?;
-        // Checked after the descriptor is known, so the message can name the
-        // declared secrets rather than guess at them.
-        settings.validate_inputs(contract_id, &contract.descriptor)?;
-
-        let generated: Harness = harness::generate(library, &contract)?;
-        let artifact: Artifact =
-            harness::build(library, &generated, contract_id, &work_dir, &target_dir)?;
-        let symbol: ResolvedSymbol = harness::resolve_symbol(&artifact.path, contract_id)?;
-
-        let case = harness::verification_case(&contract, &symbol, &generated, settings);
+        // Everything decidable about the contract is decided before the
+        // analyzer is touched, so a problem with the contract is reported as a
+        // problem with the contract. See this function's own notes.
+        let staged = stage_symbolic(
+            library,
+            contract_id,
+            settings,
+            workspace,
+            Backend::Standalone,
+        )?;
 
         // Prepared here, not earlier: everything above is a question about the
         // contract and the library, and a missing analyzer must not answer any
@@ -250,17 +247,7 @@ pub fn run_contract_verification(
             verifier = Some(prepared);
         }
         let verifier = verifier.as_ref().expect("prepared just above");
-        let result = verifier.verify(&case, &artifact.path, &artifact.sha256)?;
-
-        entries.push(Verified {
-            contract,
-            case,
-            library: library.clone(),
-            symbol,
-            harness: generated,
-            artifact,
-            result,
-        });
+        entries.push(verify_staged(staged, verifier, library)?);
     }
 
     // A non-empty selection always reaches the analyzer, because
@@ -273,6 +260,91 @@ pub fn run_contract_verification(
         contracts.len(),
         workspace.is_kept(),
     ))
+}
+
+/// Everything one contract's symbolic verification needs, assembled before the
+/// analyzer is involved.
+///
+/// Split out so a unified run can tell a *per-contract* failure -- an
+/// unsupported signature, a harness that will not compile, a symbol that does
+/// not resolve -- from a *shared infrastructure* failure, which is the missing
+/// analyzer image. The first becomes one contract's status; the second applies
+/// to every symbolic requirement in the run. Before the split both arrived as
+/// the same `HarnessError` from the same call.
+pub struct StagedSymbolic {
+    contract: contract::Contract,
+    case: VerificationCase,
+    symbol: ResolvedSymbol,
+    harness: Harness,
+    artifact: Artifact,
+}
+
+impl StagedSymbolic {
+    /// The executable this staging built, which is the artifact any result
+    /// drawn from it describes.
+    pub fn artifact_sha256(&self) -> &str {
+        &self.artifact.sha256
+    }
+}
+
+/// Builds one contract's symbolic verification artifact, touching no analyzer.
+///
+/// The per-contract execution seam M10 needs: `verify` and the unified run
+/// reach the symbolic backend through this and [`verify_staged`], so there is
+/// one implementation of what symbolic verification *is* and the two commands
+/// cannot drift apart.
+fn stage_symbolic(
+    library: &Library,
+    contract_id: &str,
+    settings: &contract::ContractSettings,
+    workspace: &Workspace,
+    backend: Backend,
+) -> Result<StagedSymbolic, HarnessError> {
+    let (work_dir, target_dir) = workspace.directories_for_backend(contract_id, backend)?;
+
+    let contract = harness::probe_contract(library, contract_id, &work_dir, &target_dir)?;
+    // Checked after the descriptor is known, so the message can name the
+    // declared secrets rather than guess at them.
+    settings.validate_inputs(contract_id, &contract.descriptor)?;
+
+    let harness: Harness = harness::generate(library, &contract)?;
+    let artifact: Artifact =
+        harness::build(library, &harness, contract_id, &work_dir, &target_dir)?;
+    let symbol: ResolvedSymbol = harness::resolve_symbol(&artifact.path, contract_id)?;
+    let case = harness::verification_case(&contract, &symbol, &harness, settings);
+
+    Ok(StagedSymbolic {
+        contract,
+        case,
+        symbol,
+        harness,
+        artifact,
+    })
+}
+
+/// Runs the analyzer over a staged contract.
+fn verify_staged(
+    staged: StagedSymbolic,
+    verifier: &symbolic::Verifier,
+    library: &Library,
+) -> Result<Verified, HarnessError> {
+    let StagedSymbolic {
+        contract,
+        case,
+        symbol,
+        harness,
+        artifact,
+    } = staged;
+    let result = verifier.verify(&case, &artifact.path, &artifact.sha256)?;
+    Ok(Verified {
+        contract,
+        case,
+        library: library.clone(),
+        symbol,
+        harness,
+        artifact,
+        result,
+    })
 }
 
 use check::{CheckBudget, Runner as CheckRunner};
@@ -788,6 +860,7 @@ impl From<InventoryError> for CheckRunError {
 /// Valgrind is located lazily, after the inventory and the plan, for the same
 /// reason M5 and M6 settled on: a developer whose contract cannot be analyzed
 /// should be told about the contract, not about a missing analyzer.
+#[allow(clippy::too_many_arguments)]
 pub fn run_contract_coverage(
     library: &Library,
     config: &VerifyConfig,
@@ -796,6 +869,7 @@ pub fn run_contract_coverage(
     selection: &Selection,
     reproducer_dir: Option<&Path>,
     today: &str,
+    runtime: Option<&str>,
 ) -> Result<CoverageReport, CheckRunError> {
     let policy = &config.policy;
     let inventory_dir = workspace.inventory_target_dir()?;
@@ -855,16 +929,27 @@ pub fn run_contract_coverage(
     } else {
         None
     };
-    let available = check_capabilities(valgrind.is_some(), tools.is_some());
+    // The analyzer, prepared once for the whole run and only if some policy
+    // asks for it. A failure is carried rather than returned: it settles every
+    // symbolic requirement as BACKEND_UNAVAILABLE, which is a status, while the
+    // generated analyses still run and still report. A missing backend must
+    // never abort the analyses that do work, and must never be substituted for.
+    let symbolic_backend =
+        needs_symbolic(&found, policy).then(|| prepare_symbolic_backend(runtime));
+    let available = check_capabilities(
+        valgrind.is_some(),
+        tools.is_some(),
+        symbolic_backend.as_ref().is_some_and(Result::is_ok),
+    );
 
     let plan = Plan::resolve(&found, config, policy, &selected, &available, today);
     let mut coverage = Coverage::from_plan(&plan, &found);
 
-    // Stage two: run what the plan left outstanding. Only the generated family
-    // is executed here; `symbolic` evidence comes from
-    // `cargo trace-check verify` and `dynamic` from `cargo trace-check test`,
-    // and a requirement for either is reported as outstanding rather than
-    // silently satisfied.
+    // Stage two: run what the plan left outstanding. The generated family is
+    // executed here and symbolic verification in stage three; `dynamic`
+    // evidence is a developer-written `#[ct_test]` that
+    // `cargo trace-check test` produces, and a requirement for it is reported
+    // as outstanding rather than silently satisfied.
     for entry in &plan.entries {
         let outstanding = entry.outstanding();
         let wants_generated = outstanding
@@ -934,6 +1019,87 @@ pub fn run_contract_coverage(
         }
     }
 
+    // Stage three: symbolic verification, through the same per-contract
+    // implementation `verify` uses. A separate stage rather than a branch
+    // inside stage two, because it builds a different executable from a
+    // different generated harness with different flags -- the artifact
+    // identities must stay apart, and nothing here may read the generated
+    // result.
+    if let Some(Ok(verifier)) = &symbolic_backend {
+        let identity = verifier.identity();
+        for entry in &plan.entries {
+            if !entry.outstanding().contains(&Analysis::Symbolic) {
+                continue;
+            }
+            // Outstanding implies configured: `settle` reports a symbolic
+            // requirement with no `[verify]` entry as a configuration gap,
+            // which is settled and so never reaches here.
+            let settings = config
+                .settings(&entry.id)
+                .expect("an outstanding symbolic requirement implies a [verify] entry");
+
+            // Staging is per contract and touches no analyzer, so most of its
+            // failures are facts about this declaration -- an unsupported
+            // signature, a harness that will not compile, a symbol that does
+            // not resolve -- and become this contract's status rather than the
+            // end of the run.
+            //
+            // Anything else is recorded as INCONCLUSIVE rather than propagated.
+            // Stage two aborts the run on a failure that is not about one
+            // contract, which is defensible when nothing has been established
+            // yet; by here the generated evidence is already in hand, and
+            // throwing it away to report an error that is also in the report
+            // would lose more than it tells anyone. Neither status can pass.
+            let staged =
+                match stage_symbolic(library, &entry.id, settings, workspace, Backend::Symbolic) {
+                    Ok(staged) => staged,
+                    Err(error) => {
+                        let reason = format!(
+                            "the symbolic verification artifact for `{}` could not be prepared: \
+                             {error}",
+                            entry.id
+                        );
+                        let status = if per_contract(&CheckRunError::Harness(error)) {
+                            Status::Unsupported { reason }
+                        } else {
+                            Status::Inconclusive { detail: reason }
+                        };
+                        coverage.note(&entry.id, Analysis::Symbolic, status);
+                        continue;
+                    }
+                };
+            // Recorded before the analyzer runs. The obligation is about the
+            // executable this run built, and the evidence is checked against
+            // that rather than against whatever the result claims.
+            let artifact_sha256 = staged.artifact_sha256().to_string();
+            match verify_staged(staged, verifier, library) {
+                Ok(verified) => {
+                    let report =
+                        library_report::contract_report(verified, &identity, workspace.is_kept());
+                    coverage.fold(
+                        &entry.id,
+                        AnalysisEvidence::from_symbolic(
+                            &entry.id,
+                            &settings.checks,
+                            &artifact_sha256,
+                            Box::new(report),
+                        ),
+                    );
+                }
+                Err(error) => coverage.note(
+                    &entry.id,
+                    Analysis::Symbolic,
+                    Status::Inconclusive {
+                        detail: format!(
+                            "the analyzer did not produce a usable result for `{}`: {error}",
+                            entry.id
+                        ),
+                    },
+                ),
+            }
+        }
+    }
+
     let provenance = coverage_report::Provenance {
         rustc_version: native::tool_version(Path::new("rustc"), &["--version"])
             .unwrap_or_else(|_| "rustc (version unavailable)".to_string()),
@@ -971,6 +1137,7 @@ pub fn report_contract_coverage(
     workspace: &Workspace,
     selection: &Selection,
     today: &str,
+    runtime: Option<&str>,
 ) -> Result<CoverageReport, CheckRunError> {
     let policy = &config.policy;
     let found = read_contract_inventory(library, workspace)?;
@@ -986,7 +1153,11 @@ pub fn report_contract_coverage(
     // Backends are probed, because "the analyzer is missing" is part of the
     // answer to "what is outstanding".
     let valgrind = native::prepare_valgrind().is_ok();
-    let available = check_capabilities(valgrind, coverage::LlvmTools::locate().is_ok());
+    let available = check_capabilities(
+        valgrind,
+        coverage::LlvmTools::locate().is_ok(),
+        needs_symbolic(&found, policy) && prepare_symbolic_backend(runtime).is_ok(),
+    );
     let plan = Plan::resolve(&found, config, policy, &selected, &available, today);
     let coverage = Coverage::from_plan(&plan, &found);
     let provenance = coverage_report::Provenance {
@@ -1019,31 +1190,55 @@ pub fn read_contract_inventory(
     Ok(inventory::build_and_read(library, &target)?)
 }
 
-/// What `check` can do, as distinct from what this machine has.
+/// What the unified `check --all-contracts` can do, as distinct from what this
+/// machine has.
 ///
-/// `check` runs the generated family. `symbolic` evidence comes from
-/// `cargo trace-check verify` and `dynamic` from `cargo trace-check test`, so a
-/// requirement for either is reported as un-analyzed *and told where to get
-/// it*, rather than as a missing analyzer. An earlier revision hard-coded
-/// `symbolic: false`, which reported BACKEND_UNAVAILABLE for an analyzer that
-/// may well be installed -- a claim about the machine when the truth was a
-/// claim about the command.
-fn check_capabilities(valgrind: bool, tools: bool) -> Available {
+/// It performs the generated family *and* symbolic verification. `dynamic`
+/// evidence is a developer-written `#[ct_test]`, which `cargo trace-check test`
+/// produces, so a requirement for it is reported as un-analyzed *and told where
+/// to get it* rather than as a missing analyzer -- a claim about the command,
+/// not about the machine.
+///
+/// `symbolic` used to be in that same category. It is not any more: this
+/// command runs it, so a missing analyzer image is now honestly
+/// BACKEND_UNAVAILABLE, and nothing else is allowed to stand in for it.
+fn check_capabilities(valgrind: bool, tools: bool, symbolic: bool) -> Available {
     let mut elsewhere = std::collections::BTreeMap::new();
-    elsewhere.insert(
-        Analysis::Symbolic,
-        "cargo trace-check verify --contract <id>".to_string(),
-    );
     elsewhere.insert(Analysis::Dynamic, "cargo trace-check test".to_string());
     Available {
         generated: valgrind,
         explore: valgrind && tools,
-        // Not probed, because this command does not run it either way.
-        symbolic: false,
+        symbolic,
         dynamic: valgrind,
-        performs: vec![Analysis::Generated, Analysis::Explore],
+        performs: vec![Analysis::Generated, Analysis::Explore, Analysis::Symbolic],
         elsewhere,
     }
+}
+
+/// Whether any declaration's policy asks for symbolic verification.
+///
+/// The analyzer is prepared only when the answer is yes. A project requiring
+/// nothing symbolic must not need a container runtime to run `check`, and
+/// probing for one it will never use would make a missing image visible in a
+/// report that has no symbolic obligation to report it against.
+fn needs_symbolic(found: &ContractInventory, policy: &enforcement::PolicyConfig) -> bool {
+    found.contracts.iter().any(|declaration| {
+        policy
+            .required_for(&declaration.id)
+            .contains(&Analysis::Symbolic)
+    })
+}
+
+/// Prepares the one analyzer the whole run shares, or says why it cannot.
+///
+/// One prepared verifier per run, reused across contracts: its identity is the
+/// analyzer's, which is shared, while the artifact identities are per contract
+/// and stay on each result. Preparing it once also means a missing image is
+/// diagnosed once rather than per contract.
+fn prepare_symbolic_backend(runtime: Option<&str>) -> Result<symbolic::Verifier, String> {
+    let mut verifier = symbolic::Verifier::prepare_with(runtime).map_err(|e| e.to_string())?;
+    verifier.check_image().map_err(|e| e.to_string())?;
+    Ok(verifier)
 }
 
 /// What analysing one contract produced.
@@ -1126,6 +1321,7 @@ fn fold_analysis(analysis: Analysis, analysed: &Analysed) -> AnalysisEvidence {
         detail,
         check: Some(analysed.check.clone()),
         discovery: analysed.discovery.clone(),
+        symbolic: None,
         reproducers: analysed.reproducers.clone(),
     }
 }

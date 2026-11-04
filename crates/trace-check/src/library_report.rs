@@ -166,6 +166,77 @@ pub struct Verified {
     pub result: CaseResult,
 }
 
+/// One verified contract's whole record, with its provenance intact.
+///
+/// Extracted from [`build`] so a unified run can hold a single contract's
+/// symbolic evidence without assembling a standalone report around it. A
+/// symbolic requirement is discharged by this value, not by the string
+/// `VERIFIED_BOUNDED`: it carries the artifact the result describes, the symbol
+/// it was attributed to, the evidence that the analyzer reached it, the declared
+/// and generated input domain, the observation classes checked, and the depth
+/// bound the search held to.
+pub fn contract_report(
+    entry: Verified,
+    analyzer: &AnalyzerIdentity,
+    path_retained: bool,
+) -> ContractReport {
+    let expected = Outcome::parse(&entry.case.expected_outcome)
+        .expect("the configuration was validated on load");
+    ContractReport {
+        contract: entry.contract.id.clone(),
+        module: entry.contract.module.clone(),
+        function: entry.contract.function.clone(),
+        declared_at: entry.contract.site.clone(),
+        description: entry.case.description.clone(),
+        rationale: entry.case.rationale.clone(),
+        library: entry.library,
+        compilation: Compilation {
+            rustc: analyzer.rustc_version.clone(),
+            target: crate::symbolic::SUPPORTED_TARGET.to_string(),
+            profile: crate::harness::PROFILE.to_string(),
+            panic: crate::harness::PANIC_STRATEGY.to_string(),
+            rustflags: crate::harness::RUSTFLAGS.join(" "),
+            lto: false,
+        },
+        symbol: SymbolBinding {
+            contract: entry.symbol.contract.clone(),
+            mangled: entry.symbol.mangled.clone(),
+            address: entry.symbol.address.clone(),
+            reached: entry.result.target.reached,
+            reached_at: entry.result.target.address.clone(),
+        },
+        harness: HarnessProvenance {
+            entry_symbol: entry.case.entry_symbol.clone(),
+            halt_symbol: entry.case.halt_symbol.clone(),
+            output_global: crate::harness::OUTPUT_GLOBAL.to_string(),
+            sha256: entry.harness.source_sha256.clone(),
+            call_shape: "laundered function pointer (out-of-line instance)",
+            source: entry.harness.source.clone(),
+        },
+        artifact: ArtifactProvenance {
+            path: entry.artifact.path.display().to_string(),
+            sha256: entry.artifact.sha256.clone(),
+            lockfile_sha256: entry.artifact.lockfile_sha256.clone(),
+            path_retained,
+            production_artifact: PRODUCTION_ARTIFACT,
+        },
+        generated_domain: entry.harness.generated_assumptions.clone(),
+        inputs: entry.harness.inputs.clone(),
+        input_domain: entry
+            .case
+            .assumptions
+            .iter()
+            .filter(|assumption| !entry.harness.generated_assumptions.contains(assumption))
+            .cloned()
+            .collect(),
+        max_depth: entry.case.max_depth,
+        solver_timeout_secs: entry.case.solver_timeout_secs,
+        evidence: Evidence::BoundedRelationalSymbolic,
+        expectation: Expectation::new(expected, entry.result.outcome),
+        analysis: entry.result,
+    }
+}
+
 pub fn build(
     entries: Vec<Verified>,
     analyzer: AnalyzerIdentity,
@@ -174,63 +245,7 @@ pub fn build(
 ) -> LibraryReport {
     let contracts: Vec<ContractReport> = entries
         .into_iter()
-        .map(|entry| {
-            let expected = Outcome::parse(&entry.case.expected_outcome)
-                .expect("the configuration was validated on load");
-            ContractReport {
-                contract: entry.contract.id.clone(),
-                module: entry.contract.module.clone(),
-                function: entry.contract.function.clone(),
-                declared_at: entry.contract.site.clone(),
-                description: entry.case.description.clone(),
-                rationale: entry.case.rationale.clone(),
-                library: entry.library,
-                compilation: Compilation {
-                    rustc: analyzer.rustc_version.clone(),
-                    target: crate::symbolic::SUPPORTED_TARGET.to_string(),
-                    profile: crate::harness::PROFILE.to_string(),
-                    panic: crate::harness::PANIC_STRATEGY.to_string(),
-                    rustflags: crate::harness::RUSTFLAGS.join(" "),
-                    lto: false,
-                },
-                symbol: SymbolBinding {
-                    contract: entry.symbol.contract.clone(),
-                    mangled: entry.symbol.mangled.clone(),
-                    address: entry.symbol.address.clone(),
-                    reached: entry.result.target.reached,
-                    reached_at: entry.result.target.address.clone(),
-                },
-                harness: HarnessProvenance {
-                    entry_symbol: entry.case.entry_symbol.clone(),
-                    halt_symbol: entry.case.halt_symbol.clone(),
-                    output_global: crate::harness::OUTPUT_GLOBAL.to_string(),
-                    sha256: entry.harness.source_sha256.clone(),
-                    call_shape: "laundered function pointer (out-of-line instance)",
-                    source: entry.harness.source.clone(),
-                },
-                artifact: ArtifactProvenance {
-                    path: entry.artifact.path.display().to_string(),
-                    sha256: entry.artifact.sha256.clone(),
-                    lockfile_sha256: entry.artifact.lockfile_sha256.clone(),
-                    path_retained,
-                    production_artifact: PRODUCTION_ARTIFACT,
-                },
-                generated_domain: entry.harness.generated_assumptions.clone(),
-                inputs: entry.harness.inputs.clone(),
-                input_domain: entry
-                    .case
-                    .assumptions
-                    .iter()
-                    .filter(|assumption| !entry.harness.generated_assumptions.contains(assumption))
-                    .cloned()
-                    .collect(),
-                max_depth: entry.case.max_depth,
-                solver_timeout_secs: entry.case.solver_timeout_secs,
-                evidence: Evidence::BoundedRelationalSymbolic,
-                expectation: Expectation::new(expected, entry.result.outcome),
-                analysis: entry.result,
-            }
-        })
+        .map(|entry| contract_report(entry, &analyzer, path_retained))
         .collect();
 
     let count = |outcome: Outcome| {
@@ -523,8 +538,19 @@ fn render(value: Option<u64>) -> String {
     value.map_or_else(|| "?".to_string(), |value| value.to_string())
 }
 
+/// A clean symbolic record for the enforcement tests, built through the real
+/// mapping so a field that stops being carried breaks them too.
 #[cfg(test)]
-mod tests {
+pub(crate) fn sample_contract_report() -> ContractReport {
+    contract_report(
+        tests::verified(Outcome::VerifiedBounded, "VERIFIED_BOUNDED", Vec::new()),
+        &tests::analyzer(),
+        false,
+    )
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
     use super::*;
     use crate::contract::{Descriptor, Role};
     use crate::harness::Artifact;
@@ -533,7 +559,7 @@ mod tests {
 
     const VERIFY_TAG: &str = r#"{"schema_version":1,"function":"verify_tag","parameters":[{"name":"expected","position":0,"role":"secret","repr":"ref-byte-array","length":16,"rust_type":"&[u8; 16]"},{"name":"supplied","position":1,"role":"public","repr":"ref-byte-array","length":16,"rust_type":"&[u8; 16]"}],"returns":{"repr":"bool","rust_type":"bool"}}"#;
 
-    fn analyzer() -> AnalyzerIdentity {
+    pub(crate) fn analyzer() -> AnalyzerIdentity {
         AnalyzerIdentity {
             rustc_version: "rustc 1.97.0".into(),
             analyzer: crate::symbolic::ANALYZER_NAME.into(),
@@ -545,7 +571,11 @@ mod tests {
         }
     }
 
-    fn verified(outcome: Outcome, expected: &str, divergences: Vec<Divergence>) -> Verified {
+    pub(crate) fn verified(
+        outcome: Outcome,
+        expected: &str,
+        divergences: Vec<Divergence>,
+    ) -> Verified {
         let contract = Contract {
             id: "crypto::tag::verify_tag".into(),
             module: "crypto::tag".into(),
