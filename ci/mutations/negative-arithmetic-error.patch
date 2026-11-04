@@ -1,0 +1,17 @@
+--- a/src/uint/add.rs
++++ b/src/uint/add.rs
+@@ -22,7 +22,13 @@
+         while i < LIMBS {
+             let (w, c) = self.limbs[i].carrying_add(rhs.limbs[i], carry);
+             limbs[i] = w;
+-            carry = c;
++            // M9 NEGATIVE CONTROL: drop the carry instead of propagating it.
++            // This is an arithmetic *error*, not a side channel: the sum is
++            // wrong whenever a limb overflows. The mutation workflow must
++            // reject it on the independent oracle before interpreting any
++            // side-channel finding.
++            let _ = c;
++            carry = Limb::ZERO;
+             i += 1;
+         }
+ 

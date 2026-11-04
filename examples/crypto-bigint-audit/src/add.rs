@@ -5,9 +5,27 @@
 //! arrays are valid operands and a finding cannot be an artifact of feeding
 //! the operation inputs its mathematics does not admit.
 
-use crate::sink::consume_all_bytes;
+use crate::sink::{consume_all_bytes, result_array};
 use crypto_bigint::U256;
 use trace_check_macros::constant_time;
+
+/// `left + right mod 2^256`, as the **complete** 32-byte result.
+///
+/// Shared by both adapters below and by the functional tests, so the tests
+/// validate the same code the contracts analyze rather than a parallel
+/// implementation of it. They have to compare the whole result: the sink maps
+/// 2^256 results onto 256 values and two byte changes can cancel exactly, so a
+/// test comparing through it cannot establish that a mutation preserved the
+/// arithmetic.
+///
+/// `#[inline(always)]` so the compiled adapter keeps the shape
+/// `docs/audits/crypto-bigint/findings.md` describes from its disassembly.
+#[inline(always)]
+pub fn wrapping_add_bytes(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let a = U256::from_be_slice(left);
+    let b = U256::from_be_slice(right);
+    result_array(a.wrapping_add(&b).to_be_bytes().as_slice())
+}
 
 /// Per-contract discriminants, and why they exist.
 ///
@@ -33,9 +51,7 @@ pub const BOTH_SECRET_TAG: u8 = 0xa5;
 /// result. It contains no arithmetic of its own.
 #[constant_time(secret = "left", dynamic = false)]
 pub fn wrapping_add_secret_left(left: &[u8; 32], right: &[u8; 32]) -> u8 {
-    let a = U256::from_be_slice(left);
-    let b = U256::from_be_slice(right);
-    consume_all_bytes(a.wrapping_add(&b).to_be_bytes().as_slice()) ^ SECRET_LEFT_TAG
+    consume_all_bytes(&wrapping_add_bytes(left, right)) ^ SECRET_LEFT_TAG
 }
 
 /// The same operation with **both** operands secret.
@@ -46,9 +62,7 @@ pub fn wrapping_add_secret_left(left: &[u8; 32], right: &[u8; 32]) -> u8 {
 /// was checked.
 #[constant_time(secret = "left", secret = "right", dynamic = false)]
 pub fn wrapping_add_both_secret(left: &[u8; 32], right: &[u8; 32]) -> u8 {
-    let a = U256::from_be_slice(left);
-    let b = U256::from_be_slice(right);
-    consume_all_bytes(a.wrapping_add(&b).to_be_bytes().as_slice()) ^ BOTH_SECRET_TAG
+    consume_all_bytes(&wrapping_add_bytes(left, right)) ^ BOTH_SECRET_TAG
 }
 
 #[cfg(test)]
@@ -65,6 +79,9 @@ mod tests {
             ([0xff; 32], [0xff; 32]),
         ] {
             let expected = reference_wrapping_add(&left, &right);
+            // Full width, against the schoolbook reference.
+            assert_eq!(wrapping_add_bytes(&left, &right), expected);
+            // And the adapter is that helper plus its discriminant.
             assert_eq!(
                 wrapping_add_secret_left(&left, &right),
                 consume_all_bytes(&expected) ^ SECRET_LEFT_TAG
@@ -104,6 +121,7 @@ mod tests {
         let sum = reference_wrapping_add(&left, &right);
         assert_eq!(sum[23], 1, "the carry must land in the next limb");
         assert_eq!(&sum[24..], &[0u8; 8], "the low limb must wrap to zero");
+        assert_eq!(wrapping_add_bytes(&left, &right), sum);
         assert_eq!(
             wrapping_add_secret_left(&left, &right),
             consume_all_bytes(&sum) ^ SECRET_LEFT_TAG

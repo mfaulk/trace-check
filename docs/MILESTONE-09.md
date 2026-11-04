@@ -201,8 +201,8 @@ python3 ci/mutate-m9.py --mutation mutation-c-indexed-reduction \
 | Upstream source changes in the clean integration | **0** |
 | Adapter code, three targets, outside tests | 17 + 16 + 27 lines |
 | Configuration entries, none assigning a secret role | 18 `[check]` + 18 `[verify]` |
-| Independent oracle vectors | 1012, all passing |
-| `check --all-contracts --ci`, 18 contracts | 317 s wall, 187 MB peak RSS |
+| Independent oracle vectors | 1012, compared at full 32-byte width, all passing |
+| `check --all-contracts --ci`, 18 contracts | 320–440 s wall, 187 MB peak RSS |
 | Operations clean on unmodified library code | 5 contracts over 3 operations |
 | Declared contracts, all accounted for | 18 |
 | Controls detected | 7 of 7, covering first / interior / last secret byte, a library-produced carry, an address, and a branchy selection |
@@ -246,6 +246,12 @@ Measured limits, each with a fixture that keeps it measured:
   neither names the cause — the symbolic one comes closest.
 * **`site` names the contract's frame, not the leaking instruction's.** An
   upstream finding read from `site` alone looks like an adapter finding.
+* **The output sink is lossy, so nothing may compare correctness through it.**
+  It maps 2^256 results onto 256 values and, being linear, admits exact
+  cancellation between two byte changes. Each operation therefore has a shared
+  helper returning the complete 32-byte result; the adapter folds it, the
+  oracle compares it, and `sink.rs` pins a concrete collision so the
+  constraint stays visible.
 
 Scope limits:
 
@@ -303,9 +309,16 @@ these point to.
       branch findings and one address finding.
 - [x] Mutations leave the adapter and its contract unchanged.
 - [x] Every mutation reproducible from a pinned source and an explicit patch,
-      with validity controls for a stale patch, an unexecuted mutation and a
-      reused artifact.
-- [x] M6 versus M7 detection effectiveness measured on this integration:
+      with validity controls for a stale patch, an unexecuted mutation, a
+      mutation that breaks the arithmetic, a reused artifact and a drifting
+      dependency graph. Each experiment stages the committed lockfile, builds
+      `--locked`, runs the 1012 full-width oracle vectors against both the
+      clean and the mutated dependency, and requires the two dependency graphs
+      to be identical where the artifacts must differ.
+- [x] M6 versus M7 detection effectiveness **asserted** on this integration,
+      not merely measured — coverage guidance must find strictly more than
+      `m6-default`, lose none of either baseline's detections, and detect
+      `nested_modes` specifically:
       `m6-default` 2 of 5, `m6-random-10x` 1 of 5, `m7-explore` 3 of 5, the
       symbolic backend 5 of 5, with no false positive on either clean fixture.
 - [x] Symbolic feasibility evaluated — all eighteen contracts, every

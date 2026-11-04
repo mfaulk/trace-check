@@ -680,7 +680,8 @@ selection compiles to four `test`/`cmovne` pairs through the `cmov` crate and
 is clean, while the same function written with a branch is found. And nothing is
 read as a security result before `cargo test` passes — 1012 vectors whose
 expected values were computed in Python's arbitrary-precision integers, which
-share no code with the library under audit.
+share no code with the library under audit, compared at the operation's full
+32-byte width rather than through the lossy output sink.
 
 The decisive evidence is that changing the **library**, not the harness, flips
 the verdict. Three mutations do, in three different files:

@@ -17,6 +17,13 @@ chosen. A clean fixture is included in every run, because a strategy that
 One fixture is expected to be found by neither strategy, and one by M6 alone.
 A table where coverage guidance wins every row would be measuring the fixtures.
 
+The acceptance properties are **asserted**, not printed: m7-explore must find
+strictly more planted vulnerabilities than m6-default, must lose none that
+either M6 baseline found, must detect `nested_modes` specifically, and no
+configuration may report a finding on a clean fixture. m6-default must *not*
+detect `nested_modes`, or the fixture has stopped isolating what coverage
+guidance adds.
+
 Run from the repository root:
 
     python3 ci/benchmark-m9.py            # the full comparison
@@ -77,6 +84,11 @@ FIXTURES = [
     ),
     ("cbaudit::select::ct_select", 64, False, False, "clean control, the library's CtSelect"),
 ]
+
+# The fixture the improvement is demonstrated with, and the one the quick set
+# exists to exercise. Named here so the acceptance check is about *this* gap
+# and not about a count that some other fixture could compensate for.
+DEMONSTRATION = "cbaudit::hidden::nested_modes"
 
 # The milestone's baselines. `m6-random-10x` gets ten times the budget on
 # purpose: the claim has to be that coverage guidance beats M6 given *more*
@@ -279,8 +291,14 @@ def main():
         if false_positives:
             sys.exit(f"FAIL: a clean fixture reported a finding: {false_positives}")
 
-    # The acceptance property: coverage guidance must find strictly more
-    # planted vulnerabilities than either M6 baseline, and lose none.
+    # The acceptance property, asserted rather than printed: coverage guidance
+    # must find *strictly more* planted vulnerabilities than either M6
+    # baseline, must lose none of theirs, and must find the specific fixture
+    # the improvement is demonstrated with.
+    #
+    # Printing `gained` without checking it was the original mistake here: a
+    # regression to M6-equivalent detection would have left the CI job named
+    # "coverage guidance finds more vulnerable paths" green.
     by_name = {
         result["configuration"]: {
             row["contract"]
@@ -297,15 +315,37 @@ def main():
                 f"FAIL: {baseline} found {sorted(lost)} and m7-explore did not. "
                 "Coverage guidance must not lose a detection it replaces"
             )
-    gained = sorted(explore - by_name["m6-default"])
+
     print(
         f"\nm7-explore finds {len(explore)} of {len(planted)} planted "
         f"vulnerabilities; m6-default finds {len(by_name['m6-default'])}, "
         f"m6-random-10x finds {len(by_name['m6-random-10x'])}."
     )
+    gained = sorted(explore - by_name["m6-default"])
     print(f"gained by exploration: {gained or 'nothing'}")
     not_found = sorted(set(planted) - explore)
     print(f"found by no strategy:  {not_found or 'nothing'}")
+
+    if not gained:
+        sys.exit(
+            "FAIL: m7-explore found nothing m6-default did not. The milestone's "
+            "claim is that coverage guidance reaches additional vulnerable "
+            "paths, and an M6-equivalent result does not support it"
+        )
+    if DEMONSTRATION not in explore:
+        sys.exit(
+            f"FAIL: {DEMONSTRATION} was not detected by m7-explore. It is the "
+            "fixture the improvement is demonstrated with -- a conjunction over "
+            "three public predicates that boundary and pairwise generation "
+            "cannot satisfy at any budget -- so losing it is a regression even "
+            "if some other fixture compensates in the count"
+        )
+    if DEMONSTRATION in by_name["m6-default"]:
+        sys.exit(
+            f"FAIL: m6-default detected {DEMONSTRATION}, so the fixture no "
+            "longer isolates what coverage guidance adds. Check whether its "
+            "gate became reachable by boundary or pairwise generation"
+        )
 
     if arguments.json:
         pathlib.Path(arguments.json).write_text(json.dumps(results, indent=1))
