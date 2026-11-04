@@ -56,7 +56,7 @@ The invariant this example is built around:
 > has separately demonstrated that declared secret dependencies reach the
 > target operation.
 
-That demonstration is the six controls in `src/controls.rs`, which are
+That demonstration is the controls in `src/controls.rs`, which are
 `expected_outcome = "LEAK_DETECTED"` in `trace-check.toml`. If one of them ever
 stops being detected, the run fails on an unmet expectation rather than
 reporting a clean sweep.
@@ -99,13 +99,14 @@ direction that makes the tool useless.
 
 * Any claim that `crypto-bigint` is secure, or insecure. Three operations under
   one observation model on one target is not an audit of a library.
-* Operations the adapters do not reach. The compiled inventory covers the nine
-  declarations in this example and nothing else; `crypto-bigint` has hundreds
-  of public functions, and a function with no declaration is not accounted for
-  here at all.
+* Operations the adapters do not reach. The compiled inventory covers the
+  eighteen declarations in this example and nothing else; `crypto-bigint` has
+  hundreds of public functions, and a function with no declaration is not
+  accounted for here at all.
 * Hardware timing measurement, other architectures, other toolchains, and
   other feature selections.
 * Proof. A generated dynamic check is `NO_LEAK_OBSERVED` over the inputs it
-  ran. The symbolic backend can say `VERIFIED_BOUNDED`, and that too is bounded
-  by a depth limit, an input domain and one artifact — M9.6 evaluates whether
-  it reaches this integration at all.
+  ran. The symbolic backend does say `VERIFIED_BOUNDED` for every clean
+  contract here, and that too is bounded by a depth limit, an input domain and
+  one artifact that is not a production binary — see
+  [`symbolic-feasibility.md`](symbolic-feasibility.md).

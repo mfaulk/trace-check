@@ -161,10 +161,9 @@ in its source.
 Two leaks, one in each place, and the requirement is that neither is reported
 as the other.
 
-**A leak confined to the adapter.** All six controls in Experiment B are
-adapter-local. Every one was attributed to a `controls.rs` line, and no
-finding's stack contains a `crypto-bigint` frame. None was misattributed
-upstream.
+**A leak confined to the adapter.** Every control in Experiment B is
+adapter-local, and every one was attributed to a `controls.rs` line with no
+`crypto-bigint` frame anywhere in its stack. None was misattributed upstream.
 
 **A leak confined to the library.** `ci/mutations/mutation-a-carry-branch.patch`
 adds a branch on the running carry inside `Uint::carrying_add`
@@ -261,6 +260,7 @@ what licenses reading the side-channel results at all.
 | Manual configuration entries | 13 (`trace-check.toml`), none of which assigns a secret role |
 | Independent oracle vectors | 1012, all passing |
 | `check --all-contracts --ci`, 13 contracts, 64 cases each | 107 s wall, 174 MB peak RSS |
+| the same after M9.7 added five discovery fixtures, 18 contracts | 317 s wall, 187 MB peak RSS |
 | Unsupported Rust constructs encountered | none |
 | Compiler or dependency configuration changes | none beyond `default-features = false` |
 

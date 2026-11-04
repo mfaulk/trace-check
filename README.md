@@ -706,8 +706,8 @@ artifact hashes must differ or the run fails. A stale patch and a mutation in a
 function that is never called both fail as invalid experiments instead of being
 reported as clean.
 
-The same thirteen contracts also go through the **symbolic** backend, and all
-thirteen settle with zero `INCONCLUSIVE` — including 256-bit Montgomery
+The same eighteen contracts also go through the **symbolic** backend, and all
+eighteen settle with zero `INCONCLUSIVE` — including 256-bit Montgomery
 multiplication, in four seconds. Relational verification of branchless code is
 cheap no matter how wide the arithmetic is: the cost scales with paths and
 observations, not with term size, and constant-time code has one path. Reaching
@@ -1152,7 +1152,7 @@ docs/adapter-guide.md            writing an audit adapter for another library
 
 ```sh
 cargo test --workspace --lib --bins       # fast suite, no backends needed
-cargo test --workspace                    # 153 tests; backend tests skip without WABT/Valgrind
+cargo test --workspace                    # 653 tests; backend tests skip without WABT/Valgrind
 TRACE_CHECK_REQUIRE_BACKEND=1 cargo test --workspace   # a missing backend fails instead
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all
