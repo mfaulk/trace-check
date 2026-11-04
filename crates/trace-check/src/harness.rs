@@ -1273,6 +1273,7 @@ mod tests {
             checks: vec![CheckFeature::ControlFlow, CheckFeature::MemoryAccess],
             assumptions: Vec::new(),
             expected_outcome: "VERIFIED_BOUNDED".into(),
+            expectation: None,
             inputs: Default::default(),
         }
     }
@@ -1520,6 +1521,7 @@ mod tests {
             checks: vec![CheckFeature::ControlFlow, CheckFeature::MemoryAccess],
             assumptions: vec!["TC_PUBLIC_SUPPLIED < 4".into()],
             expected_outcome: "VERIFIED_BOUNDED".into(),
+            expectation: None,
             inputs: Default::default(),
         };
         let case = verification_case(&contract, &symbol, &harness, &settings);

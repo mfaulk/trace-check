@@ -828,18 +828,28 @@ pub struct PlanEntry {
     /// Statuses settled without running anything: unsupported signatures,
     /// waivers, contracts not selected for this run.
     pub settled: BTreeMap<Analysis, Status>,
-    /// The outcome an *analyzer-regression* fixture is declared to produce.
+    /// The outcome an *analyzer-regression* fixture is declared to produce,
+    /// **per analysis**.
     ///
-    /// `None` for a security contract, which is the default and the policy a
+    /// Empty for a security contract, which is the default and the policy a
     /// developer's own function gets. M6's split is preserved rather than
     /// reinterpreted: for a security contract a leak fails, and for a fixture
     /// that exists to hold trace-check to detecting a planted leak, finding it
     /// is the fixture passing.
     ///
-    /// It can only arrive from an explicit `expectation =
-    /// "analyzer-regression"`, because `CheckSettings::validate` refuses an
-    /// `expected_outcome` on a security contract.
-    pub regression_expectation: Option<Outcome>,
+    /// Per analysis because one value per contract cannot describe the
+    /// fixtures this project already has. `cbaudit::hidden::magic_gate` hides a
+    /// leak behind an exact public-input equality: generated inputs never guess
+    /// the gate and observe none, a solver finds it. `crypto::tag::    /// verify_tag_early_exit` is the same disagreement inverted -- the dynamic
+    /// backend's build keeps the per-byte branch and finds it, the symbolic
+    /// backend's build vectorizes it away and verifies bounded. Both are two
+    /// honest answers about two compilations, and judging one backend's result
+    /// against the other's declaration reports a fixture that is behaving
+    /// exactly as declared as broken.
+    ///
+    /// The *purpose* stays single -- see [`VerifyConfig::purpose`]. Only the
+    /// declared outcome varies by backend.
+    pub regression_expectations: BTreeMap<Analysis, Outcome>,
     /// Whether this contract was selected for the requested run.
     pub selected: bool,
 }
@@ -897,7 +907,9 @@ impl Plan {
             let required = policy.required_for(&declaration.id);
             let is_selected = chosen.contains(declaration.id.as_str());
             let mut settled: BTreeMap<Analysis, Status> = BTreeMap::new();
-            let symbolic_conflict = regression_expectation_conflict(config, &declaration.id);
+            let declared = regression_expectations(config, &declaration.id);
+            let is_fixture =
+                config.purpose(&declaration.id) == crate::contract::Expectation::AnalyzerRegression;
             for analysis in &required {
                 if let Some(status) = settle(
                     declaration,
@@ -907,7 +919,7 @@ impl Plan {
                     available,
                     today,
                     config.settings(&declaration.id).is_some(),
-                    symbolic_conflict.as_deref(),
+                    is_fixture.then(|| declared.contains_key(analysis)),
                 ) {
                     settled.insert(*analysis, status);
                 }
@@ -917,7 +929,7 @@ impl Plan {
                 site: declaration.site(),
                 required,
                 settled,
-                regression_expectation: regression_expectation(config, &declaration.id),
+                regression_expectations: declared,
                 selected: is_selected,
             });
         }
@@ -933,41 +945,42 @@ impl Plan {
     }
 }
 
-/// The declared outcome of an analyzer-regression fixture, if the
-/// configuration makes it one.
-fn regression_expectation(config: &VerifyConfig, contract: &str) -> Option<Outcome> {
-    let settings = config.check.get(contract)?;
-    if settings.expectation != crate::contract::Expectation::AnalyzerRegression {
-        return None;
-    }
-    Outcome::parse(settings.expected_outcome.as_deref()?)
-}
-
-/// Whether a fixture declares one outcome for generated checking and another
-/// for symbolic verification, which this model cannot hold.
+/// What an analyzer-regression fixture declares each backend will produce.
 ///
-/// Only ever `Some` for a declared analyzer-regression fixture. A security
-/// contract has no expectation to conflict with: `CheckSettings::validate`
-/// refuses an `expected_outcome` on one, and its symbolic obligation is
-/// discharged by `VERIFIED_BOUNDED` or not at all.
-fn regression_expectation_conflict(config: &VerifyConfig, contract: &str) -> Option<String> {
-    let check = config.check.get(contract)?;
-    if check.expectation != crate::contract::Expectation::AnalyzerRegression {
-        return None;
+/// Empty for a security contract: its obligations are discharged by the outcome
+/// the analysis establishes, never by one the configuration asked for.
+///
+/// Each table governs the analyses it configures. `[check]` is M6's generated
+/// corpus, so it governs `generated` and `explore` -- the same backend over
+/// better-chosen inputs, which cannot be declared to disagree with itself.
+/// `[verify]` is M5's bounded search, so it governs `symbolic`. Nothing governs
+/// `dynamic`: M3 has no expectation syntax, so a `dynamic` requirement on a
+/// fixture is reported as a configuration gap rather than guessed at.
+pub fn regression_expectations(
+    config: &VerifyConfig,
+    contract: &str,
+) -> BTreeMap<Analysis, Outcome> {
+    let mut declared = BTreeMap::new();
+    if config.purpose(contract) != crate::contract::Expectation::AnalyzerRegression {
+        return declared;
     }
-    let generated = Outcome::parse(check.expected_outcome.as_deref()?)?;
-    let symbolic = Outcome::parse(&config.verify.get(contract)?.expected_outcome)?;
-    if generated == symbolic {
-        return None;
+    if let Some(outcome) = config
+        .check
+        .get(contract)
+        .and_then(|entry| entry.expected_outcome.as_deref())
+        .and_then(Outcome::parse)
+    {
+        declared.insert(Analysis::Generated, outcome);
+        declared.insert(Analysis::Explore, outcome);
     }
-    Some(format!(
-        "`{contract}` is an analyzer-regression fixture declaring {generated} for generated \
-         checking and {symbolic} for symbolic verification. Both can be right -- a leak behind a \
-         public gate is reached by a solver and not by generated inputs -- but enforcement holds \
-         one expected outcome per contract, taken from [check], so the symbolic result would be \
-         judged against the generated expectation. Verify it with `cargo trace-check verify \
-         --contract {contract}` until expectations are modelled per analysis"
-    ))
+    if let Some(outcome) = config
+        .verify
+        .get(contract)
+        .and_then(|entry| Outcome::parse(&entry.expected_outcome))
+    {
+        declared.insert(Analysis::Symbolic, outcome);
+    }
+    declared
 }
 
 /// What one requirement's status is before any backend runs, if it is already
@@ -981,7 +994,9 @@ fn settle(
     available: &Available,
     today: &str,
     configured_for_symbolic: bool,
-    symbolic_conflict: Option<&str>,
+    // `Some(false)` when this contract is an analyzer-regression fixture that
+    // declares no outcome for this analysis; `None` when it is not a fixture.
+    fixture_declares_this_analysis: Option<bool>,
 ) -> Option<Status> {
     // An expired waiver is not a waiver. It is reported as the gap it always
     // was, with its reason, so the lapse is visible rather than silent.
@@ -1026,26 +1041,30 @@ fn settle(
             });
         }
     }
-    // An analyzer-regression fixture whose two backends are declared to behave
-    // differently cannot yet be enforced, because the enforcement model holds
-    // one expectation per contract and takes it from `[check]`.
-    //
-    // M9 produced the fixtures that make this concrete: a leak behind an exact
-    // public-input equality is `NO_LEAK_OBSERVED` to generated testing, which
-    // never guesses the gate, and `LEAK_DETECTED` to symbolic execution, which
-    // solves for it. Both are correct. Folding the symbolic result against the
-    // generated expectation would report the fixture as misbehaving when it is
-    // behaving exactly as declared.
-    //
-    // Settled as a gap, not papered over: strict CI fails, the reason names the
-    // configuration, and no result is attributed to the wrong expectation.
-    // Modelling expectations per analysis is M10.1.
-    if analysis == Analysis::Symbolic {
-        if let Some(detail) = symbolic_conflict {
-            return Some(Status::Inconclusive {
-                detail: detail.to_string(),
-            });
-        }
+    // An analyzer-regression fixture is held to the outcome it declares. With
+    // no declared outcome for *this* analysis there is nothing to hold it to:
+    // the fixture makes no security claim a clean result could discharge, so
+    // the requirement cannot be judged and is reported as the configuration gap
+    // it is. Guessing -- in either direction -- would either fail a fixture
+    // that never claimed anything about this backend, or pass one on a result
+    // nobody predicted.
+    if fixture_declares_this_analysis == Some(false) {
+        return Some(Status::Inconclusive {
+            detail: format!(
+                "`{}` is an analyzer-regression fixture and declares no expected outcome for                  `{analysis}`, so there is nothing for this analysis to reproduce. Declare one                  in {}, or require an analysis the fixture does describe",
+                declaration.id,
+                match analysis {
+                    Analysis::Generated | Analysis::Explore =>
+                        format!("[check.\"{}\"].expected_outcome", declaration.id),
+                    Analysis::Symbolic =>
+                        format!("[verify.\"{}\"].expected_outcome", declaration.id),
+                    // M3 has no expectation syntax to point at.
+                    Analysis::Dynamic =>
+                        "a developer-written `#[ct_test]`, whose expectations are not yet                          modelled"
+                            .to_string(),
+                }
+            ),
+        });
     }
     // Symbolic verification needs declared bounds -- an exploration depth and
     // an observation model -- which cannot be inferred from a signature. A
@@ -1210,9 +1229,9 @@ impl Available {
 pub struct ContractCoverage {
     pub id: String,
     pub site: String,
-    /// See [`PlanEntry::regression_expectation`].
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub regression_expectation: Option<Outcome>,
+    /// See [`PlanEntry::regression_expectations`].
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub regression_expectations: BTreeMap<Analysis, Outcome>,
     /// Whether the macro emitted M3's test adapter for it, recorded because a
     /// `dynamic` requirement cannot be met without one.
     pub dynamic_adapter_enabled: bool,
@@ -1242,13 +1261,19 @@ impl ContractCoverage {
         }
         // Evidence of a leak is a violation *unless* this contract is a
         // declared analyzer-regression fixture whose whole purpose is to be
-        // detected. That split is M6's and is preserved exactly: only an
-        // explicit `expectation = "analyzer-regression"` with a matching
-        // `expected_outcome` reaches here, and a security contract cannot
+        // detected -- by **the backend that found it**. That split is M6's and
+        // is preserved exactly: only an explicit `expectation =
+        // "analyzer-regression"` reaches here, and a security contract cannot
         // declare one.
+        //
+        // Per analysis, because a fixture may declare that generated inputs
+        // will not reach its gate while a solver will. A leak found by a
+        // backend the fixture declared clean is a real surprise and still
+        // fails -- the declaration excuses only the finding it predicted.
         self.evidence.iter().any(|evidence| {
             evidence.outcome == Outcome::LeakDetected
-                && self.regression_expectation != Some(Outcome::LeakDetected)
+                && self.regression_expectations.get(&evidence.analysis)
+                    != Some(&Outcome::LeakDetected)
         })
     }
 
@@ -1298,7 +1323,7 @@ impl Coverage {
                 .map(|entry| ContractCoverage {
                     id: entry.id.clone(),
                     site: entry.site.clone(),
-                    regression_expectation: entry.regression_expectation,
+                    regression_expectations: entry.regression_expectations.clone(),
                     dynamic_adapter_enabled: inventory
                         .contract(&entry.id)
                         .is_some_and(|d| d.dynamic_adapter_enabled),
@@ -1341,7 +1366,7 @@ impl Coverage {
             return;
         };
         let analysis = evidence.analysis;
-        let status = match contract.regression_expectation {
+        let status = match contract.regression_expectations.get(&analysis).copied() {
             // An analyzer-regression fixture is held to the outcome it
             // declares, which is a statement about trace-check rather than
             // about the function being secure. A planted leak that was found
@@ -2917,5 +2942,244 @@ mod tests {
             Some("INCONCLUSIVE"),
             "VERIFIED_BOUNDED for a different artifact is not a dynamic check of this one"
         );
+    }
+
+    /// `[verify]` declares the purpose when there is no `[check]` entry to
+    /// carry it, and either table declaring it is enough.
+    #[test]
+    fn either_table_may_declare_an_analyzer_regression() {
+        use crate::contract::{CheckSettings, ContractSettings, Expectation};
+
+        let settings = |expectation: Option<Expectation>| ContractSettings {
+            max_depth: 4000,
+            solver_timeout_secs: 30,
+            wall_timeout_secs: 900,
+            checks: vec![CheckFeature::ControlFlow],
+            expected_outcome: "LEAK_DETECTED".to_string(),
+            expectation,
+            description: String::new(),
+            rationale: String::new(),
+            assumptions: Vec::new(),
+            inputs: BTreeMap::new(),
+        };
+
+        // Neither table says: a security contract, which is the safe default.
+        let mut config = VerifyConfig::empty();
+        config
+            .verify
+            .insert("crypto::a::probe".to_string(), settings(None));
+        assert_eq!(
+            config.purpose("crypto::a::probe"),
+            Expectation::SecurityContract
+        );
+        assert!(regression_expectations(&config, "crypto::a::probe").is_empty());
+
+        // `[verify]` says so, with no `[check]` entry at all -- the shape every
+        // M4/M5-era fixture has.
+        let mut config = VerifyConfig::empty();
+        config.verify.insert(
+            "crypto::a::probe".to_string(),
+            settings(Some(Expectation::AnalyzerRegression)),
+        );
+        assert_eq!(
+            config.purpose("crypto::a::probe"),
+            Expectation::AnalyzerRegression
+        );
+        assert_eq!(
+            regression_expectations(&config, "crypto::a::probe").get(&Analysis::Symbolic),
+            Some(&Outcome::LeakDetected)
+        );
+
+        // `[check]` says so, and `[verify]` is silent: the purpose still
+        // reaches the symbolic expectation.
+        let mut config = VerifyConfig::empty();
+        config.check.insert(
+            "crypto::a::probe".to_string(),
+            CheckSettings {
+                expectation: Expectation::AnalyzerRegression,
+                expected_outcome: Some("NO_LEAK_OBSERVED".to_string()),
+                ..CheckSettings::default()
+            },
+        );
+        config
+            .verify
+            .insert("crypto::a::probe".to_string(), settings(None));
+        assert_eq!(
+            config.purpose("crypto::a::probe"),
+            Expectation::AnalyzerRegression
+        );
+        let declared = regression_expectations(&config, "crypto::a::probe");
+        assert_eq!(
+            declared.get(&Analysis::Generated),
+            Some(&Outcome::NoLeakObserved)
+        );
+        assert_eq!(
+            declared.get(&Analysis::Explore),
+            Some(&Outcome::NoLeakObserved)
+        );
+        assert_eq!(
+            declared.get(&Analysis::Symbolic),
+            Some(&Outcome::LeakDetected)
+        );
+        assert_eq!(
+            declared.get(&Analysis::Dynamic),
+            None,
+            "M3 has no expectation syntax"
+        );
+    }
+
+    /// A fixture's two declarations are evaluated independently: each backend
+    /// is judged against its own, and neither against the other's.
+    #[test]
+    fn a_fixture_is_judged_per_analysis() {
+        use crate::contract::{CheckSettings, ContractSettings, Expectation};
+
+        let found = inventory(&["crypto::a::probe"]);
+        let mut policy = PolicyConfig::default();
+        policy.contracts.insert(
+            "crypto::a::probe".to_string(),
+            ContractPolicy {
+                required: Some(vec![Analysis::Generated, Analysis::Symbolic]),
+            },
+        );
+        let mut config = VerifyConfig::empty();
+        config.check.insert(
+            "crypto::a::probe".to_string(),
+            CheckSettings {
+                expectation: Expectation::AnalyzerRegression,
+                expected_outcome: Some("NO_LEAK_OBSERVED".to_string()),
+                ..CheckSettings::default()
+            },
+        );
+        config.verify.insert(
+            "crypto::a::probe".to_string(),
+            ContractSettings {
+                max_depth: 4000,
+                solver_timeout_secs: 30,
+                wall_timeout_secs: 900,
+                checks: vec![CheckFeature::ControlFlow],
+                expected_outcome: "LEAK_DETECTED".to_string(),
+                expectation: None,
+                description: String::new(),
+                rationale: String::new(),
+                assumptions: Vec::new(),
+                inputs: BTreeMap::new(),
+            },
+        );
+        let plan = Plan::resolve(
+            &found,
+            &config,
+            &policy,
+            &["crypto::a::probe".to_string()],
+            &Available::all(),
+            TODAY,
+        );
+        let mut coverage = Coverage::from_plan(&plan, &found);
+
+        // Each backend reproduces its own declaration.
+        coverage.fold(
+            "crypto::a::probe",
+            evidence(Analysis::Generated, Outcome::NoLeakObserved),
+        );
+        coverage.fold(
+            "crypto::a::probe",
+            evidence(Analysis::Symbolic, Outcome::LeakDetected),
+        );
+        let contract = coverage.contract("crypto::a::probe").expect("the contract");
+        assert_eq!(contract.status[&Analysis::Generated], Status::Checked);
+        assert_eq!(contract.status[&Analysis::Symbolic], Status::Checked);
+        assert!(
+            !contract.violated(),
+            "the declared leak is the fixture passing: {:?}",
+            contract.status
+        );
+        assert!(contract.satisfied());
+        assert!(coverage.blocking(&found, &policy).is_empty());
+
+        // Swap the outcomes between the backends: each is now unmet, and the
+        // leak the fixture did *not* predict for this backend is a surprise.
+        let mut coverage = Coverage::from_plan(&plan, &found);
+        coverage.fold(
+            "crypto::a::probe",
+            evidence(Analysis::Generated, Outcome::LeakDetected),
+        );
+        coverage.fold(
+            "crypto::a::probe",
+            evidence(Analysis::Symbolic, Outcome::VerifiedBounded),
+        );
+        let contract = coverage.contract("crypto::a::probe").expect("the contract");
+        assert!(
+            contract.violated(),
+            "a leak from a backend declared clean is a real surprise, not a reproduced \
+             expectation: {:?}",
+            contract.status
+        );
+        assert!(!contract.satisfied());
+        match &contract.status[&Analysis::Symbolic] {
+            Status::Inconclusive { detail } => {
+                assert!(detail.contains("declared LEAK_DETECTED"), "{detail}");
+                assert!(detail.contains("VERIFIED_BOUNDED"), "{detail}");
+            }
+            other => panic!("unexpected status: {other:?}"),
+        }
+    }
+
+    /// A fixture that declares nothing for a required analysis cannot pass it.
+    ///
+    /// There is no security claim a clean result could discharge and no
+    /// declaration to reproduce, so the requirement is the configuration gap it
+    /// is -- settled before any backend runs, and naming where to state it.
+    #[test]
+    fn a_fixture_with_no_declaration_for_an_analysis_cannot_pass_it() {
+        use crate::contract::{CheckSettings, ContractSettings, Expectation};
+
+        let found = inventory(&["crypto::a::probe"]);
+        let mut policy = PolicyConfig::default();
+        policy.contracts.insert(
+            "crypto::a::probe".to_string(),
+            ContractPolicy {
+                required: Some(vec![Analysis::Generated, Analysis::Symbolic]),
+            },
+        );
+        // A fixture declared through `[verify]`, with a `[check]` entry that
+        // states no outcome -- so `generated` has nothing to reproduce.
+        let mut config = VerifyConfig::empty();
+        config
+            .check
+            .insert("crypto::a::probe".to_string(), CheckSettings::default());
+        config.verify.insert(
+            "crypto::a::probe".to_string(),
+            ContractSettings {
+                max_depth: 4000,
+                solver_timeout_secs: 30,
+                wall_timeout_secs: 900,
+                checks: vec![CheckFeature::ControlFlow],
+                expected_outcome: "LEAK_DETECTED".to_string(),
+                expectation: Some(Expectation::AnalyzerRegression),
+                description: String::new(),
+                rationale: String::new(),
+                assumptions: Vec::new(),
+                inputs: BTreeMap::new(),
+            },
+        );
+        let plan = Plan::resolve(
+            &found,
+            &config,
+            &policy,
+            &["crypto::a::probe".to_string()],
+            &Available::all(),
+            TODAY,
+        );
+        let coverage = Coverage::from_plan(&plan, &found);
+        let contract = coverage.contract("crypto::a::probe").expect("the contract");
+        match &contract.status[&Analysis::Generated] {
+            Status::Inconclusive { detail } => {
+                assert!(detail.contains("declares no expected outcome"), "{detail}");
+                assert!(detail.contains("[check."), "{detail}");
+            }
+            other => panic!("unexpected status: {other:?}"),
+        }
+        assert_eq!(contract.status[&Analysis::Symbolic], Status::not_analyzed());
+        assert!(!contract.satisfied());
     }
 }

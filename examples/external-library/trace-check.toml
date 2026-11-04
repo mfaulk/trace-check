@@ -13,6 +13,13 @@ description = "vulnerable: the secret's low nibble selects a load address"
 rationale = "every secret executes the same instructions, so only an address-aware analysis can see this"
 max_depth = 4000
 checks = ["control-flow", "memory-access"]
+# Stated explicitly as of M10.1. This crate has no `[check]` table, which was
+# where the security-contract/analyzer-regression split lived, so there was no
+# way to say that detecting this planted leak is the fixture *passing* -- and a
+# security contract declaring that it leaks is a contradiction enforcement must
+# never be asked to resolve. Without this line the configuration is now refused
+# at load, which is the intended migration: loud, not silent.
+expectation = "analyzer-regression"
 expected_outcome = "LEAK_DETECTED"
 
 [verify."external_library::mix_when"]

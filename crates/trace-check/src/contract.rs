@@ -345,6 +345,18 @@ pub struct ContractSettings {
     /// invalidates it surfaces as an unmet expectation. Never used to decide
     /// the outcome.
     pub expected_outcome: String,
+    /// What this contract is asserting, when `[verify]` is where it is stated.
+    ///
+    /// `[check]` has carried the security-contract/analyzer-regression split
+    /// since M6, and remains its usual home. This exists for a contract that
+    /// has a `[verify]` entry and no `[check]` entry at all -- M4 and M5
+    /// predate the split, so such a fixture had no way to say that detecting
+    /// its planted leak is the test passing.
+    ///
+    /// `None` means *not stated here*, which is different from
+    /// `Some(SecurityContract)`: see [`VerifyConfig::purpose`].
+    #[serde(default)]
+    pub expectation: Option<Expectation>,
     /// Explicit restatements of the default for public parameters. Cannot
     /// assign a role; see the module documentation.
     #[serde(default)]
@@ -737,6 +749,32 @@ impl VerifyConfig {
         for (contract, settings) in &config.check {
             settings.validate(contract)?;
         }
+        // A security contract declaring that it leaks is a contradiction, and
+        // one that enforcement must never be asked to resolve at run time.
+        // `CheckSettings::validate` has refused it on the `[check]` side since
+        // M6; `[verify]` could still say it, because M4 and M5 predate the
+        // security-contract/analyzer-regression split and had no purpose to
+        // check it against.
+        //
+        // Refused at load so the answer cannot depend on what an analyzer
+        // happens to find. `VERIFIED_BOUNDED` and `INCONCLUSIVE` remain
+        // declarable on a security contract: those are tripwires on the
+        // analyzer and the toolchain, and neither can excuse a leak.
+        for (contract, settings) in &config.verify {
+            if settings.expected_outcome == "LEAK_DETECTED"
+                && config.purpose(contract) == Expectation::SecurityContract
+            {
+                return Err(ContractError::Config(format!(
+                    "{}: [verify.\"{contract}\"] declares `expected_outcome = \"LEAK_DETECTED\"` \
+                     on a security contract, which asserts the function must not leak. The two \
+                     cannot both hold. If this is one of this project's deliberately vulnerable \
+                     examples, say so with `expectation = \"analyzer-regression\"` and detecting \
+                     the planted leak becomes the fixture passing; otherwise remove the declared \
+                     outcome, because it can never make a real leak acceptable",
+                    path.display()
+                )));
+            }
+        }
         // The policy is validated at load, not at use: an exemption with no
         // reason or a requirement that establishes nothing is a configuration
         // error, and a developer should hear about it before a backend runs.
@@ -809,6 +847,41 @@ impl VerifyConfig {
     /// Whether a contract has an explicit `[check]` entry.
     pub fn is_check_configured(&self, contract: &str) -> bool {
         self.check.contains_key(contract)
+    }
+
+    /// What this contract is asserting — one purpose, however many backends
+    /// analyze it.
+    ///
+    /// A contract is an analyzer-regression fixture when **either** table says
+    /// so, and a security contract otherwise. One purpose per contract is the
+    /// point: a function is either one whose constant-time property must hold,
+    /// or an example that exists to hold trace-check to detecting a planted
+    /// leak. It cannot be the first for one backend and the second for another,
+    /// because then a declared leak would excuse a real one.
+    ///
+    /// What *is* per analysis is the declared **outcome** — see
+    /// [`crate::enforcement::regression_expectations`]. A fixture may be
+    /// `NO_LEAK_OBSERVED` to generated testing and `LEAK_DETECTED` to symbolic
+    /// execution without being any less of a fixture.
+    ///
+    /// Either table declaring it is enough rather than requiring agreement: the
+    /// declaration is an explicit opt-out of the security reading, nobody
+    /// writes it by accident, and an unstated `[check]` purpose is
+    /// indistinguishable from an explicitly stated default one.
+    pub fn purpose(&self, contract: &str) -> Expectation {
+        let declared_by_check = self
+            .check
+            .get(contract)
+            .is_some_and(|entry| entry.expectation == Expectation::AnalyzerRegression);
+        let declared_by_verify = self
+            .verify
+            .get(contract)
+            .is_some_and(|entry| entry.expectation == Some(Expectation::AnalyzerRegression));
+        if declared_by_check || declared_by_verify {
+            Expectation::AnalyzerRegression
+        } else {
+            Expectation::SecurityContract
+        }
     }
 
     /// Contracts with a `[check]` entry, in a stable order.
@@ -1046,6 +1119,7 @@ mod tests {
             checks: vec![CheckFeature::ControlFlow, CheckFeature::MemoryAccess],
             assumptions: Vec::new(),
             expected_outcome: expected.to_string(),
+            expectation: None,
             inputs: BTreeMap::new(),
         }
     }

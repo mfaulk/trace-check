@@ -160,11 +160,27 @@ def main():
         )
         waived = [analysis for analysis, state in states.items() if state == "EXEMPTED"]
         if leaked and waived:
-            regression = entry.get("regression_expectation")
-            if regression != "LEAK_DETECTED":
+            # Per analysis as of M10.1: a fixture may declare that generated
+            # inputs will not reach its gate while a solver will, so the
+            # question is whether *the backend that found the leak* predicted
+            # it. A declaration for another backend excuses nothing here.
+            declared = entry.get("regression_expectations") or {}
+            predicted = {
+                evidence["analysis"]
+                for evidence in entry.get("evidence") or []
+                if evidence.get("outcome") == "LEAK_DETECTED"
+                and declared.get(evidence.get("analysis")) == "LEAK_DETECTED"
+            }
+            unpredicted = {
+                evidence["analysis"]
+                for evidence in entry.get("evidence") or []
+                if evidence.get("outcome") == "LEAK_DETECTED"
+            } - predicted
+            if unpredicted:
                 fail(
-                    f"{name}: a leak was observed and `{waived[0]}` is EXEMPTED. A waiver may "
-                    f"excuse not performing an analysis; it may never suppress what one found"
+                    f"{name}: {sorted(unpredicted)} observed a leak and `{waived[0]}` is "
+                    f"EXEMPTED. A waiver may excuse not performing an analysis; it may never "
+                    f"suppress what one found"
                 )
 
         # Evidence is reported in the backends' own vocabulary.
