@@ -720,6 +720,26 @@ jobs:
             --manifest-path examples/external-library/Cargo.toml | tee m5-external.txt
           grep -q 'generated: TC_PUBLIC_ENABLED <= 1' m5-external.txt
 
+      # M9.6: the same thirteen contracts the dynamic job checks, through the
+      # symbolic backend. The point of running it here is not the five clean
+      # rows -- it is that the seven controls still come back LEAK_DETECTED and
+      # nothing comes back INCONCLUSIVE. A control that verified clean would
+      # mean the secret stopped being symbolic inside the library's decode, and
+      # then every clean row in the matrix would be worthless.
+      #
+      # This also covers the link fix M9 needed: before it, a freestanding
+      # artifact for any library with more than one dependency failed with
+      # `undefined symbol: rust_eh_personality` and never reached the analyzer.
+      - name: Verify the real-library audit contracts
+        env:
+          EXPECTED_CONTAINER_RUNTIME: docker
+        run: |
+          set -euo pipefail
+          cargo run --locked --release -p cargo-trace-check -- verify --all-contracts \
+            --manifest-path examples/crypto-bigint-audit/Cargo.toml | tee m9-symbolic.txt
+          grep -q 'Summary: 6 verified bounded, 7 leak detected, 0 inconclusive' m9-symbolic.txt
+          grep -q 'Every declared expectation was reproduced' m9-symbolic.txt
+
       # The milestone's defining property, asserted against the checkout rather
       # than only inside the test binary: change the library's actual
       # implementation, leave the harness design and the configuration alone,

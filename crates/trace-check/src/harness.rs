@@ -772,7 +772,18 @@ fn render_source(
          /// symbol, and anything `_start` does not reach is dropped as dead code.\n\
          /// The analyzer starts at `{ENTRY_SYMBOL}` directly, so this is never explored.\n\
          #[no_mangle]\npub extern \"C\" fn _start() -> ! {{\n\x20   {ENTRY_SYMBOL}()\n}}\n\n\
-         #[panic_handler]\nfn tc_panic(_: &core::panic::PanicInfo) -> ! {{\n\x20   loop {{}}\n}}\n"
+         #[panic_handler]\nfn tc_panic(_: &core::panic::PanicInfo) -> ! {{\n\x20   loop {{}}\n}}\n\n\
+         /// Never called -- the panic handler above loops forever and the profile\n\
+         /// is `panic = \"abort\"`. The symbol has to *exist* anyway: the\n\
+         /// precompiled `libcore` carries unwind tables, and a codegen unit with a\n\
+         /// landing pad references `rust_eh_personality` through a DWARF reference\n\
+         /// that `-nostdlib` has nothing to resolve.\n\
+         ///\n\
+         /// Found by M9: a one-crate library never pulled in such a codegen unit,\n\
+         /// so the link succeeded for every earlier example. `crypto-bigint` and\n\
+         /// its four dependencies do, and the link failed with `undefined symbol:\n\
+         /// rust_eh_personality` before any analysis ran.\n\
+         #[no_mangle]\nextern \"C\" fn rust_eh_personality() {{}}\n"
     ));
 
     let _ = library;
@@ -1234,6 +1245,24 @@ mod tests {
             harness
                 .source
                 .contains("pub static mut TC_SECRET_EXPECTED: [u8; 16] = [0; 16];"),
+            "{}",
+            harness.source
+        );
+    }
+
+    /// The freestanding harness defines `rust_eh_personality`, without which
+    /// a multi-crate dependency graph fails to link under `-nostdlib`.
+    #[test]
+    fn the_harness_defines_the_unwind_personality_symbol() {
+        let harness = generate(
+            &library(),
+            &contract(VERIFY_TAG, "crypto::tag", "verify_tag"),
+        )
+        .unwrap();
+        assert!(
+            harness
+                .source
+                .contains("extern \"C\" fn rust_eh_personality() {}"),
             "{}",
             harness.source
         );

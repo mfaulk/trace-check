@@ -45,10 +45,11 @@ clean result on `wrapping_add_secret_left`, read alone, is indistinguishable
 from a harness that marked nothing or a secret that stopped being tracked at
 the first type conversion.
 
-The six controls are what make it mean something. B2–B6 are driven by values
+The seven controls are what make it mean something. B2–B6 are driven by values
 the *library* produced from the secret bytes — decoded limbs, and in B5 the
 `Limb` carry returned by `Uint::carrying_add`. B1 is deliberately listed first
-and deliberately weak: it only shows the array was marked at all.
+and deliberately weak: it only shows the array was marked at all. B7 is the
+branchy counterexample to Target B rather than a propagation control.
 
 They are declared `expected_outcome = "LEAK_DETECTED"`, so if one ever stops
 being detected the run fails on an unmet expectation instead of reporting a
@@ -88,6 +89,30 @@ Two negative controls guard the experiment itself:
 `negative-unreached-branch.patch` puts the same branch in a function the
 adapters never call, so it reports `NO_LEAK_OBSERVED` and cannot be claimed as
 a detection.
+
+## The same contracts, verified symbolically
+
+```sh
+cargo trace-check verify --all-contracts \
+  --manifest-path examples/crypto-bigint-audit/Cargo.toml
+```
+
+Thirteen contracts, every declared expectation reproduced, **zero
+`INCONCLUSIVE`**, 13 s and 186 MB for the whole matrix — including 256-bit
+Montgomery multiplication, which M9's plan did not require to complete at all.
+`VERIFIED_BOUNDED` quantifies over the whole declared secret domain rather than
+over 64 generated inputs.
+
+It is cheap because the cost scales with paths and observations, not with term
+size: the analyzer never reasons about what a 256-bit product equals, only about
+whether an address can differ. Constant-time code is branchless, so it has one
+path. `controls::decoded_address_probe` is the row worth reading — one path,
+4/4 control-flow checks passed, 256 of 257 *memory* checks — a leak with no
+branch divergence anywhere.
+
+Measurements and caveats in
+[`docs/audits/crypto-bigint/symbolic-feasibility.md`](../../docs/audits/crypto-bigint/symbolic-feasibility.md).
+Needs `podman` or `docker`: the analyzer runs in a pinned container.
 
 ## The sink, and why it is not decoration
 

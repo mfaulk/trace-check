@@ -706,10 +706,20 @@ artifact hashes must differ or the run fails. A stale patch and a mutation in a
 function that is never called both fail as invalid experiments instead of being
 reported as clean.
 
+The same thirteen contracts also go through the **symbolic** backend, and all
+thirteen settle with zero `INCONCLUSIVE` — including 256-bit Montgomery
+multiplication, in four seconds. Relational verification of branchless code is
+cheap no matter how wide the arithmetic is: the cost scales with paths and
+observations, not with term size, and constant-time code has one path. Reaching
+that took fixing a real blocker — the freestanding artifact failed to link with
+`undefined symbol: rust_eh_personality` for any library with more than one
+dependency, which no in-repo example could have surfaced. See
+[docs/audits/crypto-bigint/symbolic-feasibility.md](docs/audits/crypto-bigint/symbolic-feasibility.md).
+
 The one integration hazard this turned up: two adapters whose bodies compile
 identically are folded to one symbol, and a finding in either then cannot be
 attributed — reported as `INCONCLUSIVE`, never as clean. See
-[docs/MILESTONE-09.md](docs/MILESTONE-09.md) for that and the other three
+[docs/MILESTONE-09.md](docs/MILESTONE-09.md) for that and the other four
 findings, [docs/adapter-guide.md](docs/adapter-guide.md) for how to write an
 adapter for a different library, and
 [docs/audits/crypto-bigint/](docs/audits/crypto-bigint/threat-model.md) for the
@@ -1101,8 +1111,9 @@ examples/crypto-bigint-audit/    audit adapters over RustCrypto crypto-bigint
                                  1012 independently computed vectors (M9)
 examples/legacy-branch-demo/     original proof of concept, kept for context
 docs/                            milestone plan, methodology, limitations
-docs/audits/crypto-bigint/       the M9 target selection, threat model and
-                                 integration report
+docs/audits/crypto-bigint/       the M9 target selection, threat model,
+                                 integration report, findings and the
+                                 symbolic feasibility matrix
 docs/spikes/m6-generated-harness/ the recorded M6.1 feasibility spike
 docs/spikes/m7-coverage-feedback/ the recorded M7.1 feasibility spike
 docs/spikes/m8-contract-inventory/ the recorded M8.1 feasibility spike
