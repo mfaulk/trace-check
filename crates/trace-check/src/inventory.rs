@@ -241,6 +241,11 @@ pub fn build_and_read(
 /// Compiles the library for inventory and returns its `rlib`.
 fn build_library(library: &Library, target_dir: &Path) -> Result<PathBuf, InventoryError> {
     let mut command = Command::new("cargo");
+    // The inventory build is of the library itself, so it uses the library's
+    // toolchain for the same reason the analysis builds do -- and because an
+    // inventory read from an rlib built by a different compiler than the
+    // analyzed artifact is a descriptor from a different build.
+    library.toolchain.apply(&mut command);
     command
         .args([
             "build",

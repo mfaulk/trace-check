@@ -55,6 +55,7 @@ pub mod security;
 pub mod symbolic;
 pub mod symbolic_report;
 pub mod taint;
+pub mod toolchain;
 pub mod wasm;
 
 #[cfg(test)]

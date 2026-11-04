@@ -377,6 +377,7 @@ mod tests {
             lib_name: "crypto".into(),
             manifest_path: "/w/examples/crypto-library/Cargo.toml".into(),
             features: Vec::new(),
+            toolchain: crate::toolchain::Toolchain::unresolved(),
         }
     }
 

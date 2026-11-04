@@ -965,3 +965,99 @@ fn the_verification_artifact_hash_is_reproducible() {
          artifact hash is the identity every report and every enforcement decision uses"
     );
 }
+
+/// The analyzed executable is built by the toolchain the **library's** project
+/// pins, and the recorded compiler is the one that built it.
+///
+/// `rustup` resolves a toolchain by walking up from the working directory.
+/// trace-check runs in the developer's project and sees its
+/// `rust-toolchain.toml`; the harness it generates is built in a private work
+/// directory under `/tmp` and does not. So the recorded `rustc --version` was
+/// the pinned compiler and the artifact was built by the machine default.
+///
+/// Demonstrated before the fix against a library pinning 1.88.0 while the
+/// default was 1.97.0: the report said `rustc 1.88.0` and the artifact was
+/// byte-identical to the 1.97.0 build. This test is that reproduction --
+/// building the same staged library twice, once relying on its pin and once
+/// with the pin forced through the environment, and requiring one artifact.
+///
+/// Skips unless a second toolchain is installed, because with one toolchain
+/// there is no difference to detect. `TRACE_CHECK_REQUIRE_ALT_TOOLCHAIN=1`
+/// turns the skip into a failure.
+#[test]
+fn the_artifact_is_built_by_the_library_s_pinned_toolchain() {
+    const PINNED: &str = "1.88.0";
+    let installed = std::process::Command::new("rustup")
+        .args(["toolchain", "list"])
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .unwrap_or_default();
+    let Some(_name) = installed
+        .lines()
+        .map(|line| line.split_whitespace().next().unwrap_or_default())
+        .find(|line| line.starts_with(PINNED))
+    else {
+        assert!(
+            std::env::var_os("TRACE_CHECK_REQUIRE_ALT_TOOLCHAIN").is_none(),
+            "TRACE_CHECK_REQUIRE_ALT_TOOLCHAIN is set but no {PINNED} toolchain is installed"
+        );
+        eprintln!("skipping: no {PINNED} toolchain to contrast with the default");
+        return;
+    };
+
+    let staged = tempfile::tempdir().expect("temp dir");
+    let copy = stage_library(staged.path());
+    std::fs::write(
+        copy.join("rust-toolchain.toml"),
+        format!("[toolchain]\nchannel = \"{PINNED}\"\n"),
+    )
+    .expect("pin the staged library's toolchain");
+
+    let contract = "crypto::tag::verify_tag";
+    let build_once = || {
+        let workspace = Workspace::ephemeral().expect("a private workspace");
+        let (work_dir, target_dir) = workspace.directories_for(contract).expect("directories");
+        let library =
+            Library::resolve(&copy.join("Cargo.toml"), &[]).expect("the staged library resolves");
+        let probed = harness::probe_contract(&library, contract, &work_dir, &target_dir)
+            .expect("the contract is declared");
+        let generated = harness::generate(&library, &probed).expect("a harness");
+        let artifact = harness::build(&library, &generated, contract, &work_dir, &target_dir)
+            .expect("the harness builds");
+        (library.toolchain.rustc_version.clone(), artifact.sha256)
+    };
+
+    // Relying on the library's own pin.
+    let (recorded, from_pin) = build_once();
+    assert!(
+        recorded.contains(PINNED),
+        "the recorded compiler must be the pinned one, not the default: {recorded}"
+    );
+
+    // Stable across runs, so the hash is a property of the toolchain rather
+    // than of one build.
+    let (second_record, second) = build_once();
+    assert!(second_record.contains(PINNED), "{second_record}");
+    assert_eq!(
+        from_pin, second,
+        "two builds relying on the library's pin must produce one artifact"
+    );
+
+    // The decisive comparison. Remove the pin so the staged library resolves
+    // the machine default, and build the same source again: the artifact must
+    // differ. Before the fix both builds produced *this* one, because the
+    // harness was always compiled by the default toolchain whatever the
+    // library pinned -- so an equality here is the regression returning.
+    std::fs::remove_file(copy.join("rust-toolchain.toml")).expect("unpin");
+    let (default_record, from_default) = build_once();
+    assert!(
+        !default_record.contains(PINNED),
+        "this machine's default toolchain is {PINNED}, so there is nothing to contrast with; \
+         the test needs a default that differs from the pin"
+    );
+    assert_ne!(
+        from_pin, from_default,
+        "relying on the library's pin produced the same artifact as the machine default \
+         ({default_record}), so the pin is not reaching the build"
+    );
+}
