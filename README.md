@@ -23,7 +23,8 @@ the formal noninterference property, and the roadmap.
 | M7 | Coverage-guided leakage discovery | complete, experimental |
 | M8 | Complete contract coverage and enforcement | complete, experimental |
 | M9 | Real-world cryptography integration — auditing `crypto-bigint` | complete, experimental |
-| M10 | Hardware-oriented validation — statistical timing | future |
+| M10 | Unified multi-backend verification and CI enforcement | in progress — M10.0 feasibility gate complete |
+| M11 | Hardware-oriented validation — statistical timing | future |
 
 `trace-check` turns that idea into reproducible analysis, from five directions:
 
@@ -572,6 +573,30 @@ A status is *not* a security outcome. It says whether a required analysis
 happened; what it observed is reported separately as evidence, in the backends'
 own vocabulary, so `NO_LEAK_OBSERVED` and `VERIFIED_BOUNDED` are never
 interchangeable and a generated run never discharges a symbolic requirement.
+
+**Two backends, one invocation (M10.0).** A contract whose policy requires both
+`generated` and `symbolic` gets both analyses from this one command: the
+generated family runs under Valgrind, and symbolic verification runs through the
+same BINSEC implementation `verify` uses.
+
+```toml
+[policy.contracts."cbaudit::monty::mul_both_secret"]
+required = ["generated", "symbolic"]
+```
+
+The two results are **not** merged. Each backend builds its own executable from
+its own generated harness with its own flags, so each result carries its own
+artifact hash, and evidence is checked against the obligation's artifact before
+it can discharge it — a `VERIFIED_BOUNDED` from another contract, another
+artifact, or a run that never reached the contract's symbol is rejected rather
+than read as a pass. A symbolic requirement additionally needs a
+`[verify."…"]` entry: a bounded search has no declared depth or observation
+model without one, and that is reported as a configuration gap before any
+container starts.
+
+`--ci` requires `mode = "strict"` and refuses an advisory policy. Advisory mode
+reports gaps without failing, which is what it is for during adoption and
+exactly why it must not be the reason a CI job is green.
 
 Two read-only commands, because inspecting obligations is a different activity
 from enforcing them:
@@ -1144,11 +1169,16 @@ ci/benchmark-m9.py               M6 against M7 on the external integration
 ci/mutate-m9.py                  one upstream-mutation experiment, with the
                                  validity checks that make its outcome earned
 ci/verify-m9-integration.py      asserts the M9 audit report, not its exit code
+ci/verify-m10-feasibility.py     asserts that two backends discharged two
+                                 obligations over two distinct artifacts
+docs/spikes/m10-unified-verification/
+                                 the recorded M10.0 feasibility gate, its
+                                 policy overlay, and the three defects it found
 ci/verify-workflow.py            refuses a CI step that selects a workspace
                                  package from inside an out-of-workspace example
 ci/mutations/                    the explicit patches those experiments apply
 docs/adapter-guide.md            writing an audit adapter for another library
-.github/workflows/ci.yml         pinned Linux CI (M1-M3/M6-M9 job + M4/M5 analyzer job)
+.github/workflows/ci.yml         pinned Linux CI (M1-M3/M6-M9 job + M4/M5/M10 analyzer job)
 ```
 
 ## Development

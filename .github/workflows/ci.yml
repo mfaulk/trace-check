@@ -665,6 +665,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # M10 runs the generated and symbolic backends in one invocation, so this
+      # job needs both. Until M10 it needed only the analyzer.
+      - name: Install Valgrind
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y valgrind
+          valgrind --version
+          test -f /usr/include/valgrind/memcheck.h
+
       # Pinned by digest, so the analyzer and its bundled solver are one
       # reproducible artifact. A tag could change underneath a recorded result.
       #
@@ -789,6 +798,38 @@ jobs:
           grep -q 'Summary: 7 verified bounded, 11 leak detected, 0 inconclusive' m9-symbolic.txt
           grep -q 'Every declared expectation was reproduced' m9-symbolic.txt
 
+      # ------------------------------------------------------------------
+      # M10.0: the unified feasibility gate.
+      # ------------------------------------------------------------------
+
+      # One invocation, two backends, one contract. The validator checks the
+      # *report* rather than the exit code, because a unified run that quietly
+      # used one backend's result for both obligations would exit 0 too. What
+      # it asserts is that each obligation was discharged by its own backend's
+      # outcome and that the two results carry different artifact hashes --
+      # they are different executables, and one hash would mean one result is
+      # describing a binary it never analyzed.
+      #
+      # The policy is overlaid rather than committed into the audit library's
+      # own configuration: the M9 acceptance steps read that file, and this
+      # must not change what they measure.
+      - name: Two backends discharge two obligations in one invocation
+        env:
+          TRACE_CHECK_REQUIRE_SYMBOLIC: "1"
+          TRACE_CHECK_REQUIRE_BACKEND: "1"
+        run: |
+          set -euo pipefail
+          cargo test --locked -p trace-check --test unified
+          cat examples/crypto-bigint-audit/trace-check.toml \
+              docs/spikes/m10-unified-verification/policy.toml > m10-unified.toml
+          cargo run --locked --release -p cargo-trace-check -- check \
+            --all-contracts --ci --format json \
+            --manifest-path examples/crypto-bigint-audit/Cargo.toml \
+            --config m10-unified.toml \
+            > m10-unified.json
+          python3 ci/verify-m8-contracts.py m10-unified.json --expect-declared 18
+          python3 ci/verify-m10-feasibility.py m10-unified.json
+
       # The milestone's defining property, asserted against the checkout rather
       # than only inside the test binary: change the library's actual
       # implementation, leave the harness design and the configuration alone,
@@ -823,3 +864,8 @@ jobs:
         with:
           name: m5-library-report
           path: m5-library.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: m10-unified-report
+          path: m10-unified.json
