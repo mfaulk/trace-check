@@ -978,3 +978,117 @@ fn a_leak_from_an_unrequired_test_still_fails_the_contract() {
         report.to_text()
     );
 }
+
+/// Requiring `generated` and `explore` runs **one** Memcheck workflow, and the
+/// report says the two requirements shared it.
+///
+/// `explore` is not a separate proof level. Coverage feedback chooses which
+/// inputs to analyze; every security conclusion still comes from the same
+/// uninstrumented artifact, and an explored run already contains the boundary
+/// cases a baseline run would have used. Two executions would double the most
+/// expensive backend in the tool for no additional evidence.
+///
+/// Needs Valgrind and the LLVM tools, not the analyzer.
+#[test]
+fn generated_and_explore_share_one_memcheck_workflow() {
+    let config = config_with_policy(&format!(
+        "[policy]\nmode = \"strict\"\ndefault_required = [\"generated\"]\n\n\
+         [policy.contracts.\"{CONTRACT}\"]\nrequired = [\"generated\", \"explore\"]\n"
+    ));
+    let report = unified(&config, None);
+
+    // The plan committed to one workflow before anything was built.
+    let execution = report
+        .execution
+        .as_ref()
+        .expect("an executing run reports what it executed");
+    assert_eq!(
+        execution.memcheck_jobs(),
+        1,
+        "requiring both must plan one Memcheck workflow, not two:\n{}",
+        execution.to_text()
+    );
+    let jobs = execution.jobs_for(CONTRACT);
+    assert_eq!(jobs.len(), 1, "{}", execution.to_text());
+    assert_eq!(
+        jobs[0].work,
+        trace_check::orchestration::Work::Generated { explore: true }
+    );
+    assert_eq!(
+        jobs[0].discharges,
+        vec![Analysis::Generated, Analysis::Explore],
+        "the one execution answers both obligations"
+    );
+
+    // And the run bears that out: two requirements, two records, one
+    // observation.
+    let contract = contract_of(&report);
+    let generated = contract
+        .evidence_for(Analysis::Generated)
+        .expect("generated evidence");
+    let explore = contract
+        .evidence_for(Analysis::Explore)
+        .expect("explore evidence");
+    for analysis in [Analysis::Generated, Analysis::Explore] {
+        assert_eq!(
+            contract.status.get(&analysis).map(|s| s.as_str()),
+            Some("CHECKED"),
+            "{analysis}: {:?}",
+            contract.status
+        );
+    }
+    assert_eq!(
+        generated.artifact_sha256, explore.artifact_sha256,
+        "one execution means one analyzed executable"
+    );
+    assert_eq!(
+        generated.shared_with,
+        vec![Analysis::Explore],
+        "the generated record must say the explore requirement shared its execution"
+    );
+    assert_eq!(explore.shared_with, vec![Analysis::Generated]);
+
+    // The case counts are the same object's, not two runs' -- so a reader
+    // cannot add them up into twice the coverage.
+    let left = generated.check.as_ref().expect("a check record");
+    let right = explore.check.as_ref().expect("a check record");
+    assert_eq!(left.cases_completed, right.cases_completed);
+    assert_eq!(
+        left.analyzer_runs, right.analyzer_runs,
+        "two independent Memcheck workflows would not report identical process counts"
+    );
+    assert!(
+        generated.discovery.is_some(),
+        "the explored corpus's provenance must be retained"
+    );
+}
+
+/// Requiring only `generated` plans no discovery, so the deduplication test
+/// above is not passing because exploration is always on.
+#[test]
+fn requiring_only_generated_plans_no_discovery() {
+    let config = config_with_policy(&format!(
+        "[policy]\nmode = \"strict\"\ndefault_required = [\"generated\"]\n\n\
+         [policy.contracts.\"{CONTRACT}\"]\nrequired = [\"generated\"]\n"
+    ));
+    let report = unified(&config, None);
+    let execution = report.execution.as_ref().expect("an execution plan");
+    let jobs = execution.jobs_for(CONTRACT);
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(
+        jobs[0].work,
+        trace_check::orchestration::Work::Generated { explore: false },
+        "{}",
+        execution.to_text()
+    );
+    assert_eq!(jobs[0].discharges, vec![Analysis::Generated]);
+    let contract = contract_of(&report);
+    assert!(
+        contract
+            .evidence_for(Analysis::Generated)
+            .expect("generated evidence")
+            .shared_with
+            .is_empty(),
+        "a lone requirement shares its execution with nothing"
+    );
+}

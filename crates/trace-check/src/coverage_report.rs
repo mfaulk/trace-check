@@ -116,10 +116,22 @@ pub struct CoverageReport {
     pub selection: &'static str,
     pub contracts: Vec<crate::enforcement::ContractCoverage>,
     pub stale: Vec<crate::enforcement::StaleEntry>,
+    /// What this run actually executed, as decided before anything was built.
+    ///
+    /// Separate from the requirements on purpose: four named analyses are not
+    /// four invocations. A reader comparing the obligations to this sees which
+    /// requirements shared an execution, and a CI job can assert that
+    /// requiring `generated` and `explore` produced one Memcheck workflow
+    /// rather than two.
+    ///
+    /// Absent from a read-only `coverage` report, which runs nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution: Option<crate::orchestration::ExecutionPlan>,
     pub summary: Summary,
     pub limitations: Vec<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build(
     provenance: Provenance,
     inventory: &ContractInventory,
@@ -127,6 +139,7 @@ pub fn build(
     policy: &crate::enforcement::PolicyConfig,
     selected: Vec<String>,
     selection: &'static str,
+    execution: Option<crate::orchestration::ExecutionPlan>,
 ) -> CoverageReport {
     let blocking = coverage.blocking(inventory, policy);
     let counts = coverage.enforcement();
@@ -138,6 +151,7 @@ pub fn build(
         selection,
         contracts: coverage.contracts.clone(),
         stale: coverage.stale.clone(),
+        execution,
         summary: Summary {
             mode: coverage.mode.as_str(),
             enforcement_rate: counts.rate(),
@@ -334,6 +348,12 @@ impl CoverageReport {
                 line!("  - {reason}");
             }
         }
+        // What actually ran, so a reader can see that two requirements met by
+        // one Memcheck workflow were one observation rather than two.
+        if let Some(execution) = &self.execution {
+            line!("");
+            out.push_str(&execution.to_text());
+        }
         line!("");
         line!("What this does and does not show:");
         for limitation in &self.limitations {
@@ -447,6 +467,7 @@ mod tests {
             policy,
             selected,
             "--all-contracts",
+            None,
         )
     }
 

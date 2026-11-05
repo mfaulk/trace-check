@@ -48,6 +48,7 @@ pub mod library_report;
 pub mod memcheck;
 pub mod native;
 pub mod native_report;
+pub mod orchestration;
 pub mod parser;
 pub mod report;
 pub mod reproducer;
@@ -950,33 +951,42 @@ pub fn run_contract_coverage(
     let plan = Plan::resolve(&found, config, policy, &selected, &available, today);
     let mut coverage = Coverage::from_plan(&plan, &found);
 
+    // What will actually run, decided before any artifact is compiled. Four
+    // named analyses are not four invocations: `generated` and `explore` share
+    // one Memcheck workflow, and `dynamic` is one pass over a test suite
+    // rather than a per-contract job. Deciding it here, as a value, is what
+    // makes "requiring both must not run two Memcheck analyses" a property
+    // something can check.
+    let execution = orchestration::ExecutionPlan::resolve(&plan, &|contract| {
+        let mut settings = config.check_settings(contract);
+        apply_overrides(&mut settings, overrides);
+        settings.explore.enabled
+    });
+
     // Stage two: run what the plan left outstanding. The generated family is
     // executed here and symbolic verification in stage three; `dynamic`
     // evidence is a developer-written `#[ct_test]` that
     // `cargo trace-check test` produces, and a requirement for it is reported
     // as outstanding rather than silently satisfied.
-    for entry in &plan.entries {
-        let outstanding = entry.outstanding();
-        let wants_generated = outstanding
-            .iter()
-            .any(|analysis| matches!(analysis, Analysis::Generated | Analysis::Explore));
-        if !wants_generated {
+    for job in &execution.jobs {
+        let orchestration::Work::Generated { explore } = job.work else {
             continue;
-        }
+        };
         let Some((valgrind_path, valgrind_version)) = &valgrind else {
             continue;
         };
         let declaration = found
-            .contract(&entry.id)
-            .expect("selected from the inventory");
+            .contract(&job.contract)
+            .expect("planned from the inventory");
 
-        let mut settings = config.check_settings(&entry.id);
+        let mut settings = config.check_settings(&job.contract);
         apply_overrides(&mut settings, overrides);
-        if outstanding.contains(&Analysis::Explore) {
-            settings.explore.enabled = true;
-        }
+        // The plan already decided this, from the policy and the
+        // configuration together. Taking it from the plan rather than
+        // re-deriving it here is the point: one place decides what runs.
+        settings.explore.enabled = explore;
         settings
-            .validate(&entry.id)
+            .validate(&job.contract)
             .map_err(HarnessError::Contract)?;
 
         // A failure analysing one contract becomes that contract's status, not
@@ -1004,10 +1014,10 @@ pub fn run_contract_coverage(
         ) {
             Ok(analysed) => analysed,
             Err(error) if per_contract(&error) => {
-                for analysis in outstanding {
+                for analysis in &job.discharges {
                     coverage.note(
-                        &entry.id,
-                        analysis,
+                        &job.contract,
+                        *analysis,
                         Status::Unsupported {
                             reason: error.to_string(),
                         },
@@ -1017,11 +1027,14 @@ pub fn run_contract_coverage(
             }
             Err(error) => return Err(error),
         };
-        for analysis in outstanding {
-            if !matches!(analysis, Analysis::Generated | Analysis::Explore) {
-                continue;
-            }
-            coverage.fold(&entry.id, fold_analysis(analysis, &analysed));
+        // One execution, folded against every obligation it discharges. Each
+        // record names the others, so two requirements met by one Memcheck
+        // workflow cannot be read as two independent observations.
+        for analysis in &job.discharges {
+            coverage.fold(
+                &job.contract,
+                fold_analysis(*analysis, &analysed, &job.discharges),
+            );
         }
     }
 
@@ -1033,10 +1046,13 @@ pub fn run_contract_coverage(
     // result.
     if let Some(Ok(verifier)) = &symbolic_backend {
         let identity = verifier.identity();
-        for entry in &plan.entries {
-            if !entry.outstanding().contains(&Analysis::Symbolic) {
+        for job in &execution.jobs {
+            if job.work != orchestration::Work::Symbolic {
                 continue;
             }
+            let entry = plan
+                .entry(&job.contract)
+                .expect("planned from the resolved policy");
             // Outstanding implies configured: `settle` reports a symbolic
             // requirement with no `[verify]` entry as a configuration gap,
             // which is settled and so never reaches here.
@@ -1112,7 +1128,26 @@ pub fn run_contract_coverage(
     // where the security decision is: a test that ran is not evidence about a
     // contract unless it provably invoked it.
     if let Some(runs) = dynamic_runs {
-        fold_dynamic(&mut coverage, &plan, &found, library, runs);
+        let binding = dynamic::bind(&runs.runs, &found);
+        // Reported whenever runs were supplied, *not* only when some contract
+        // still owes a `dynamic` answer. A test naming a contract this build
+        // does not declare is a mistake about the test suite rather than about
+        // any one obligation -- gating it on an outstanding requirement hid it
+        // whenever the only contract asking for `dynamic` was already settled.
+        report_unresolved_targets(&mut coverage, &binding);
+        // Folded whenever runs were supplied, for the same reason: the tests
+        // have already executed, and whether some contract still *owes* a
+        // dynamic answer decides which results get a status -- never which
+        // get kept. Gating this on the job existing discarded a leak found by
+        // a test whose own contract required nothing dynamic.
+        fold_dynamic(
+            &mut coverage,
+            execution.dynamic.as_ref(),
+            &found,
+            library,
+            runs,
+            &binding,
+        );
     }
 
     let provenance = coverage_report::Provenance {
@@ -1131,6 +1166,7 @@ pub fn run_contract_coverage(
         policy,
         selected,
         selection.describe(),
+        Some(execution),
     ))
 }
 
@@ -1152,25 +1188,19 @@ pub struct DynamicRuns {
     pub valgrind_version: String,
 }
 
-/// Binds the caller's test runs to contracts and folds one aggregate each.
-fn fold_dynamic(
-    coverage: &mut Coverage,
-    plan: &Plan,
-    found: &ContractInventory,
-    library: &Library,
-    runs: &DynamicRuns,
-) {
-    let binding = dynamic::bind(&runs.runs, found);
-    // A test whose target names no contract in this build, or more than one,
-    // binds to nothing. That is already fail-closed -- the obligation stays
-    // un-analyzed and strict CI fails -- but silently so, and "failed without
-    // saying why" is the shape of problem this milestone exists to remove.
-    //
-    // Reported in the same place configuration that matches no declaration is
-    // reported, because it is the same class of mistake: something names a
-    // contract this build does not have. The CLI's `resolve_targets` rejects
-    // these up front, so reaching here means the inventory and the test
-    // binaries' own metadata disagree -- which a developer must hear about.
+/// Reports a `#[ct_test]` whose target names no contract in this build, or
+/// more than one.
+///
+/// Such a test binds to nothing, which is already fail-closed -- the obligation
+/// stays un-analyzed and strict CI fails -- but silently so, and "failed
+/// without saying why" is the shape of problem this milestone exists to remove.
+///
+/// Reported where configuration that matches no declaration is reported,
+/// because it is the same class of mistake: something names a contract this
+/// build does not have. The CLI's `resolve_targets` rejects these up front, so
+/// reaching here means the inventory and the test binaries' own metadata
+/// disagree -- which a developer must hear about.
+fn report_unresolved_targets(coverage: &mut Coverage, binding: &dynamic::Binding) {
     for detail in &binding.unresolved {
         coverage.stale.push(enforcement::StaleEntry {
             contract: detail.split('`').nth(1).unwrap_or_default().to_string(),
@@ -1178,29 +1208,41 @@ fn fold_dynamic(
             detail: detail.clone(),
         });
     }
-    // Which contracts *owe* a dynamic answer. A contract with no bound test
-    // keeps the `NOT_ANALYZED` status it already has: saying so here would be
-    // the same thing twice, and silently folding a clean result would be the
-    // failure this milestone exists to prevent.
-    let required: std::collections::BTreeSet<&str> = plan
-        .entries
-        .iter()
-        .filter(|entry| entry.outstanding().contains(&Analysis::Dynamic))
-        .map(|entry| entry.id.as_str())
-        .collect();
+}
 
-    // Every contract with a bound test, not only those that owe an answer.
-    //
-    // `dynamic` is a whole test suite rather than a per-contract job: a policy
-    // requiring it of one contract makes the run execute every targeted
-    // `#[ct_test]`, including tests bound to contracts that require nothing
-    // dynamic. Those tests have *already run*. Discarding a leak one of them
-    // found, because nobody asked for the analysis, would erase positive
-    // leakage evidence -- and no arrangement of obligations may do that.
+/// Folds one aggregate per contract that has a bound test.
+///
+/// `job` names the contracts that *owe* a dynamic answer, and is `None` when
+/// none does. Either way that is not the same set as the contracts which
+/// *have* an answer: `dynamic` is a whole test
+/// suite rather than a per-contract job, so a policy requiring it of one
+/// contract makes the run execute every targeted `#[ct_test]`, including tests
+/// bound to contracts that require nothing dynamic.
+///
+/// Those tests have *already run*. Discarding a leak one of them found, because
+/// nobody asked for the analysis, would erase positive leakage evidence -- and
+/// no arrangement of obligations may do that.
+fn fold_dynamic(
+    coverage: &mut Coverage,
+    job: Option<&orchestration::DynamicJob>,
+    found: &ContractInventory,
+    library: &Library,
+    runs: &DynamicRuns,
+    binding: &dynamic::Binding,
+) {
+    // Empty when no contract owes a dynamic answer, which is a reason for
+    // every result to be supplemental -- not a reason to drop them.
+    let required: std::collections::BTreeSet<&str> = job
+        .map(|job| job.contracts.iter().map(String::as_str).collect())
+        .unwrap_or_default();
     for (contract, tests) in &binding.per_contract {
         let Some(declaration) = found.contract(contract) else {
             continue;
         };
+        // A contract with no bound test keeps the `NOT_ANALYZED` status it
+        // already has: saying so here would be the same thing twice, and
+        // silently folding a clean result would be the failure this milestone
+        // exists to prevent. Such a contract is simply absent from `binding`.
         let Some(aggregate) = dynamic::aggregate(tests) else {
             continue;
         };
@@ -1285,6 +1327,8 @@ pub fn report_contract_coverage(
         policy,
         selected,
         selection.describe(),
+        // `coverage` runs nothing, so there is no execution to report.
+        None,
     ))
 }
 
@@ -1416,7 +1460,11 @@ fn per_contract(error: &CheckRunError) -> bool {
 /// A detected leak is never downgraded. A finding from the security artifact
 /// does not depend on how its input was chosen, so it stands whatever the
 /// search did.
-fn fold_analysis(analysis: Analysis, analysed: &Analysed) -> AnalysisEvidence {
+fn fold_analysis(
+    analysis: Analysis,
+    analysed: &Analysed,
+    discharges: &[Analysis],
+) -> AnalysisEvidence {
     let leaked = analysed.outcome == security::Outcome::LeakDetected;
     let (outcome, detail) = match &analysed.explore_incomplete {
         _ if leaked => (analysed.outcome, analysed.message.clone()),
@@ -1439,6 +1487,13 @@ fn fold_analysis(analysis: Analysis, analysed: &Analysed) -> AnalysisEvidence {
         analysed.check.clone(),
         analysed.discovery.clone(),
         analysed.reproducers.clone(),
+        // The other obligations this same Memcheck workflow answered, so the
+        // two records cannot be read as two independent observations.
+        discharges
+            .iter()
+            .copied()
+            .filter(|other| *other != analysis)
+            .collect(),
     )
 }
 
@@ -1739,6 +1794,7 @@ mod fold_tests {
                 security::Outcome::NoLeakObserved,
                 Some("the wall-clock limit was reached"),
             ),
+            &[Analysis::Generated],
         );
         assert_eq!(evidence.outcome, security::Outcome::Inconclusive);
         assert!(
@@ -1767,6 +1823,7 @@ mod fold_tests {
         let evidence = fold_analysis(
             Analysis::Generated,
             &analysed(security::Outcome::LeakDetected, Some("it died early")),
+            &[Analysis::Generated],
         );
         assert_eq!(evidence.outcome, security::Outcome::LeakDetected);
         assert_eq!(evidence.detail, "the security analysis said this");
@@ -1776,8 +1833,11 @@ mod fold_tests {
     #[test]
     fn a_complete_exploration_does_not_downgrade_anything() {
         for analysis in [Analysis::Generated, Analysis::Explore] {
-            let evidence =
-                fold_analysis(analysis, &analysed(security::Outcome::NoLeakObserved, None));
+            let evidence = fold_analysis(
+                analysis,
+                &analysed(security::Outcome::NoLeakObserved, None),
+                &[Analysis::Generated, Analysis::Explore],
+            );
             assert_eq!(evidence.outcome, security::Outcome::NoLeakObserved);
             assert_eq!(evidence.detail, "the security analysis said this");
         }
@@ -1790,6 +1850,7 @@ mod fold_tests {
         let evidence = fold_analysis(
             Analysis::Generated,
             &analysed(security::Outcome::NoLeakObserved, None),
+            &[Analysis::Generated],
         );
         let check = evidence.check.expect("the generated result is attached");
         assert_eq!(check.cases_completed, 64);

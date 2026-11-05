@@ -331,6 +331,50 @@ def main(argv):
             "is reported as a violation",
         )
 
+    # ---- the execution plan, and the deduplication claim ---------------
+    #
+    # `explore` is not a separate proof level: coverage feedback chooses which
+    # inputs to analyze and the security conclusion still comes from the same
+    # uninstrumented artifact. Requiring both must therefore plan *one*
+    # Memcheck workflow per contract, and the two requirements must be marked
+    # as sharing it so nothing reads them as two independent observations.
+    execution = report.get("execution")
+    require(
+        execution is not None,
+        "an executing run must report what it executed, or the deduplication claim is "
+        "unverifiable",
+    )
+    if execution:
+        per_contract = {}
+        for job in execution.get("jobs", []):
+            require(
+                job.get("discharges"),
+                f"a planned job for `{job.get('contract')}` discharges nothing, so it spent a "
+                "backend to produce a result nothing uses",
+            )
+            if job.get("backend") == "generated":
+                per_contract.setdefault(job["contract"], []).append(job)
+        for name, jobs in per_contract.items():
+            require(
+                len(jobs) == 1,
+                f"`{name}` planned {len(jobs)} Memcheck workflows; requiring `generated` and "
+                "`explore` must share one",
+            )
+
+        # A requirement sharing an execution says so, in both directions.
+        for row in report.get("contracts", []):
+            shared = {
+                item["analysis"]: set(item.get("shared_with") or [])
+                for item in row.get("evidence", [])
+            }
+            for analysis, partners in shared.items():
+                for partner in partners:
+                    require(
+                        analysis in shared.get(partner, set()),
+                        f"`{row['id']}`: {analysis} claims to share an execution with "
+                        f"{partner}, which does not say the same",
+                    )
+
     # The unified report is meant to become the standard CI interface, so the
     # caveats that keep two results from reading as one must survive in it.
     limitations = " ".join(report.get("limitations") or [])

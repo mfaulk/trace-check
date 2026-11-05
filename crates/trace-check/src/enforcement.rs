@@ -312,6 +312,18 @@ pub struct AnalysisEvidence {
     /// Reproducers written for this contract's findings.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub reproducers: Vec<String>,
+    /// Other requirements the **same execution** discharged.
+    ///
+    /// `generated` and `explore` share one Memcheck workflow: discovery
+    /// chooses which inputs to analyze and the security conclusion still comes
+    /// from the same uninstrumented artifact. Two evidence records are
+    /// reported, because the status map is total over the requirements, and
+    /// this field says they are one observation rather than two.
+    ///
+    /// Without it a reader counting evidence would conclude the contract had
+    /// been checked twice, when it was checked once with better inputs.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub shared_with: Vec<Analysis>,
 }
 
 impl AnalysisEvidence {
@@ -334,6 +346,7 @@ impl AnalysisEvidence {
             symbolic: None,
             dynamic: None,
             reproducers: Vec::new(),
+            shared_with: Vec::new(),
         }
     }
 
@@ -412,6 +425,7 @@ impl AnalysisEvidence {
             symbolic: Some(report),
             dynamic: None,
             reproducers: Vec::new(),
+            shared_with: Vec::new(),
         }
     }
 
@@ -428,6 +442,7 @@ impl AnalysisEvidence {
     /// A detected leak is never downgraded. A finding from the security
     /// artifact does not depend on how its input was chosen or on whether a
     /// later case completed.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_generated(
         analysis: Analysis,
         outcome: Outcome,
@@ -436,6 +451,7 @@ impl AnalysisEvidence {
         check: crate::check::ContractCheck,
         discovery: Option<crate::check_report::DiscoveryEvidence>,
         reproducers: Vec<String>,
+        shared_with: Vec<Analysis>,
     ) -> AnalysisEvidence {
         let mut detail = detail.to_string();
         let outcome = match validate_generated(&artifact, &check) {
@@ -460,6 +476,7 @@ impl AnalysisEvidence {
             symbolic: None,
             dynamic: None,
             reproducers,
+            shared_with,
         }
     }
 
@@ -486,6 +503,7 @@ impl AnalysisEvidence {
             symbolic: None,
             dynamic: Some(dynamic),
             reproducers: Vec::new(),
+            shared_with: Vec::new(),
         }
     }
 }
@@ -3398,6 +3416,7 @@ mod tests {
                 "detail",
                 check,
                 None,
+                Vec::new(),
                 Vec::new(),
             )
         };

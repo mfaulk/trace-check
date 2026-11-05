@@ -838,6 +838,11 @@ jobs:
       # declarations enforced independently. The validator refuses a report
       # containing no such fixture, because without one nothing here would
       # notice a backend's result being judged against another's declaration.
+      #
+      # M10.5 adds a contract requiring `generated` *and* `explore`, so the
+      # deduplication claim is exercised on real work: the validator refuses a
+      # plan that schedules two Memcheck workflows for one contract, and
+      # refuses evidence whose `shared_with` is one-sided.
       - name: Two backends discharge two obligations in one invocation
         env:
           TRACE_CHECK_REQUIRE_SYMBOLIC: "1"
