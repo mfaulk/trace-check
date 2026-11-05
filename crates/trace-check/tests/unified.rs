@@ -925,18 +925,19 @@ fn a_leak_from_an_unrequired_test_still_fails_the_contract() {
     let workspace = Workspace::ephemeral().expect("a private workspace");
     let library =
         Library::resolve(&library_dir().join("Cargo.toml"), &[]).expect("the audit library");
-    let report = trace_check::run_contract_coverage(
-        &library,
-        &config,
-        &workspace,
-        &trace_check::CheckOverrides::default(),
+    let report = trace_check::run_contract_coverage(trace_check::CoverageRequest {
+        library: &library,
+        config: &config,
+        workspace: &workspace,
+        overrides: &trace_check::CheckOverrides::default(),
         // Only A is selected for analysis, so no backend runs for B.
-        &Selection::Named(vec![A.to_string()]),
-        None,
-        "2026-11-04",
-        Some(UNREACHABLE_RUNTIME),
-        Some(&runs),
-    )
+        selection: &Selection::Named(vec![A.to_string()]),
+        reproducer_dir: None,
+        today: "2026-11-04",
+        runtime: Some(UNREACHABLE_RUNTIME),
+        dynamic_runs: Some(&runs),
+        limits: trace_check::schedule::Limits::default(),
+    })
     .expect("the unified run reports rather than failing");
 
     let contract = named(&report, A);
