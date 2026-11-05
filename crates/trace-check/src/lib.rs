@@ -1084,8 +1084,7 @@ pub fn run_contract_coverage(
             );
             match verify_staged(staged, verifier, library) {
                 Ok(verified) => {
-                    let report =
-                        library_report::contract_report(verified, &identity, workspace.is_kept());
+                    let report = library_report::contract_report(verified, workspace.is_kept());
                     coverage.fold(
                         &entry.id,
                         AnalysisEvidence::from_symbolic(&settings.checks, built, Box::new(report)),

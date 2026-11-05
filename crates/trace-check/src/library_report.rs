@@ -175,13 +175,11 @@ pub struct Verified {
 /// it was attributed to, the evidence that the analyzer reached it, the declared
 /// and generated input domain, the observation classes checked, and the depth
 /// bound the search held to.
-pub fn contract_report(
-    entry: Verified,
-    analyzer: &AnalyzerIdentity,
-    path_retained: bool,
-) -> ContractReport {
+pub fn contract_report(entry: Verified, path_retained: bool) -> ContractReport {
     let expected = Outcome::parse(&entry.case.expected_outcome)
         .expect("the configuration was validated on load");
+    // Read before `entry.library` is moved into the report below.
+    let rustc = entry.library.toolchain.rustc_version.clone();
     ContractReport {
         contract: entry.contract.id.clone(),
         module: entry.contract.module.clone(),
@@ -191,7 +189,15 @@ pub fn contract_report(
         rationale: entry.case.rationale.clone(),
         library: entry.library,
         compilation: Compilation {
-            rustc: analyzer.rustc_version.clone(),
+            // The toolchain that compiled *this artifact*, not the one the
+            // analyzer runner happened to resolve. `Verifier::prepare_with`
+            // measures `rustc --version` in trace-check's own environment,
+            // which is the invocation directory -- and since the harness is
+            // built with the library's pinned toolchain, the two disagree for
+            // any library pinning something else. Recording the runner's
+            // version here would describe a compiler that did not build the
+            // executable this report is about.
+            rustc,
             target: crate::symbolic::SUPPORTED_TARGET.to_string(),
             profile: crate::harness::PROFILE.to_string(),
             panic: crate::harness::PANIC_STRATEGY.to_string(),
@@ -245,7 +251,7 @@ pub fn build(
 ) -> LibraryReport {
     let contracts: Vec<ContractReport> = entries
         .into_iter()
-        .map(|entry| contract_report(entry, &analyzer, path_retained))
+        .map(|entry| contract_report(entry, path_retained))
         .collect();
 
     let count = |outcome: Outcome| {
@@ -544,7 +550,6 @@ fn render(value: Option<u64>) -> String {
 pub(crate) fn sample_contract_report() -> ContractReport {
     contract_report(
         tests::verified(Outcome::VerifiedBounded, "VERIFIED_BOUNDED", Vec::new()),
-        &tests::analyzer(),
         false,
     )
 }
@@ -590,7 +595,15 @@ pub(crate) mod tests {
             lib_name: "crypto".into(),
             manifest_path: "/w/examples/crypto-library/Cargo.toml".into(),
             features: Vec::new(),
-            toolchain: crate::toolchain::Toolchain::unresolved(),
+            // Deliberately not the analyzer fixture's `rustc 1.97.0`: the
+            // report's compilation provenance must come from the toolchain
+            // that built the artifact, and a shared value could not tell the
+            // two apart. See `the_report_names_the_compiler_that_built_it`.
+            toolchain: crate::toolchain::Toolchain {
+                name: Some("1.88.0-x86_64-unknown-linux-gnu".into()),
+                rustc_version: "rustc 1.88.0 (library pin)".into(),
+                cargo_version: "cargo 1.88.0".into(),
+            },
         };
         let harness = crate::harness::generate(&library, &contract).expect("generated");
         let symbol = ResolvedSymbol {
@@ -1043,5 +1056,34 @@ pub(crate) mod tests {
         assert_eq!(inputs[0].role, Role::Secret);
         assert!(inputs[0].passing.contains("pointer is public"));
         assert_eq!(inputs[1].role, Role::Public);
+    }
+
+    /// The report names the compiler that built the artifact, not the one the
+    /// analyzer runner resolved.
+    ///
+    /// `Verifier::prepare_with` measures `rustc --version` in trace-check's own
+    /// environment -- the invocation directory -- while the harness is built
+    /// with the *library's* pinned toolchain. Taking the runner's version here
+    /// described a compiler that did not build the executable the report is
+    /// about, for any library pinning something else.
+    #[test]
+    fn the_report_names_the_compiler_that_built_it() {
+        let analyzer = analyzer();
+        let entry = verified(Outcome::VerifiedBounded, "VERIFIED_BOUNDED", Vec::new());
+        let library_rustc = entry.library.toolchain.rustc_version.clone();
+        assert_ne!(
+            library_rustc, analyzer.rustc_version,
+            "the fixture must distinguish the two, or this test proves nothing"
+        );
+
+        let report = contract_report(entry, false);
+        assert_eq!(
+            report.compilation.rustc, library_rustc,
+            "compilation provenance must be the library's toolchain"
+        );
+        assert_ne!(
+            report.compilation.rustc, analyzer.rustc_version,
+            "the analyzer runner's compiler must not be reported as the build's"
+        );
     }
 }
