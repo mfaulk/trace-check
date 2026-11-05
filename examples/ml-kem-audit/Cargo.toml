@@ -1,0 +1,37 @@
+[package]
+name = "ml-kem-audit"
+description = "Audit adapters that expose RustCrypto ml-kem decapsulation to trace-check"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# The crate name qualifies every contract identity, so the contracts read
+# `mlkemaudit::decaps::decaps_valid_ciphertext`.
+[lib]
+name = "mlkemaudit"
+path = "src/lib.rs"
+
+# Outside the workspace, for M9's reasons: the audit crate resolves its own
+# dependency graph, and an experiment that rewrites the dependency underneath a
+# copy of this crate cannot be a workspace member.
+[workspace]
+
+[dependencies]
+# `=0.3.4`, not `0.3.4`. The analyzed artifact is the claim, so the audited
+# library's exact version is part of the pinned configuration.
+#
+# `default-features = false` drops `alloc`, which keeps the decapsulation key's
+# components inline rather than boxed. Nothing here needs a heap.
+ml-kem = { version = "=0.3.4", default-features = false }
+
+# A proc-macro crate, compiled for the host, contributing nothing to the
+# analyzed binary.
+trace-check-macros = { path = "../../crates/trace-check-macros" }
+
+# A normal dependency, unlike the M9 audit crate, because the declassification
+# boundary is *this crate's* responsibility: key generation runs on a
+# declassified copy of the seed and only the genuinely secret components of the
+# derived key are re-marked. `docs/audits/ml-kem/threat-model.md` justifies
+# every call.
+trace-check-secret = { path = "../../crates/trace-check-secret" }
