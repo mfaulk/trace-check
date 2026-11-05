@@ -1,6 +1,6 @@
 # Milestone 10 — Unified Multi-Backend Verification and CI Enforcement
 
-**Status:** In progress. M10.0 and M10.1 complete; M10.2–M10.8 outstanding.
+**Status:** Implemented. M10.0–M10.8 complete; the outstanding items are in §11.
 **Branch:** `feat/m10-unified-verification`, then one branch per package
 **Prerequisite:** Milestone 9, merged
 **Primary platform:** Linux x86-64, pinned Rust toolchain
@@ -41,7 +41,7 @@ are two results about two binaries, not one result about the function.
 | M10.5 | Unified execution planner and backend deduplication | complete |
 | M10.6 | Bounded scheduling, isolation and failure handling | complete |
 | M10.7 | Unified CLI, reporting and schema migration | complete |
-| M10.8 | Acceptance, mutation tests, benchmarks, CI and documentation | not started |
+| M10.8 | Acceptance, mutation tests, benchmarks, CI and documentation | complete |
 
 ---
 
@@ -694,13 +694,157 @@ configurations must not be silently reinterpreted.
 
 ---
 
-## 10. What is not done
+## 10. M10.8 — acceptance, the mutation experiment, and what it costs
 
-* **M10.4** — M3 expectations are not modelled, so an analyzer-regression
-  fixture cannot declare an outcome for `dynamic`; such a requirement is
-  reported as a configuration gap rather than guessed at. A `dynamic`
-  requirement is still reported as produced elsewhere when no policy asks for
-  it, which is what keeps `coverage` and a generated-only run honest.
-* **M10.8** — no benchmark comparing unified execution against
-  standalone-plus-standalone, and no mutation experiment run through the unified
-  command.
+### A real mutation through the unified command
+
+`ci/mutate-m9.py --unified` runs M9's upstream-mutation machinery and then the
+unified command rather than the standalone check. All of M9's validity checks
+still apply — the patch must apply cleanly, the mutated tree must actually
+differ, and the adapter's own tests including the 1012 independent-oracle
+vectors must still pass, so a mutation that changed the *arithmetic* is
+rejected rather than reported as a side channel.
+
+Acceptance experiment C, measured:
+
+```
+[mutated] mutation:    mutation-a-carry-branch.patch
+[mutated] functional:  inline tests and the 1012 oracle vectors pass
+[mutated] generated: LEAK_DETECTED in 86bbb88eedf5
+[mutated] symbolic:  LEAK_DETECTED in c8300aff3169
+[mutated] exit code:   1
+[mutated] statuses:    {'generated': 'leak-detected', 'symbolic': 'leak-detected'}
+[mutated] both analyses preserved, exit 1
+```
+
+Both backends found the planted carry branch, in two different executables, and
+the run exited 1. The script fails if either analysis is **missing** from the
+report, which is the half that matters: a run stopping at the first failure
+would report one backend and leave the other un-analyzed.
+
+### What orchestration costs
+
+`ci/benchmark-m10.py` runs four configurations over the same work — eighteen
+generated checks and three symbolic verifications of the audit contracts — so
+the comparison measures orchestration rather than selection:
+
+| Configuration | Wall clock | Peak RSS | Invocations |
+| --- | --- | --- | --- |
+| standalone `check` + `verify` | 226.4 s | 164 MB | not reported |
+| unified, `--jobs 1` | 237.1 s | 161 MB | 18 Memcheck, 3 symbolic, 21 artifacts |
+| unified, `--jobs 2` | 147.7 s | 163 MB | 18 Memcheck, 3 symbolic, 21 artifacts |
+
+**Orchestration overhead: +4.7%** against coordinating the two commands by
+hand, inside the plan's 10% engineering target. **Two workers: 1.61x**, which
+also makes the unified run 35% faster than the standalone pair it replaces.
+
+Twenty-one distinct artifact hashes for twenty-one jobs: every result is bound
+to its own executable, and none shares one with another.
+
+The deduplication invariant is asserted from the plan rather than from a
+stopwatch — eighteen contracts must schedule eighteen Memcheck workflows even
+though one of them requires `generated` *and* `explore`. A timing threshold
+would be the wrong test for it: a shared CI runner's wall clock is not a
+regression signal, and the invariant is exact.
+
+### What the benchmark does not measure
+
+Per-phase timings — inventory build, harness build, Memcheck execution, solver
+time — are **not** measured. They would need the tool to instrument and emit
+them, and deriving them from the outside by diffing wall clocks across
+configurations would produce numbers that look precise and are not. The
+milestone plan asks for them; this records their absence rather than
+estimating them.
+
+Cold-cache rows are available (`benchmark-m10.py` without `--warm-only`) but
+not run in CI, because a cold row is dominated by compiling the dependency
+graph, which is not what this measures.
+
+### The CI surface
+
+| Check | Where |
+| --- | --- |
+| Three backends, one invocation, three artifacts | `cargo test -p cargo-trace-check --test unified` |
+| Unified report shape, identity, plan, deduplication | `ci/verify-m10-feasibility.py` |
+| `--jobs 2` agrees with `--jobs 1` | `ci/compare-m10-runs.py`, on two real runs |
+| Artifact built by the library's pinned toolchain | `tests/library.rs`, with a contrasting toolchain installed |
+| A mutation fails the unified command, both analyses intact | `ci/mutate-m9.py --unified` |
+| Orchestration overhead and deduplication | `ci/benchmark-m10.py --warm-only` |
+
+---
+
+## 11. Definition of done
+
+The milestone plan's checklist, against what is built. Each line names where
+the claim is checked, because a checklist that cannot be re-run is a claim and
+not a check.
+
+| Claim | Checked by |
+| --- | --- |
+| A real contract runs generated and symbolic analysis through one command | `tests/unified.rs`, `ci/verify-m10-feasibility.py` |
+| The compiler-derived inventory stays authoritative | `ci/verify-m8-contracts.py` |
+| Every required analysis is in the execution plan | `orchestration.rs` tests; the plan is in the report |
+| Every runnable required analysis is executed | `verify-m10-feasibility.py` (a job discharging nothing fails) |
+| Generated and exploration share one Memcheck run | planner tests, `benchmark-m10.py`, `verify-m10-feasibility.py` |
+| M5 symbolic verification has a reusable per-contract interface | `stage_symbolic` / `verify_staged`, used by `verify` and the unified run |
+| M3 dynamic tests can satisfy explicit dynamic requirements | `cargo-trace-check/tests/unified.rs` |
+| Each backend's evidence keeps its provenance and diagnostics | `each_result_carries_the_identity_of_what_it_analyzed` |
+| Symbolic evidence keeps domain, assumptions, observations, depth | `symbolic_evidence_retains_the_conditions_of_its_result` |
+| `VERIFIED_BOUNDED` satisfies only a compatible symbolic obligation | `validate_identity` / `validate_coverage` tests |
+| `NO_LEAK_OBSERVED` cannot satisfy a symbolic requirement | `neither_backend_can_discharge_the_other_requirement` |
+| Backend-specific regression expectations are supported | `a_fixture_may_declare_a_different_outcome_per_backend` |
+| Security contracts cannot declare a leak acceptable | refused at load; `a_leak_fails_a_security_contract_that_declared_it_clean` |
+| M9's backend-disagreement fixtures are handled | both directions, against both real libraries |
+| A detected leak from either backend fails a security contract | `ci/mutate-m9.py --unified` |
+| Incomplete or unavailable analysis fails strict CI | `a_missing_analyzer_leaves_the_symbolic_requirement_unmet` |
+| Existing evidence is preserved if another backend fails | same test; `one_contract_failing_does_not_stop_the_others` |
+| Missing backends cannot trigger weaker analysis instead | `Available::performs`; no substitution path exists |
+| Exemptions stay explicit and cannot erase a leak | `an_exemption_cannot_erase_a_detected_leak` |
+| Artifact hashes cannot be confused between backends | distinct hashes asserted in every multi-backend test |
+| Concurrent execution introduces no artifact races | per-backend directories; `one_worker_and_two_workers_agree` |
+| Report ordering is deterministic | results folded in plan order; `compare-m10-runs.py` |
+| Reports distinguish inventory, enforcement and evidence | `the_json_report_separates_the_three_questions` |
+| Findings identify leaking instructions separately | `a_leak_names_its_instruction_and_not_only_the_declaration` |
+| Standalone M3/M5/M6/M7 workflows keep their semantics | their own suites, unedited, still green |
+| The five clean M9 contracts pass generated **and** symbolic | the CI overlay requires both of three of them |
+| M9's mutation experiments fail unified enforcement | `ci/mutate-m9.py --unified --expect-exit 1` |
+| CI covers policy, provenance, backend failures, incompleteness | §10's table |
+| Runtime and memory costs are measured | `benchmark-m10.py`; §10 |
+| M1–M9 tests remain green | 846 tests, 37 binaries, both backends required |
+
+Two lines of the plan's checklist are **not** fully met, and are listed in §12
+rather than ticked here: the five clean M9 contracts are exercised with both
+backends for three of them rather than all five (the other two differ only in
+which operand is secret, and the policy overlay is a CI cost), and cold/warm
+runtime is measured warm in CI with cold available but not run.
+
+---
+
+## 12. What is not done
+
+Every package is implemented. These are the limits that remain inside them,
+and the non-goals the plan set that are still non-goals.
+
+**Carried limits.**
+
+* M3 expectations are not modelled, so an analyzer-regression fixture cannot
+  declare an outcome for `dynamic`; such a requirement is reported as a
+  configuration gap rather than guessed at.
+* Per-phase timings are not instrumented — see §10.
+* The observation-model default is unchanged: omitting
+  `policy.contracts."…".observations` accepts whatever `[verify]` declared.
+  The plan's alternative, defaulting to both classes, would retroactively
+  invalidate every existing single-class entry.
+* `--jobs` bounds jobs per backend, not Cargo compilation separately from
+  Valgrind separately from solver containers. One number per backend was enough
+  for the measured gain; a finer split has no evidence behind it yet.
+* No persistent cross-run evidence cache, deliberately. The artifact identity
+  is now rich enough to key one, which is a reason to design it on purpose
+  rather than to add it here. Only evidence produced and validated in the
+  current execution can discharge a requirement.
+
+**Still non-goals**, as the plan set them: no new symbolic engine, no new
+observation classes, no hardware timing, no generic/method/struct support, no
+cross-architecture verification, no build-profile matrix, no verification of
+deployed production binaries, and no automatic discovery of unannotated
+security-sensitive functions.
