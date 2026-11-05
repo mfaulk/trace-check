@@ -1,0 +1,19 @@
+[package]
+name = "ml-dsa-control-vulnerable"
+description = "M11.6 negative control, vulnerable half: ml-dsa =0.1.0-rc.2 under trace-check"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "mldsavuln"
+path = "src/lib.rs"
+
+[workspace]
+
+[dependencies]
+# The one thing that differs between the two halves of this control.
+ml-dsa = { version = "=0.1.0-rc.2", default-features = false }
+
+trace-check-macros = { path = "../../crates/trace-check-macros" }

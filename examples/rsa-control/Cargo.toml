@@ -1,0 +1,23 @@
+[package]
+name = "rsa-control"
+description = "M11.6 positive control: the modular exponentiation RUSTSEC-2023-0071 concerns"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "rsactl"
+path = "src/lib.rs"
+
+[workspace]
+
+[dependencies]
+# `=0.9.10`: the latest stable release of `rsa`, and one of the two versions
+# RUSTSEC-2023-0071 lists as affected. The advisory has **no** patched version,
+# so the defect is in current published source and the control does not depend
+# on pinning something old. `rsa` re-exports the big-integer type it computes
+# with, which is the layer the advisory is about.
+rsa = { version = "=0.9.10", default-features = false }
+
+trace-check-macros = { path = "../../crates/trace-check-macros" }

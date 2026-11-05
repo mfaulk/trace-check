@@ -1,0 +1,22 @@
+# M11.6 negative control, patched half.
+#
+# Expected outcomes are recorded from measurement. The control's claim is not
+# about either outcome on its own -- it is about the two halves agreeing, which
+# would mean RUSTSEC-2025-0144's division latency is invisible to this
+# observation model. docs/audits/controls.md states it with the numbers.
+schema_version = 1
+description = "ML-DSA-65 deterministic signing under ml-dsa (patched half of the M11.6 negative control)."
+
+[check."mldsafixed::sign_secret_seed"]
+description = "deterministic ML-DSA-65 signing with the key-generation seed secret"
+rationale = "the advisory's condition: everything the signature derives from the seed is secret, including the s2 and t0 that reach decompose. Measured INCONCLUSIVE in both halves -- ML-DSA's rejection samplers produce undefined-value uses that Memcheck cannot trace back to the client request, the same provenance loss as the ml-kem audit's finding A, so the run fails closed. Read with the other half and with the disassembly in docs/audits/controls.md, which shows the advisory's division is not in either artifact"
+cases = 32
+expectation = "analyzer-regression"
+expected_outcome = "INCONCLUSIVE"
+
+[check."mldsafixed::sign_secret_message"]
+description = "the same signing with the message secret and the key public"
+rationale = "the other half of the question an auditor would ask, and a different claim: a scheme that leaks nothing about its key may still leak about the message. Measured INCONCLUSIVE for the same reason as the contract above"
+cases = 32
+expectation = "analyzer-regression"
+expected_outcome = "INCONCLUSIVE"
