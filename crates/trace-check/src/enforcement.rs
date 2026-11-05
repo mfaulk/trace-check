@@ -304,6 +304,11 @@ pub struct AnalysisEvidence {
     /// struct and most evidence is not symbolic.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbolic: Option<Box<crate::library_report::ContractReport>>,
+    /// The developer-written tests a `dynamic` result rests on, when M3 tests
+    /// produced this evidence: each test's identity, its executable, its
+    /// controls, whether it provably invoked the contract, and its findings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dynamic: Option<crate::dynamic::DynamicEvidence>,
     /// Reproducers written for this contract's findings.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub reproducers: Vec<String>,
@@ -327,6 +332,7 @@ impl AnalysisEvidence {
             check: None,
             discovery: None,
             symbolic: None,
+            dynamic: None,
             reproducers: Vec::new(),
         }
     }
@@ -404,6 +410,7 @@ impl AnalysisEvidence {
             check: None,
             discovery: None,
             symbolic: Some(report),
+            dynamic: None,
             reproducers: Vec::new(),
         }
     }
@@ -451,7 +458,34 @@ impl AnalysisEvidence {
             check: Some(check),
             discovery,
             symbolic: None,
+            dynamic: None,
             reproducers,
+        }
+    }
+
+    /// Developer-written dynamic evidence, from tests already bound to this
+    /// contract and aggregated.
+    ///
+    /// The validation that matters here happened in [`crate::dynamic`]: a test
+    /// that never invoked the contract, whose controls did not fire, or that
+    /// did not complete cannot contribute to a clean aggregate, and the
+    /// aggregate is what arrives. This constructor exists so that dynamic
+    /// evidence, like the other two, can only be built one way.
+    pub fn from_dynamic(
+        artifact: crate::evidence::ArtifactIdentity,
+        dynamic: crate::dynamic::DynamicEvidence,
+    ) -> AnalysisEvidence {
+        AnalysisEvidence {
+            analysis: Analysis::Dynamic,
+            outcome: dynamic.outcome,
+            artifact_sha256: artifact.artifact_sha256.clone(),
+            artifact,
+            detail: dynamic.detail.clone(),
+            check: None,
+            discovery: None,
+            symbolic: None,
+            dynamic: Some(dynamic),
+            reproducers: Vec::new(),
         }
     }
 }

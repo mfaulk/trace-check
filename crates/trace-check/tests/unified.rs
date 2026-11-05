@@ -117,6 +117,7 @@ fn unified_for(config: &VerifyConfig, contract: &str, runtime: Option<&str>) -> 
         None,
         "2026-11-04",
         runtime,
+        None,
     )
     .expect("the unified run reports rather than failing")
 }
@@ -517,6 +518,7 @@ fn the_inverse_disagreement_is_enforced_too() {
         None,
         "2026-11-04",
         None,
+        None,
     )
     .expect("the unified run reports rather than failing");
     let contract = named(&report, INVERTED);
@@ -695,4 +697,185 @@ fn each_result_carries_the_identity_of_what_it_analyzed() {
             "{same} must not differ between two backends of one contract: {joined}"
         );
     }
+}
+
+/// No `DynamicRuns` to build a run from, for the cases that are about what the
+/// enforcement model does with an absence.
+fn no_dynamic_runs() -> trace_check::DynamicRuns {
+    trace_check::DynamicRuns {
+        runs: Vec::new(),
+        profile: "release+debug".to_string(),
+        lockfile_sha256: "lock".to_string(),
+        valgrind_version: "valgrind 3.28.0".to_string(),
+    }
+}
+
+/// Runs the unified checker over one contract with a dynamic contribution.
+fn unified_with_dynamic(
+    config: &VerifyConfig,
+    contract: &str,
+    runs: &trace_check::DynamicRuns,
+) -> CoverageReport {
+    let workspace = Workspace::ephemeral().expect("a private workspace");
+    let library =
+        Library::resolve(&library_dir().join("Cargo.toml"), &[]).expect("the audit library");
+    trace_check::run_contract_coverage(
+        &library,
+        config,
+        &workspace,
+        &trace_check::CheckOverrides::default(),
+        &Selection::Named(vec![contract.to_string()]),
+        None,
+        "2026-11-04",
+        None,
+        Some(runs),
+    )
+    .expect("the unified run reports rather than failing")
+}
+
+/// A contract annotated `dynamic = false` has no test adapter, so an M3
+/// dynamic requirement is unsupported rather than merely unmet.
+///
+/// Unsupported is the honest status: no amount of running tests will produce
+/// adapter-backed evidence for a contract the macro emitted no adapter for.
+/// Needs no backend at all -- it is settled before anything runs.
+#[test]
+fn a_dynamic_disabled_contract_cannot_satisfy_a_dynamic_requirement() {
+    // `cbaudit::select::ct_select` is annotated `dynamic = false`.
+    const DISABLED: &str = "cbaudit::select::ct_select";
+    let config = config_with_policy(&format!(
+        "[policy]\nmode = \"strict\"\ndefault_required = [\"generated\"]\n\n\
+         [policy.contracts.\"{DISABLED}\"]\nrequired = [\"dynamic\"]\n"
+    ));
+    let report = unified_with_dynamic(&config, DISABLED, &no_dynamic_runs());
+    let contract = named(&report, DISABLED);
+    let status = contract
+        .status
+        .get(&Analysis::Dynamic)
+        .expect("a required analysis always has a status");
+    assert_eq!(status.as_str(), "UNSUPPORTED", "{status:?}");
+    assert!(
+        status.describe().contains("dynamic = false"),
+        "the diagnostic must name the annotation: {}",
+        status.describe()
+    );
+    assert!(!contract.satisfied());
+    assert!(contract.evidence_for(Analysis::Dynamic).is_none());
+}
+
+/// A contract with a test adapter and no bound `#[ct_test]` run stays
+/// NOT_ANALYZED.
+///
+/// The absence of evidence, which is the one thing a unified run must never
+/// render as a clean result. `crypto::tag::verify_tag` has an adapter — it is
+/// the acceptance subject precisely because it does — and this run supplies no
+/// test results for it.
+#[test]
+fn a_contract_with_no_bound_test_is_not_analyzed() {
+    const ADAPTED: &str = "crypto::tag::verify_tag";
+    let base = std::fs::read_to_string(
+        workspace_root()
+            .join("examples/crypto-library")
+            .join(CONFIG_FILE),
+    )
+    .expect("the bundled configuration is committed");
+    let config = write_config(&format!(
+        "{base}\n[policy]\nmode = \"strict\"\ndefault_required = [\"generated\"]\n\n\
+         [policy.contracts.\"{ADAPTED}\"]\nrequired = [\"dynamic\"]\n"
+    ));
+    let workspace = Workspace::ephemeral().expect("a private workspace");
+    let library = Library::resolve(
+        &workspace_root().join("examples/crypto-library/Cargo.toml"),
+        &[],
+    )
+    .expect("the bundled library");
+    let runs = no_dynamic_runs();
+    let report = trace_check::run_contract_coverage(
+        &library,
+        &config,
+        &workspace,
+        &trace_check::CheckOverrides::default(),
+        &Selection::Named(vec![ADAPTED.to_string()]),
+        None,
+        "2026-11-04",
+        None,
+        Some(&runs),
+    )
+    .expect("the unified run reports rather than failing");
+    let contract = named(&report, ADAPTED);
+    let status = contract
+        .status
+        .get(&Analysis::Dynamic)
+        .expect("a required analysis always has a status");
+    assert_eq!(status.as_str(), "NOT_ANALYZED", "{status:?}");
+    assert!(
+        contract.evidence_for(Analysis::Dynamic).is_none(),
+        "no bound test is no evidence, not clean evidence"
+    );
+    assert!(!contract.satisfied());
+}
+
+/// A `#[ct_test]` whose target names no contract in this build is reported,
+/// not silently dropped.
+///
+/// Binding to nothing is already fail-closed: the obligation stays un-analyzed
+/// and strict CI fails. But a run that fails without saying why is the shape of
+/// problem this milestone exists to remove, so the unresolved target appears in
+/// the report alongside configuration that matches no declaration.
+#[test]
+fn a_test_targeting_no_contract_is_reported() {
+    let config = config_with_policy(&format!(
+        "[policy]\nmode = \"strict\"\ndefault_required = [\"generated\"]\n\n\
+         [policy.contracts.\"{CONTRACT}\"]\nrequired = [\"dynamic\"]\n"
+    ));
+    let mut runs = no_dynamic_runs();
+    runs.runs.push(trace_check::dynamic::DynamicTestRun {
+        test: "tests::covers_something_renamed".to_string(),
+        declared_target: Some("monty::mul_renamed".to_string()),
+        executable: "/t/tests-abc".to_string(),
+        executable_sha256: "exec0".to_string(),
+        outcome: Outcome::NoLeakObserved,
+        calibrated: true,
+        invoked_target: true,
+        completed: true,
+        message: "clean".to_string(),
+        findings: Vec::new(),
+    });
+    let report = unified_with_dynamic(&config, CONTRACT, &runs);
+
+    let reported: Vec<&trace_check::enforcement::StaleEntry> = report
+        .stale
+        .iter()
+        .filter(|entry| entry.source == "ct_test")
+        .collect();
+    assert_eq!(reported.len(), 1, "{:?}", report.stale);
+    assert!(
+        reported[0].detail.contains("monty::mul_renamed"),
+        "the diagnostic must name the target: {}",
+        reported[0].detail
+    );
+    assert!(
+        reported[0].detail.contains("declares no contract"),
+        "{}",
+        reported[0].detail
+    );
+
+    // And it discharged nothing: an unbound test is not evidence.
+    let contract = contract_of(&report);
+    assert_eq!(
+        contract.status.get(&Analysis::Dynamic).map(|s| s.as_str()),
+        Some("UNSUPPORTED"),
+        "{:?}",
+        contract.status
+    );
+    assert!(!contract.satisfied());
+    assert!(
+        report
+            .summary
+            .blocking_reasons
+            .iter()
+            .any(|reason| reason.contains("monty::mul_renamed")),
+        "the unresolved target must block: {:?}",
+        report.summary.blocking_reasons
+    );
 }
