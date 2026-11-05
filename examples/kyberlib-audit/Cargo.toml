@@ -1,0 +1,27 @@
+[package]
+name = "kyberlib-audit"
+description = "Audit adapters that expose kyberlib's ML-KEM-768 decapsulation to trace-check"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "kyberaudit"
+path = "src/lib.rs"
+
+[workspace]
+
+[dependencies]
+# `=0.0.11`, pinned for the same reason as the ml-kem audit: the analyzed
+# artifact is the claim. Default features are `kyber768` and `std`; `avx2` is
+# off, because the portable reference path is the target and a SIMD path is a
+# different compiled program.
+kyberlib = { version = "=0.0.11", default-features = false, features = ["kyber768", "std"] }
+
+# kyberlib's encapsulation takes an RNG, so deterministic ciphertext
+# construction needs one. rand_core must match kyberlib's major version.
+rand_core = { version = "0.6.4", default-features = false }
+
+trace-check-macros = { path = "../../crates/trace-check-macros" }
+trace-check-secret = { path = "../../crates/trace-check-secret" }

@@ -48,8 +48,9 @@ BRANCH = "secret_dependent_branch"
 # class the tool never emits would make this script vacuous.
 VALUE = "secret_dependent_value"
 
+# One table per audited target, selected by the namespace the report contains.
 # contract -> (expected outcome, expected finding classification or None)
-EXPECTED = {
+ML_KEM = {
     "mlkemaudit::decaps::decaps_valid_ciphertext": (CLEAN, None),
     "mlkemaudit::decaps::decaps_corrupted_ciphertext": (CLEAN, None),
     "mlkemaudit::decaps::decaps_supplied_ciphertext": (CLEAN, None),
@@ -64,40 +65,94 @@ EXPECTED = {
     "mlkemaudit::seedlevel::keygen_and_decaps": (INCONCLUSIVE, None),
 }
 
-# The boundary pair, and the control whose failure would invalidate everything.
-BOUNDARY_PUBLIC = "mlkemaudit::controls::public_component_branch"
-BOUNDARY_SEED = "mlkemaudit::controls::public_component_branch_seed_level"
-OVER_DECLASSIFICATION = (
-    "mlkemaudit::controls::secret_component_branch",
-    "mlkemaudit::controls::secret_component_address",
-)
-SENSITIVITY = "mlkemaudit::controls::shared_key_branch"
+# kyberlib's seed-level contract reports the *same* rejection-sampling branches
+# as ml-kem's, attributed rather than unattributable, because provenance
+# survives its XOF. Asserting LEAK_DETECTED here and INCONCLUSIVE there is what
+# keeps that comparison from silently decaying into agreement.
+KYBERLIB = {
+    "kyberaudit::decaps::decaps_valid_ciphertext": (CLEAN, None),
+    "kyberaudit::decaps::decaps_corrupted_ciphertext": (CLEAN, None),
+    "kyberaudit::decaps::decaps_supplied_ciphertext": (CLEAN, None),
+    "kyberaudit::controls::no_planted_leak": (CLEAN, None),
+    "kyberaudit::controls::public_component_branch": (CLEAN, None),
+    "kyberaudit::controls::pre_keygen_seed_byte": (DETECTED, BRANCH),
+    "kyberaudit::controls::secret_component_branch": (DETECTED, BRANCH),
+    "kyberaudit::controls::secret_component_address": (DETECTED, VALUE),
+    "kyberaudit::controls::shared_secret_branch": (DETECTED, BRANCH),
+    "kyberaudit::seedlevel::keygen_and_decaps": (DETECTED, BRANCH),
+}
 
-# Finding A's upstream frame.
-REJ_UNIFORM = "ml_kem::algebra::rej_uniform"
+TARGETS = {"mlkemaudit": ML_KEM, "kyberaudit": KYBERLIB}
+
+# Per-target: the boundary pair, the controls whose failure invalidates
+# everything, and the upstream frame the seed-level outcome is explained by.
+SETTINGS = {
+    "mlkemaudit": {
+        "boundary_public": "mlkemaudit::controls::public_component_branch",
+        "boundary_seed": "mlkemaudit::controls::public_component_branch_seed_level",
+        "load_bearing": (
+            "mlkemaudit::controls::secret_component_branch",
+            "mlkemaudit::controls::secret_component_address",
+            "mlkemaudit::controls::shared_key_branch",
+        ),
+        # Finding A: unattributable diagnostics, so the frame is looked for
+        # among `other_diagnostics`.
+        "artifact_frame": "ml_kem::algebra::rej_uniform",
+        "artifact_in": "other_diagnostics",
+        "artifact_contracts": (
+            "mlkemaudit::controls::public_component_branch_seed_level",
+            "mlkemaudit::seedlevel::keygen_and_decaps",
+        ),
+    },
+    "kyberaudit": {
+        "boundary_public": "kyberaudit::controls::public_component_branch",
+        "boundary_seed": "kyberaudit::seedlevel::keygen_and_decaps",
+        "load_bearing": (
+            "kyberaudit::controls::secret_component_branch",
+            "kyberaudit::controls::secret_component_address",
+            "kyberaudit::controls::shared_secret_branch",
+        ),
+        # Finding A-prime: the same step, attributed, so the frame is looked
+        # for among the findings themselves.
+        "artifact_frame": "rej_uniform",
+        "artifact_in": "findings",
+        "artifact_contracts": ("kyberaudit::seedlevel::keygen_and_decaps",),
+    },
+}
 
 
-def main() -> int:
-    if len(sys.argv) != 2:
-        print("usage: ci/verify-m11-audit.py <report.json>", file=sys.stderr)
-        return 2
-
-    report = json.loads(pathlib.Path(sys.argv[1]).read_text())
+def check_report(report: dict) -> tuple[list[str], str, int]:
+    """Returns (problems, target namespace, contracts checked)."""
     contracts = {entry["contract"]: entry for entry in report.get("contracts", [])}
     problems: list[str] = []
 
-    missing = sorted(set(EXPECTED) - set(contracts))
+    namespaces = {name.split("::", 1)[0] for name in contracts}
+    known = namespaces & set(TARGETS)
+    if len(known) != 1:
+        return (
+            [
+                "the report must contain exactly one audited target's contracts; "
+                f"saw namespaces {sorted(namespaces)}"
+            ],
+            "?",
+            0,
+        )
+    target = known.pop()
+    expected = TARGETS[target]
+    settings = SETTINGS[target]
+
+    missing = sorted(set(expected) - set(contracts))
     if missing:
         problems.append(f"contracts absent from the report: {missing}")
 
-    extra = sorted(set(contracts) - set(EXPECTED))
+    extra = sorted(set(contracts) - set(expected))
     if extra:
         problems.append(
             f"contracts in the report that this script does not know about: {extra}. "
             "Add them here in the same commit that adds them to the audit"
         )
 
-    for name, (expected_outcome, expected_class) in EXPECTED.items():
+    for name, (expected_outcome, expected_class) in expected.items():
         entry = contracts.get(name)
         if entry is None:
             continue
@@ -123,38 +178,41 @@ def main() -> int:
         if not entry.get("artifact_sha256"):
             problems.append(f"{name}: no artifact hash recorded")
 
-    # The boundary pair. `public_component_branch` must be clean with *nothing*
-    # reported, not merely with no attributed finding.
-    public = (contracts.get(BOUNDARY_PUBLIC) or {}).get("check") or {}
+    # The boundary pair. The clean half must report *nothing*, not merely no
+    # attributed finding.
+    public_name = settings["boundary_public"]
+    public = (contracts.get(public_name) or {}).get("check") or {}
     if public.get("other_diagnostics"):
         problems.append(
-            f"{BOUNDARY_PUBLIC}: clean but with "
-            f"{len(public['other_diagnostics'])} diagnostic(s); the key-level boundary "
-            "is supposed to leave this branch entirely unobserved"
+            f"{public_name}: clean but with {len(public['other_diagnostics'])} "
+            "diagnostic(s); the key-level boundary is supposed to leave this branch "
+            "entirely unobserved"
         )
-    seed = (contracts.get(BOUNDARY_SEED) or {}).get("check") or {}
+    seed_name = settings["boundary_seed"]
+    seed = (contracts.get(seed_name) or {}).get("check") or {}
     if seed.get("outcome") == CLEAN:
         problems.append(
-            f"{BOUNDARY_SEED}: clean. The same branch on the same byte is clean under "
-            "both encodings, so the boundary is not doing what the audit says"
+            f"{seed_name}: clean. The seed-level encoding is supposed to observe what "
+            "the key-level boundary declassifies, so the boundary is not doing what "
+            "the audit says"
         )
 
-    # Finding A, by frame rather than by count.
-    for name in (BOUNDARY_SEED, "mlkemaudit::seedlevel::keygen_and_decaps"):
+    # The upstream rejection-sampling frame that explains the seed-level outcome.
+    for name in settings["artifact_contracts"]:
         check = (contracts.get(name) or {}).get("check") or {}
-        frames = {
-            (diagnostic.get("fingerprint") or {}).get("function")
-            for diagnostic in check.get("other_diagnostics") or []
-        }
-        if REJ_UNIFORM not in frames:
+        entries = check.get(settings["artifact_in"]) or []
+        frames = {(item.get("fingerprint") or {}).get("function") for item in entries}
+        if not any(
+            frame and settings["artifact_frame"] in frame for frame in frames
+        ):
             problems.append(
-                f"{name}: no diagnostic in {REJ_UNIFORM}. Finding A is the recorded "
-                "explanation for this contract's INCONCLUSIVE and no longer applies"
+                f"{name}: nothing in {settings['artifact_frame']} among its "
+                f"{settings['artifact_in']}. The recorded explanation for this "
+                "contract's outcome no longer applies"
             )
 
-    # Restate the two controls everything else depends on, so a reader of CI
-    # output sees them named rather than having to infer them from a pass.
-    for name in (*OVER_DECLASSIFICATION, SENSITIVITY):
+    # Named explicitly so CI output shows them rather than implying them.
+    for name in settings["load_bearing"]:
         check = (contracts.get(name) or {}).get("check") or {}
         if check.get("outcome") != DETECTED:
             problems.append(
@@ -162,20 +220,34 @@ def main() -> int:
                 "clean results mean nothing without it"
             )
 
+    return problems, target, len(expected)
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print("usage: ci/verify-m11-audit.py <report.json>", file=sys.stderr)
+        return 2
+
+    report = json.loads(pathlib.Path(sys.argv[1]).read_text())
+    problems, target, count = check_report(report)
+
     if problems:
-        print("M11 ml-kem audit report did NOT establish what it claims:")
+        print(f"M11 {target} audit report did NOT establish what it claims:")
         for problem in problems:
             print(f"  - {problem}")
         return 1
 
-    detected = sum(
-        1 for name, (outcome, _) in EXPECTED.items() if outcome == DETECTED
+    expected = TARGETS[target]
+    clean = sum(1 for outcome, _ in expected.values() if outcome == CLEAN)
+    detected = sum(1 for outcome, _ in expected.values() if outcome == DETECTED)
+    inconclusive = sum(
+        1 for outcome, _ in expected.values() if outcome == INCONCLUSIVE
     )
-    clean = sum(1 for name, (outcome, _) in EXPECTED.items() if outcome == CLEAN)
     print(
-        f"M11 audit report checked: {len(EXPECTED)} contract(s), {clean} clean, "
-        f"{detected} control(s) detected with the declared observation class, "
-        "2 inconclusive with finding A's frame present, boundary pair intact"
+        f"M11 {target} audit report checked: {count} contract(s), {clean} clean, "
+        f"{detected} detected with the declared observation class, "
+        f"{inconclusive} inconclusive, boundary pair intact, "
+        "rejection-sampling frame present"
     )
     return 0
 
