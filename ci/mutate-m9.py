@@ -39,6 +39,16 @@ Usage:
         --expect-outcome LEAK_DETECTED \\
         --expect-frame src/uint/add.rs
     ci/mutate-m9.py --mutation … --expect-outcome NO_LEAK_OBSERVED --clean
+
+`--unified` runs the mutation through `check --all-contracts --ci` instead,
+with a policy requiring both generated and symbolic analysis of the affected
+contract. The exit code and the survival of *both* analyses are what it checks:
+a run that stopped at the first failure would report one backend and leave the
+other un-analyzed.
+
+    ci/mutate-m9.py --mutation mutation-a-carry-branch \
+        --contract cbaudit::add::wrapping_add_secret_left \
+        --expect-outcome LEAK_DETECTED --unified --expect-exit 1
 """
 
 import argparse
@@ -283,6 +293,75 @@ def check_contract(manifest, contract, reproducer_dir=None):
     return report["contracts"][0]
 
 
+def check_unified(manifest, contract, policy_path):
+    """Runs the *unified* enforcement command over one staged adapter.
+
+    M10's acceptance experiment C: declare the mutated operation a security
+    contract requiring both generated and symbolic analysis, and require one
+    command to exit 1 when either backend establishes a leak -- with both
+    analyses preserved in the report rather than the first failure ending the
+    run.
+
+    Returns `(exit_code, contract_row)`. The exit code is the point, so it is
+    returned rather than asserted on here: a leak must outrank an incomplete
+    analysis, and only the caller knows which it expected.
+    """
+    command = [
+        "cargo",
+        "run",
+        "--release",
+        "--quiet",
+        "-p",
+        "cargo-trace-check",
+        "--",
+        "check",
+        "--all-contracts",
+        "--ci",
+        "--config",
+        str(policy_path),
+        "--manifest-path",
+        str(manifest),
+        "--format",
+        "json",
+    ]
+    result = run(command, cwd=REPO)
+    try:
+        report = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        fail(f"the unified checker produced no report:\n{result.stdout}\n{result.stderr}")
+    rows = [row for row in report.get("contracts", []) if row["id"] == contract]
+    if not rows:
+        fail(f"the unified report does not mention {contract}")
+    return result.returncode, rows[0], report
+
+
+def unified_policy(work, contract, base_config):
+    """Writes the staged adapter's configuration with a unified policy on top.
+
+    Overlaid rather than replacing it: the `[check]` and `[verify]` entries the
+    audit already carries are what make both backends runnable, and rewriting
+    them would make this experiment test a different configuration from the one
+    the project ships.
+
+    Every *other* contract is given a requirement this build cannot satisfy, so
+    the run schedules only the contract under test. Eighteen generated checks
+    and three symbolic verifications to observe one mutation would be a slow
+    way to learn nothing extra -- and the contracts are all `dynamic = false`,
+    so `dynamic` settles as UNSUPPORTED without running anything.
+    """
+    text = base_config.read_text()
+    text += (
+        "\n[policy]\nmode = \"strict\"\n"
+        "default_required = [\"dynamic\"]\n\n"
+        f'[policy.contracts."{contract}"]\n'
+        'required = ["generated", "symbolic"]\n'
+        'observations = ["control-flow", "memory-access"]\n'
+    )
+    path = work / "unified-trace-check.toml"
+    path.write_text(text)
+    return path
+
+
 def replay_reproducer(manifest, reproducer_dir, label):
     """A finding has to be replayable against the build it was found in.
 
@@ -340,18 +419,66 @@ def check_replay(manifest, reproducer):
         fail(f"replaying {reproducer} produced no report:\n{result.stdout}{result.stderr}")
 
 
+def require_unified(run, expect_outcome, expect_exit):
+    """Holds a unified run to the outcome, the exit code, and both analyses.
+
+    The exit code is checked separately from the outcomes because it encodes a
+    priority the outcomes do not: a detected leak must outrank an incomplete
+    analysis, so a run where one backend found a leak and the other was
+    inconclusive still exits 1.
+    """
+    row = run.unified_row
+    by_analysis = {item["analysis"]: item for item in row.get("evidence", [])}
+    outcomes = {name: item["outcome"] for name, item in by_analysis.items()}
+    if expect_outcome not in outcomes.values():
+        fail(
+            f"[mutated] no backend reported {expect_outcome}; the unified run saw {outcomes}"
+        )
+    # Every analysis that reported is still in the report: a backend failing
+    # must not discard what another established.
+    for analysis in ("generated", "symbolic"):
+        if analysis not in by_analysis:
+            fail(f"[mutated] {analysis} evidence is missing from the report")
+    states = {name: value["state"] for name, value in (row.get("status") or {}).items()}
+    if expect_outcome == "LEAK_DETECTED" and "leak-detected" not in states.values():
+        fail(
+            f"[mutated] a leak was reported as evidence but no requirement is "
+            f"leak-detected: {states}"
+        )
+    if expect_exit is not None and run.unified_exit != expect_exit:
+        fail(
+            f"[mutated] the unified run exited {run.unified_exit}, expected {expect_exit}. "
+            "A detected leak must outrank an incomplete analysis"
+        )
+    print(f"[mutated] statuses:    {states}")
+    print(f"[mutated] both analyses preserved, exit {run.unified_exit}")
+
+
 class Run:
     """One staged experiment's results, so callers compare like with like."""
 
-    def __init__(self, artifact, evidence, manifest, reproducer_dir, graph_digest):
+    def __init__(
+        self,
+        artifact,
+        evidence,
+        manifest,
+        reproducer_dir,
+        graph_digest,
+        unified_exit=None,
+        unified_row=None,
+    ):
         self.artifact = artifact
         self.evidence = evidence
         self.manifest = manifest
         self.reproducer_dir = reproducer_dir
         self.graph_digest = graph_digest
+        # Set only by a `--unified` run: the process exit code, and the
+        # contract's whole row so a caller can inspect both analyses.
+        self.unified_exit = unified_exit
+        self.unified_row = unified_row
 
 
-def experiment(work, source, patch, contract, label, reproducers=False):
+def experiment(work, source, patch, contract, label, reproducers=False, unified=False):
     """Stages one dependency tree, checks one contract, returns the evidence."""
     dependency, before, after = stage_dependency(work, source, patch)
     print(f"[{label}] staged:      {dependency}")
@@ -367,6 +494,36 @@ def experiment(work, source, patch, contract, label, reproducers=False):
         f"[{label}] functional:  inline tests and the 1012 oracle vectors pass "
         "against the staged dependency"
     )
+
+    if unified:
+        policy = unified_policy(work, contract, adapter / "trace-check.toml")
+        code, row, _report = check_unified(adapter / "Cargo.toml", contract, policy)
+        by_analysis = {item["analysis"]: item for item in row.get("evidence", [])}
+        # Both analyses must be present. A run that stopped at the first
+        # failure would report one and leave the other un-analyzed, which is
+        # the behaviour M10 forbids by default.
+        for analysis in ("generated", "symbolic"):
+            if analysis not in by_analysis:
+                fail(
+                    f"[{label}] the unified run produced no {analysis} evidence, so a backend "
+                    f"was skipped: {sorted(by_analysis)}"
+                )
+            print(
+                f"[{label}] {analysis}: {by_analysis[analysis]['outcome']} in "
+                f"{by_analysis[analysis]['artifact_sha256'][:12]}"
+            )
+        if by_analysis["generated"]["artifact_sha256"] == by_analysis["symbolic"]["artifact_sha256"]:
+            fail(f"[{label}] both analyses report one artifact, so one of them is misattributed")
+        print(f"[{label}] exit code:   {code}")
+        return Run(
+            artifact=by_analysis["generated"]["artifact_sha256"],
+            evidence=by_analysis["generated"].get("check") or by_analysis["generated"],
+            manifest=adapter / "Cargo.toml",
+            reproducer_dir=None,
+            graph_digest=graph_digest,
+            unified_exit=code,
+            unified_row=row,
+        )
 
     reproducer_dir = work / "reproducers" if reproducers else None
     reported = check_contract(adapter / "Cargo.toml", contract, reproducer_dir)
@@ -476,6 +633,19 @@ def main():
         default="NO_LEAK_OBSERVED",
         help="what the unpatched baseline must report under --compare-clean",
     )
+    parser.add_argument(
+        "--unified",
+        action="store_true",
+        help=(
+            "run the mutation through `check --all-contracts --ci` with a policy requiring "
+            "both generated and symbolic analysis, instead of the standalone check"
+        ),
+    )
+    parser.add_argument(
+        "--expect-exit",
+        type=int,
+        help="exit code the unified run must produce (1 for a detected leak)",
+    )
     parser.add_argument("--keep", help="write the staged trees here instead of a temp dir")
     arguments = parser.parse_args()
 
@@ -522,7 +692,12 @@ def main():
             arguments.contract,
             "mutated",
             reproducers=arguments.verify_reproducer,
+            unified=arguments.unified,
         )
+        if arguments.unified:
+            require_unified(mutated, arguments.expect_outcome, arguments.expect_exit)
+            print("PASS")
+            return
         require_outcome(mutated.evidence, arguments.expect_outcome, "mutated")
         if arguments.expect_class:
             require_class(mutated.evidence, arguments.expect_class, "mutated")
