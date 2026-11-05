@@ -23,7 +23,7 @@ the formal noninterference property, and the roadmap.
 | M7 | Coverage-guided leakage discovery | complete, experimental |
 | M8 | Complete contract coverage and enforcement | complete, experimental |
 | M9 | Real-world cryptography integration — auditing `crypto-bigint` | complete, experimental |
-| M10 | Unified multi-backend verification and CI enforcement | in progress — M10.0–M10.2, M10.4 complete |
+| M10 | Unified multi-backend verification and CI enforcement | in progress — M10.0–M10.2, M10.4–M10.5 complete |
 | M11 | Hardware-oriented validation — statistical timing | future |
 
 `trace-check` turns that idea into reproducible analysis, from five directions:
@@ -645,6 +645,28 @@ function it names establishes nothing about it. Several tests covering one
 contract aggregate deterministically — a leak is preserved, any test that did
 not complete with valid controls prevents a clean result, and a duplicate
 execution counts once.
+
+**Four named analyses are not four backend runs.** The report carries the
+execution plan the run committed to before building anything:
+
+```
+Execution plan
+
+  crypto::tag::verify_tag
+    J1: LLVM coverage discovery + Memcheck
+        discharges: generated, explore
+    J2: BINSEC relational verification
+        discharges: symbolic
+
+  1 Memcheck workflow(s), 1 symbolic verification(s)
+```
+
+`explore` is not a separate proof level: coverage feedback chooses which inputs
+to analyze, and the security conclusion still comes from the same uninstrumented
+artifact an explored run already covers the baseline corpus with. So requiring
+`generated` *and* `explore` is one Memcheck workflow discharging two
+obligations, and each evidence record names the other in `shared_with` — two
+requirements met, one observation, never counted twice.
 
 `--ci` requires `mode = "strict"` and refuses an advisory policy. Advisory mode
 reports gaps without failing, which is what it is for during adoption and

@@ -28,3 +28,10 @@ required = ["generated", "symbolic"]
 
 [policy.contracts."cbaudit::hidden::nested_modes_wide"]
 required = ["generated", "symbolic"]
+
+# M10.5 adds a contract requiring `generated` *and* `explore`, so the CI run
+# exercises the deduplication claim on real work: the two obligations must be
+# discharged by one Memcheck workflow, and the report must mark them as sharing
+# it. `verify-m10-feasibility.py` refuses a plan that schedules two.
+[policy.contracts."cbaudit::monty::mul_secret_left"]
+required = ["generated", "explore"]

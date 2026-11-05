@@ -38,7 +38,7 @@ are two results about two binaries, not one result about the function.
 | M10.2 | Typed artifact-bound evidence model | complete |
 | M10.3 | Refactor and integrate the M5 symbolic runner | partial — see §5 |
 | M10.4 | Integrate M3 developer-written dynamic tests | complete |
-| M10.5 | Unified execution planner and backend deduplication | not started |
+| M10.5 | Unified execution planner and backend deduplication | complete |
 | M10.6 | Bounded scheduling, isolation and failure handling | not started |
 | M10.7 | Unified CLI, reporting and schema migration | partial — see §5 |
 | M10.8 | Acceptance, mutation tests, benchmarks, CI and documentation | not started |
@@ -434,7 +434,100 @@ it would leave the invocation check untested.
 
 ---
 
-## 7. What is not done
+## 7. M10.5 — one execution plan, and no redundant backend runs
+
+### What was already true, and what was missing
+
+The unified run already invoked the generated backend once per contract and
+folded that one result against both a `generated` and an `explore` obligation,
+so the expensive half of deduplication was never broken. Three things were
+missing.
+
+**Nothing said so.** The decision was spread across an inline loop and derived
+per contract at execution time. "Requiring both must never run two Memcheck
+analyses" was true by accident of control flow rather than by construction, and
+nothing could assert it without running Valgrind.
+
+**The report double-counted.** Two evidence records with the same artifact hash
+and the same case counts read as two independent observations. A reader counting
+evidence would conclude the contract had been checked twice, when it was checked
+once with better inputs.
+
+**`dynamic` was modelled per contract**, when it is one pass over a whole test
+suite: a per-contract job would rebuild the suite per contract and run a test
+covering two contracts twice.
+
+### The plan is a value
+
+`orchestration::ExecutionPlan` is resolved from the policy plan *before any
+artifact is compiled*, and the run walks it. One place decides what executes.
+
+```
+Execution plan
+
+  cbaudit::monty::mul_both_secret
+    J1: generated corpus + Memcheck
+        discharges: generated
+    J2: BINSEC relational verification
+        discharges: symbolic
+
+  1 Memcheck workflow(s), 1 symbolic verification(s)
+```
+
+`Work::Generated { explore }` is one variant rather than two, because there is
+one workflow: discovery selects a corpus and hands it to the same analysis.
+`explore` is a property of the job, never a second job. The deduplication table
+from the milestone plan is now a unit test needing no backend at all:
+
+| Required | Plans |
+| --- | --- |
+| `generated` | 1 Memcheck (`explore: false`) |
+| `explore` | 1 Memcheck (`explore: true`) |
+| `generated`, `explore` | **1** Memcheck (`explore: true`), discharging both |
+| `symbolic` | 1 BINSEC |
+| `generated`, `symbolic` | 1 Memcheck + 1 BINSEC |
+| all four | 1 Memcheck + 1 BINSEC + one pass over the test suite |
+
+Only *outstanding* requirements produce jobs. A requirement already settled —
+exempted, unsupported, not selected, backend unavailable — has its answer, and
+running a backend to re-derive it would spend the analysis and then discard the
+result. A configured `[check."…".explore] enabled = true` still explores where
+no `explore` obligation exists, which preserves M7's regression: looking only at
+the policy silently skipped a configured search, so the corpus analyzed was not
+the one the run was set up to analyze.
+
+### Evidence says when it was shared
+
+`AnalysisEvidence::shared_with` names the other requirements the same execution
+discharged. Two records are still reported — the status map is total over the
+requirements, and both genuinely were met — but neither can be read as an
+independent observation.
+
+The acceptance test checks both halves: that the plan commits to one workflow,
+and that the run bears it out with one artifact hash, identical case counts,
+identical analyzer-process counts, and `shared_with` agreeing in both
+directions. A second test requires that a lone `generated` requirement plans
+*no* discovery, so the first is not passing merely because exploration is always
+on.
+
+`verify-m10-feasibility.py` refuses a report whose plan schedules more than one
+Memcheck workflow for a contract, refuses a job that discharges nothing, and
+refuses a one-sided `shared_with`. The CI policy overlay gains
+`cbaudit::monty::mul_secret_left` requiring `generated` and `explore`, so the
+claim is exercised against real work rather than only in the planner's unit
+tests.
+
+### The plan is in the report
+
+`CoverageReport.execution` carries it, absent from a read-only `coverage` report
+because that runs nothing. The report now answers three separable questions:
+which contracts were declared, what each owed, and **what actually ran** — the
+last being what makes "two requirements, one observation" checkable rather than
+a claim.
+
+---
+
+## 8. What is not done
 
 * **M10.3** — the per-contract symbolic seam exists (`stage_symbolic` /
   `verify_staged`) and the standalone command uses it. Observation-model policy
@@ -444,9 +537,6 @@ it would leave the invocation check untested.
   reported as a configuration gap rather than guessed at. A `dynamic`
   requirement is still reported as produced elsewhere when no policy asks for
   it, which is what keeps `coverage` and a generated-only run honest.
-* **M10.5** — no execution plan representation and no deduplication of
-  `generated` against `explore`. Requiring both still goes through the existing
-  single Memcheck workflow, but nothing yet *proves* there is only one run.
 * **M10.6** — backends run sequentially, in inventory order. No `--jobs`.
 * **M10.7** — `--ci` is now honoured on the `--all-contracts` path and refuses
   an advisory policy. No schema migration, and no leaking-instruction/folded-
