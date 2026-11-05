@@ -170,14 +170,35 @@ fn leak_sites(evidence: &crate::enforcement::AnalysisEvidence) -> Vec<String> {
     if let Some(check) = &evidence.check {
         for finding in &check.findings {
             let what = finding.fingerprint.classification.describe();
-            match (&finding.site, &finding.fingerprint.function) {
-                (Some(site), Some(function)) => {
-                    sites.push(format!("{site} in `{function}` ({what})"))
+            // `fingerprint.function` and `fingerprint.location` describe the
+            // *same* frame -- the innermost located one, which is where the
+            // leaking instruction is. `finding.site` describes a different
+            // frame: the contract's own, which is how the finding was
+            // attributed to this contract.
+            //
+            // Pairing one with the other printed a function from an upstream
+            // dependency beside a line number from the audit adapter. For M9's
+            // mutation inside `crypto-bigint`'s `carrying_add` that read as
+            // "add.rs:38 in `carrying_add`", where add.rs:38 is the adapter and
+            // the instruction is in the library -- a confident sentence about
+            // somewhere the leak is not, which is the exact problem M9 raised.
+            let instruction = match (&finding.fingerprint.location, &finding.fingerprint.function) {
+                (Some(at), Some(function)) => format!("{at} in `{function}`"),
+                (Some(at), None) => at.clone(),
+                (None, Some(function)) => format!("`{function}`"),
+                (None, None) => "an unlocated frame".to_string(),
+            };
+            let mut line = format!("{instruction} ({what})");
+            // The contract's own frame, named as what it is. Shown when it
+            // differs, because at `-O` the instruction is usually in an
+            // inlined callee and the attribution frame is the line a developer
+            // opens first.
+            if let Some(site) = &finding.site {
+                if Some(site) != finding.fingerprint.location.as_ref() {
+                    line.push_str(&format!(", attributed to {site}"));
                 }
-                (Some(site), None) => sites.push(format!("{site} ({what})")),
-                (None, Some(function)) => sites.push(format!("`{function}` ({what})")),
-                (None, None) => sites.push(format!("{what} (no source location in this build)")),
             }
+            sites.push(line);
         }
     }
     if let Some(symbolic) = &evidence.symbolic {
@@ -699,5 +720,84 @@ mod tests {
         assert_eq!(report.summary.enforcement_rate, None);
         assert!(report.to_text().contains("n/a (no unwaived requirements)"));
         assert_eq!(report.exit_code(), EXIT_OK);
+    }
+
+    /// The leak site names one frame at a time: the leaking instruction from
+    /// the fingerprint, and the contract's attribution frame separately.
+    ///
+    /// Pairing `finding.site` with `fingerprint.function` mixed two frames.
+    /// For an upstream mutation -- M9's planted branch inside
+    /// `crypto-bigint`'s `carrying_add` -- it printed the adapter's line
+    /// number beside the library's function name: a confident sentence about
+    /// somewhere the leak is not, which is the problem M9 raised.
+    #[test]
+    fn a_leak_site_does_not_mix_two_frames() {
+        use crate::check::{Finding, Fingerprint, Isolation};
+        use crate::memcheck::Classification;
+
+        let upstream = Finding {
+            fingerprint: Fingerprint {
+                classification: Classification::SecretDependentBranch,
+                // The leaking instruction, in the dependency.
+                function: Some("crypto_bigint::uint::add::carrying_add".to_string()),
+                location: Some("src/uint/add.rs:94".to_string()),
+            },
+            classification: Classification::SecretDependentBranch,
+            description: "Secret-dependent branch".to_string(),
+            what: "Conditional jump depends on undefined value".to_string(),
+            origin: "a secret".to_string(),
+            stack: Vec::new(),
+            attributed: true,
+            // The contract's own frame, in the audit adapter.
+            site: Some("src/add.rs:38".to_string()),
+            isolation: Isolation::Single { id: 0 },
+            shrunk: None,
+        };
+        let check = crate::check::ContractCheck {
+            contract: "cbaudit::add::wrapping_add_secret_left".to_string(),
+            function: "wrapping_add_secret_left".to_string(),
+            secret_parameters: vec!["left".to_string()],
+            marked_bytes: 32,
+            outcome: Outcome::LeakDetected,
+            message: "1 finding(s)".to_string(),
+            calibration: crate::check::Control::Confirmed,
+            binding: crate::check::Control::Confirmed,
+            cases_planned: 64,
+            cases_executed: 64,
+            cases_completed: 64,
+            analyzer_runs: 2,
+            findings: vec![upstream],
+            unattributed: Vec::new(),
+            other_diagnostics: Vec::new(),
+        };
+        let evidence = crate::enforcement::AnalysisEvidence::from_generated(
+            Analysis::Generated,
+            Outcome::LeakDetected,
+            crate::evidence::sample_identity("cbaudit::add::wrapping_add_secret_left", "artifact"),
+            "a finding",
+            check,
+            None,
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let sites = leak_sites(&evidence);
+        assert_eq!(sites.len(), 1, "{sites:?}");
+        let site = &sites[0];
+        // The instruction and its function come from one frame.
+        assert!(
+            site.starts_with("src/uint/add.rs:94 in `crypto_bigint::uint::add::carrying_add`"),
+            "the leaking instruction must name its own frame: {site}"
+        );
+        // The adapter's line is labelled as attribution, not as the leak.
+        assert!(
+            site.contains("attributed to src/add.rs:38"),
+            "the contract's frame must be named as attribution: {site}"
+        );
+        // And never as the instruction's location.
+        assert!(
+            !site.starts_with("src/add.rs:38"),
+            "the adapter's line must not be presented as the leaking instruction: {site}"
+        );
     }
 }
