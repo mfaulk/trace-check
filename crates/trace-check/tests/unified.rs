@@ -108,17 +108,18 @@ fn unified_for(config: &VerifyConfig, contract: &str, runtime: Option<&str>) -> 
     let workspace = Workspace::ephemeral().expect("a private workspace");
     let library =
         Library::resolve(&library_dir().join("Cargo.toml"), &[]).expect("the audit library");
-    trace_check::run_contract_coverage(
-        &library,
+    trace_check::run_contract_coverage(trace_check::CoverageRequest {
+        library: &library,
         config,
-        &workspace,
-        &trace_check::CheckOverrides::default(),
-        &Selection::Named(vec![contract.to_string()]),
-        None,
-        "2026-11-04",
+        workspace: &workspace,
+        overrides: &trace_check::CheckOverrides::default(),
+        selection: &Selection::Named(vec![contract.to_string()]),
+        reproducer_dir: None,
+        today: "2026-11-04",
         runtime,
-        None,
-    )
+        dynamic_runs: None,
+        limits: trace_check::schedule::Limits::default(),
+    })
     .expect("the unified run reports rather than failing")
 }
 
@@ -509,17 +510,18 @@ fn the_inverse_disagreement_is_enforced_too() {
         &[],
     )
     .expect("the bundled library");
-    let report = trace_check::run_contract_coverage(
-        &library,
-        &config,
-        &workspace,
-        &trace_check::CheckOverrides::default(),
-        &Selection::Named(vec![INVERTED.to_string()]),
-        None,
-        "2026-11-04",
-        None,
-        None,
-    )
+    let report = trace_check::run_contract_coverage(trace_check::CoverageRequest {
+        library: &library,
+        config: &config,
+        workspace: &workspace,
+        overrides: &trace_check::CheckOverrides::default(),
+        selection: &Selection::Named(vec![INVERTED.to_string()]),
+        reproducer_dir: None,
+        today: "2026-11-04",
+        runtime: None,
+        dynamic_runs: None,
+        limits: trace_check::schedule::Limits::default(),
+    })
     .expect("the unified run reports rather than failing");
     let contract = named(&report, INVERTED);
 
@@ -719,17 +721,18 @@ fn unified_with_dynamic(
     let workspace = Workspace::ephemeral().expect("a private workspace");
     let library =
         Library::resolve(&library_dir().join("Cargo.toml"), &[]).expect("the audit library");
-    trace_check::run_contract_coverage(
-        &library,
+    trace_check::run_contract_coverage(trace_check::CoverageRequest {
+        library: &library,
         config,
-        &workspace,
-        &trace_check::CheckOverrides::default(),
-        &Selection::Named(vec![contract.to_string()]),
-        None,
-        "2026-11-04",
-        None,
-        Some(runs),
-    )
+        workspace: &workspace,
+        overrides: &trace_check::CheckOverrides::default(),
+        selection: &Selection::Named(vec![contract.to_string()]),
+        reproducer_dir: None,
+        today: "2026-11-04",
+        runtime: None,
+        dynamic_runs: Some(runs),
+        limits: trace_check::schedule::Limits::default(),
+    })
     .expect("the unified run reports rather than failing")
 }
 
@@ -790,17 +793,18 @@ fn a_contract_with_no_bound_test_is_not_analyzed() {
     )
     .expect("the bundled library");
     let runs = no_dynamic_runs();
-    let report = trace_check::run_contract_coverage(
-        &library,
-        &config,
-        &workspace,
-        &trace_check::CheckOverrides::default(),
-        &Selection::Named(vec![ADAPTED.to_string()]),
-        None,
-        "2026-11-04",
-        None,
-        Some(&runs),
-    )
+    let report = trace_check::run_contract_coverage(trace_check::CoverageRequest {
+        library: &library,
+        config: &config,
+        workspace: &workspace,
+        overrides: &trace_check::CheckOverrides::default(),
+        selection: &Selection::Named(vec![ADAPTED.to_string()]),
+        reproducer_dir: None,
+        today: "2026-11-04",
+        runtime: None,
+        dynamic_runs: Some(&runs),
+        limits: trace_check::schedule::Limits::default(),
+    })
     .expect("the unified run reports rather than failing");
     let contract = named(&report, ADAPTED);
     let status = contract
@@ -1091,4 +1095,199 @@ fn requiring_only_generated_plans_no_discovery() {
             .is_empty(),
         "a lone requirement shares its execution with nothing"
     );
+}
+
+/// Running two jobs at once produces the same report as running one.
+///
+/// This is what makes `--jobs` safe to offer. Results are folded in plan order
+/// rather than completion order, so scheduling cannot reach the answer: the
+/// statuses, the outcomes and the artifact hashes must all match, and two
+/// backends analyzing one contract concurrently must not collide on a work
+/// directory or a target directory.
+///
+/// Compared field by field rather than as rendered text, because the text
+/// carries paths and timings that legitimately differ between runs.
+#[test]
+fn one_worker_and_two_workers_agree() {
+    if !analyzer_available() {
+        return;
+    }
+    // Three contracts and two backends, so there is genuinely something to
+    // overlap: a symbolic verification can proceed while another contract's
+    // generated harness compiles.
+    let config = config_with_policy(
+        "[policy]\nmode = \"strict\"\ndefault_required = [\"generated\"]\n\n\
+         [policy.contracts.\"cbaudit::monty::mul_both_secret\"]\n\
+         required = [\"generated\", \"symbolic\"]\n\n\
+         [policy.contracts.\"cbaudit::add::wrapping_add_both_secret\"]\n\
+         required = [\"generated\", \"symbolic\"]\n\n\
+         [policy.contracts.\"cbaudit::select::ct_select\"]\nrequired = [\"generated\"]\n",
+    );
+    let selection = [
+        "cbaudit::monty::mul_both_secret",
+        "cbaudit::add::wrapping_add_both_secret",
+        "cbaudit::select::ct_select",
+    ];
+
+    let run = |jobs: usize| {
+        let workspace = Workspace::ephemeral().expect("a private workspace");
+        let library =
+            Library::resolve(&library_dir().join("Cargo.toml"), &[]).expect("the audit library");
+        trace_check::run_contract_coverage(trace_check::CoverageRequest {
+            library: &library,
+            config: &config,
+            workspace: &workspace,
+            overrides: &trace_check::CheckOverrides::default(),
+            selection: &Selection::Named(selection.iter().map(|id| id.to_string()).collect()),
+            reproducer_dir: None,
+            today: "2026-11-04",
+            runtime: None,
+            dynamic_runs: None,
+            limits: trace_check::schedule::Limits::uniform(jobs),
+        })
+        .expect("the unified run reports rather than failing")
+    };
+
+    let sequential = run(1);
+    let concurrent = run(2);
+
+    // The execution plan is a function of the policy, not of the scheduler.
+    let (left, right) = (
+        sequential.execution.as_ref().expect("a plan"),
+        concurrent.execution.as_ref().expect("a plan"),
+    );
+    assert_eq!(left, right, "the plan must not depend on the worker count");
+    assert_eq!(left.memcheck_jobs(), 3);
+    assert_eq!(left.symbolic_jobs(), 2);
+
+    // Contracts in the same order, with the same statuses and the same
+    // evidence about the same executables.
+    assert_eq!(
+        sequential
+            .contracts
+            .iter()
+            .map(|c| &c.id)
+            .collect::<Vec<_>>(),
+        concurrent
+            .contracts
+            .iter()
+            .map(|c| &c.id)
+            .collect::<Vec<_>>(),
+        "report ordering must be deterministic"
+    );
+    for (one, two) in sequential.contracts.iter().zip(&concurrent.contracts) {
+        assert_eq!(one.id, two.id);
+        assert_eq!(
+            one.status
+                .iter()
+                .map(|(a, s)| (*a, s.as_str()))
+                .collect::<Vec<_>>(),
+            two.status
+                .iter()
+                .map(|(a, s)| (*a, s.as_str()))
+                .collect::<Vec<_>>(),
+            "`{}` was judged differently with two workers",
+            one.id
+        );
+        assert_eq!(
+            one.evidence
+                .iter()
+                .map(|e| (e.analysis, e.outcome, e.artifact_sha256.clone()))
+                .collect::<Vec<_>>(),
+            two.evidence
+                .iter()
+                .map(|e| (e.analysis, e.outcome, e.artifact_sha256.clone()))
+                .collect::<Vec<_>>(),
+            "`{}`: concurrent execution changed the evidence or the artifact it \
+             describes",
+            one.id
+        );
+    }
+    assert_eq!(sequential.summary.ok, concurrent.summary.ok);
+    assert_eq!(
+        sequential.summary.blocking_reasons,
+        concurrent.summary.blocking_reasons
+    );
+    assert_eq!(sequential.exit_code(), concurrent.exit_code());
+}
+
+/// A contract the generated backend cannot analyze gets a status, and the
+/// other contracts still produce results — concurrently as well as
+/// sequentially.
+///
+/// `cbaudit::select::ct_select` takes a secret `bool`, which the generated
+/// harness refuses: a one-bit secret is disclosed by any branch on it. That
+/// refusal is settled before anything runs, so the interesting half is that
+/// the two contracts either side of it in the plan are unaffected whatever the
+/// worker count.
+#[test]
+fn one_contract_failing_does_not_stop_the_others() {
+    for jobs in [1, 2] {
+        // Written from scratch: the audit configuration already has a
+        // `[check]` entry for this contract, and a second one would be a
+        // duplicate TOML key.
+        let config = write_config(
+            "schema_version = 1\n\n\
+             [check.\"cbaudit::select::ct_select\"]\ncases = 4\n\n\
+             [policy]\nmode = \"strict\"\ndefault_required = [\"generated\"]\n",
+        );
+        let workspace = Workspace::ephemeral().expect("a private workspace");
+        let library =
+            Library::resolve(&library_dir().join("Cargo.toml"), &[]).expect("the audit library");
+        let report = trace_check::run_contract_coverage(trace_check::CoverageRequest {
+            library: &library,
+            config: &config,
+            workspace: &workspace,
+            overrides: &trace_check::CheckOverrides::default(),
+            selection: &Selection::Named(vec![
+                "cbaudit::add::wrapping_add_both_secret".to_string(),
+                "cbaudit::select::ct_select".to_string(),
+                "cbaudit::monty::mul_both_secret".to_string(),
+            ]),
+            reproducer_dir: None,
+            today: "2026-11-04",
+            runtime: None,
+            dynamic_runs: None,
+            limits: trace_check::schedule::Limits::uniform(jobs),
+        })
+        .expect("a per-contract failure must not abort the run");
+
+        let refused = named(&report, "cbaudit::select::ct_select");
+        let status = refused
+            .status
+            .get(&Analysis::Generated)
+            .expect("a required analysis always has a status");
+        assert_eq!(
+            status.as_str(),
+            "UNSUPPORTED",
+            "with {jobs} worker(s): {:?}",
+            refused.status
+        );
+        assert!(
+            status.describe().contains("boundary values"),
+            "the diagnostic must name the cause: {}",
+            status.describe()
+        );
+        assert!(refused.evidence.is_empty());
+
+        // The others ran and reported, which is the point.
+        for id in [
+            "cbaudit::add::wrapping_add_both_secret",
+            "cbaudit::monty::mul_both_secret",
+        ] {
+            let contract = named(&report, id);
+            assert_eq!(
+                contract
+                    .evidence_for(Analysis::Generated)
+                    .map(|e| e.outcome),
+                Some(Outcome::NoLeakObserved),
+                "with {jobs} worker(s), `{id}` must still produce evidence: {:?}",
+                contract.status
+            );
+        }
+        // And the unsupported one blocks, so the run does not pass on a
+        // requirement nothing answered.
+        assert!(!report.summary.ok);
+        assert_eq!(report.exit_code(), 2);
+    }
 }
