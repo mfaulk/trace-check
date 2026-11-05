@@ -432,7 +432,12 @@ mod tests {
         for (id, analysis, outcome) in evidence {
             coverage.fold(
                 id,
-                AnalysisEvidence::summary(*analysis, *outcome, "artifact0000", "detail"),
+                AnalysisEvidence::summary(
+                    *analysis,
+                    *outcome,
+                    crate::evidence::sample_identity(id, "artifact0000"),
+                    "detail",
+                ),
             );
         }
         build(

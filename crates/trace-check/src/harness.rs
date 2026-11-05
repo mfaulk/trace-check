@@ -279,6 +279,14 @@ pub struct Library {
     pub manifest_path: String,
     /// Cargo features enabled for the verification build.
     pub features: Vec<String>,
+    /// The toolchain every build in this run uses.
+    ///
+    /// Resolved from this library's own directory, because that is the project
+    /// whose `rust-toolchain.toml` is the one that matters, and carried here so
+    /// the generated packages -- which live outside the project and would
+    /// otherwise resolve the machine default -- are built by it. See
+    /// [`crate::toolchain`].
+    pub toolchain: crate::toolchain::Toolchain,
 }
 
 impl Library {
@@ -341,12 +349,14 @@ impl Library {
             // paths spell it.
             .replace('-', "_");
 
+        let directory = manifest_path.parent().unwrap_or(Path::new("."));
         Ok(Library {
             package: package["name"].as_str().unwrap_or_default().to_string(),
             version: package["version"].as_str().unwrap_or_default().to_string(),
             lib_name,
             manifest_path: manifest_path.display().to_string(),
             features: features.to_vec(),
+            toolchain: crate::toolchain::Toolchain::resolve(directory),
         })
     }
 
@@ -479,7 +489,11 @@ pub fn probe_contract(
     // `--manifest-path`, so a generated package's own configuration is only
     // honored when it is also the working directory. The harness build below
     // depends on that; the probe uses it for the same hermeticity.
-    let output = Command::new("cargo")
+    let mut probe = Command::new("cargo");
+    // The library's toolchain, not the one this directory resolves to: the
+    // generated package lives outside the project. See `crate::toolchain`.
+    library.toolchain.apply(&mut probe);
+    let output = probe
         .args(["run", "--quiet"])
         .arg("--target-dir")
         .arg(target_dir)
@@ -951,7 +965,13 @@ pub fn build(
     //
     // `--target` is named explicitly for the other half of the same concern:
     // it keeps those flags off host build scripts and proc-macro crates.
-    let output = Command::new("cargo")
+    let mut build = Command::new("cargo");
+    // The library's toolchain. Without this the analyzed executable is built by
+    // whatever toolchain is default where the harness lives, which is not the
+    // one the developer's project pins -- and the recorded compiler was the
+    // pinned one, so the identity described a build that never happened.
+    library.toolchain.apply(&mut build);
+    let output = build
         .args(["build", "--release", "--target", SUPPORTED_TARGET])
         .arg("--target-dir")
         .arg(target_dir)
@@ -1260,6 +1280,7 @@ mod tests {
             lib_name: "crypto".into(),
             manifest_path: "/w/examples/crypto-library/Cargo.toml".into(),
             features: Vec::new(),
+            toolchain: crate::toolchain::Toolchain::unresolved(),
         }
     }
 

@@ -37,6 +37,7 @@ pub mod coverage;
 pub mod coverage_report;
 pub mod dynamic_harness;
 pub mod enforcement;
+pub mod evidence;
 pub mod experiment;
 pub mod explore;
 pub mod generate;
@@ -55,6 +56,7 @@ pub mod security;
 pub mod symbolic;
 pub mod symbolic_report;
 pub mod taint;
+pub mod toolchain;
 pub mod wasm;
 
 #[cfg(test)]
@@ -581,7 +583,7 @@ pub fn run_generated_checks(
         // stage are the same whether it ran or not.
         let (corpus, discovery) = if settings.explore.enabled {
             if tools.is_none() {
-                tools = Some(coverage::LlvmTools::locate()?);
+                tools = Some(coverage::LlvmTools::locate(Some(&library.toolchain))?);
             }
             let tools = tools.as_ref().expect("located just above");
             let (corpus, evidence) = explore_contract(
@@ -925,7 +927,7 @@ pub fn run_contract_coverage(
         // A hard error, as in `run_generated_checks`: a run asked to explore
         // that cannot explore must fail rather than quietly analyze a
         // different corpus.
-        Some(coverage::LlvmTools::locate()?)
+        Some(coverage::LlvmTools::locate(Some(&library.toolchain))?)
     } else {
         None
     };
@@ -958,7 +960,7 @@ pub fn run_contract_coverage(
         if !wants_generated {
             continue;
         }
-        let Some((valgrind_path, _)) = &valgrind else {
+        let Some((valgrind_path, valgrind_version)) = &valgrind else {
             continue;
         };
         let declaration = found
@@ -993,6 +995,7 @@ pub fn run_contract_coverage(
             declaration,
             &settings,
             valgrind_path,
+            valgrind_version,
             tools.as_ref(),
             reproducer_dir,
         ) {
@@ -1071,19 +1074,20 @@ pub fn run_contract_coverage(
             // Recorded before the analyzer runs. The obligation is about the
             // executable this run built, and the evidence is checked against
             // that rather than against whatever the result claims.
-            let artifact_sha256 = staged.artifact_sha256().to_string();
+            let built = evidence::ArtifactIdentity::symbolic(
+                &entry.id,
+                &staged.contract.descriptor_json,
+                library,
+                &staged.artifact,
+                &staged.harness.source_sha256,
+                &identity,
+            );
             match verify_staged(staged, verifier, library) {
                 Ok(verified) => {
-                    let report =
-                        library_report::contract_report(verified, &identity, workspace.is_kept());
+                    let report = library_report::contract_report(verified, workspace.is_kept());
                     coverage.fold(
                         &entry.id,
-                        AnalysisEvidence::from_symbolic(
-                            &entry.id,
-                            &settings.checks,
-                            &artifact_sha256,
-                            Box::new(report),
-                        ),
+                        AnalysisEvidence::from_symbolic(&settings.checks, built, Box::new(report)),
                     );
                 }
                 Err(error) => coverage.note(
@@ -1155,7 +1159,7 @@ pub fn report_contract_coverage(
     let valgrind = native::prepare_valgrind().is_ok();
     let available = check_capabilities(
         valgrind,
-        coverage::LlvmTools::locate().is_ok(),
+        coverage::LlvmTools::locate(Some(&library.toolchain)).is_ok(),
         needs_symbolic(&found, policy) && prepare_symbolic_backend(runtime).is_ok(),
     );
     let plan = Plan::resolve(&found, config, policy, &selected, &available, today);
@@ -1245,7 +1249,10 @@ fn prepare_symbolic_backend(runtime: Option<&str>) -> Result<symbolic::Verifier,
 struct Analysed {
     outcome: security::Outcome,
     message: String,
-    artifact_sha256: String,
+    /// What decides which executable this result describes, including its
+    /// hash. Nothing carries the hash separately: two fields for one value is
+    /// two chances for them to disagree.
+    artifact: evidence::ArtifactIdentity,
     /// Why requested exploration did not complete, when it did not.
     ///
     /// `Some` downgrades an otherwise-clean outcome for **every** requirement,
@@ -1314,16 +1321,15 @@ fn fold_analysis(analysis: Analysis, analysed: &Analysed) -> AnalysisEvidence {
         ),
         None => (analysed.outcome, analysed.message.clone()),
     };
-    AnalysisEvidence {
+    AnalysisEvidence::from_generated(
         analysis,
         outcome,
-        artifact_sha256: analysed.artifact_sha256.clone(),
-        detail,
-        check: Some(analysed.check.clone()),
-        discovery: analysed.discovery.clone(),
-        symbolic: None,
-        reproducers: analysed.reproducers.clone(),
-    }
+        analysed.artifact.clone(),
+        &detail,
+        analysed.check.clone(),
+        analysed.discovery.clone(),
+        analysed.reproducers.clone(),
+    )
 }
 
 fn apply_overrides(settings: &mut contract::CheckSettings, overrides: &CheckOverrides) {
@@ -1364,6 +1370,9 @@ fn analyse_one(
     declaration: &inventory::ContractDeclaration,
     settings: &contract::CheckSettings,
     valgrind: &Path,
+    // What Valgrind reports about itself, for the artifact identity: the
+    // backend is part of what a result depends on.
+    valgrind_version: &str,
     tools: Option<&coverage::LlvmTools>,
     reproducer_dir: Option<&Path>,
 ) -> Result<Analysed, CheckRunError> {
@@ -1454,7 +1463,14 @@ fn analyse_one(
     Ok(Analysed {
         outcome: outcome.outcome,
         message: outcome.message.clone(),
-        artifact_sha256: artifact.sha256,
+        artifact: evidence::ArtifactIdentity::generated(
+            &declaration.id,
+            &contract.descriptor_json,
+            library,
+            &artifact,
+            &generated.source_sha256,
+            valgrind_version,
+        ),
         explore_incomplete,
         check: outcome,
         discovery,
@@ -1573,7 +1589,7 @@ mod fold_tests {
         Analysed {
             outcome,
             message: "the security analysis said this".to_string(),
-            artifact_sha256: "artifact".to_string(),
+            artifact: evidence::sample_identity("crypto::a::probe", "artifact"),
             explore_incomplete: explore_incomplete.map(str::to_string),
             check: check::ContractCheck {
                 contract: "crypto::a::probe".to_string(),

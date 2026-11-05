@@ -845,6 +845,9 @@ pub fn build(
     // `.cargo/config.toml` relative to the working directory, not to
     // `--manifest-path`, so the remapping above is only honored this way.
     let mut build = Command::new("cargo");
+    // The library's toolchain, not the one this directory resolves to: the
+    // generated package lives outside the project. See `crate::toolchain`.
+    library.toolchain.apply(&mut build);
     build
         .args([
             "build",

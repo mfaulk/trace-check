@@ -119,6 +119,70 @@ def main(argv):
             f"{analysis} requirement (needs {expected})",
         )
 
+    # ---- every result names what it analyzed --------------------------
+    #
+    # A status is only as trustworthy as the identity it rests on. These are
+    # the fields that decide *which* executable a result describes; a result
+    # missing any of them cannot be compared to an obligation or to another
+    # result.
+    REQUIRED_IDENTITY = (
+        "contract",
+        "descriptor_sha256",
+        "library_package",
+        "library_version",
+        "target",
+        "toolchain",
+        "profile",
+        "artifact_sha256",
+        "lockfile_sha256",
+        "harness_sha256",
+        "backend",
+        "backend_version",
+    )
+    for analysis, item in evidence.items():
+        identity = item.get("artifact")
+        if identity is None:
+            problems.append(
+                f"{analysis} evidence carries no artifact identity, so nothing says which "
+                "executable it describes beyond a bare hash"
+            )
+            continue
+        for field in REQUIRED_IDENTITY:
+            require(
+                identity.get(field) not in (None, "", []),
+                f"{analysis} identity is missing {field!r}",
+            )
+        require(
+            identity.get("contract") == contract_id,
+            f"{analysis} identity is about {identity.get('contract')!r}, not {contract_id!r}",
+        )
+        require(
+            identity.get("artifact_sha256") == item.get("artifact_sha256"),
+            f"{analysis} evidence and its identity name different artifacts: "
+            f"{item.get('artifact_sha256')!r} vs {identity.get('artifact_sha256')!r}",
+        )
+        # The compiler must be a measured version, not a placeholder. A
+        # recorded compiler that is not the one that compiled the code makes
+        # the whole identity untrustworthy.
+        rustc = (identity.get("toolchain") or {}).get("rustc_version", "")
+        require(
+            rustc.startswith("rustc ") and "unavailable" not in rustc,
+            f"{analysis} identity records {rustc!r} as its compiler",
+        )
+
+    # Only the symbolic backend depends on a container image, and it must name
+    # it by digest: the image is the analyzer and its bundled solver, so a
+    # result is reproducible only against that exact one.
+    symbolic_image = (evidence["symbolic"].get("artifact") or {}).get("analyzer_image")
+    require(
+        symbolic_image and "@sha256:" in symbolic_image,
+        f"the symbolic identity must pin its analyzer image by digest: {symbolic_image!r}",
+    )
+    require(
+        (evidence["generated"].get("artifact") or {}).get("analyzer_image") is None,
+        "the generated backend uses no analyzer image and must not claim one",
+    )
+
     # ---- two backends, two executables --------------------------------
     generated_artifact = evidence["generated"].get("artifact_sha256", "")
     symbolic_artifact = evidence["symbolic"].get("artifact_sha256", "")

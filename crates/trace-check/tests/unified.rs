@@ -623,3 +623,76 @@ fn contradictory_contract_purposes_are_refused_at_load() {
         trace_check::contract::Expectation::AnalyzerRegression
     );
 }
+
+/// Every result carries the identity of the executable it analyzed, and the two
+/// identities for one contract differ in the inputs that explain why they are
+/// two different executables.
+///
+/// A hash alone says two artifacts are different bytes. A developer looking at
+/// a clean generated result beside a symbolic one needs to know *why* they are
+/// different builds before deciding what either establishes.
+#[test]
+fn each_result_carries_the_identity_of_what_it_analyzed() {
+    if !analyzer_available() {
+        return;
+    }
+    let report = unified(&both_required(), None);
+    let contract = contract_of(&report);
+    let generated = contract
+        .evidence_for(Analysis::Generated)
+        .expect("generated evidence");
+    let symbolic = contract
+        .evidence_for(Analysis::Symbolic)
+        .expect("symbolic evidence");
+
+    // The convenience hash and the identity cannot disagree: both constructors
+    // copy it out of the identity.
+    for evidence in [generated, symbolic] {
+        assert_eq!(evidence.artifact_sha256, evidence.artifact.artifact_sha256);
+        assert_eq!(evidence.artifact.contract, CONTRACT);
+        assert_eq!(evidence.artifact.library_package, "crypto-bigint-audit");
+        assert_eq!(evidence.artifact.target, "x86_64-unknown-linux-gnu");
+        assert_eq!(evidence.artifact.descriptor_sha256.len(), 64);
+        assert_ne!(evidence.artifact.lockfile_sha256, "unavailable");
+        assert!(!evidence.artifact.harness_sha256.is_empty());
+        assert!(!evidence.artifact.backend_version.is_empty());
+        // The compiler that actually built it, measured through the toolchain
+        // the library's project pins.
+        assert!(
+            evidence
+                .artifact
+                .toolchain
+                .rustc_version
+                .starts_with("rustc "),
+            "{:?}",
+            evidence.artifact.toolchain
+        );
+    }
+
+    // Only the symbolic result depends on an analyzer image, and it names it by
+    // digest: the image is the analyzer and its solver.
+    assert!(generated.artifact.analyzer_image.is_none());
+    let image = symbolic
+        .artifact
+        .analyzer_image
+        .as_deref()
+        .expect("a symbolic result names its analyzer image");
+    assert!(image.contains("@sha256:"), "{image}");
+
+    // The two differ in named inputs, not only in the hash.
+    let differences = generated.artifact.differences(&symbolic.artifact);
+    let joined = differences.join("; ");
+    for named in ["profile", "harness", "backend", "artifact"] {
+        assert!(
+            differences.iter().any(|line| line.starts_with(named)),
+            "{named} must be named among the differences: {joined}"
+        );
+    }
+    // And agree on everything that makes them comparable at all.
+    for same in ["contract", "descriptor", "library", "compiler", "target"] {
+        assert!(
+            !differences.iter().any(|line| line.starts_with(same)),
+            "{same} must not differ between two backends of one contract: {joined}"
+        );
+    }
+}

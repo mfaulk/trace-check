@@ -263,6 +263,12 @@ about.
 
 ## One open question, not a finding
 
+> **Resolved in M10.2.** The risk below was reproduced and fixed: a library
+> pinning 1.88.0 reported `rustc 1.88.0` while its artifact was byte-identical
+> to the 1.97.0 build. Generated builds are now pinned to the library's
+> toolchain. This section records what the gate suspected, and is left as
+> written.
+
 The generated harness packages are built in the run's work directory, which for
 an ephemeral workspace is under `/tmp` — outside the repository. `rustup`
 resolves a toolchain by walking up from the working directory, so those builds
