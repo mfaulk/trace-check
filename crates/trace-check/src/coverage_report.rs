@@ -19,10 +19,31 @@ use crate::inventory::ContractInventory;
 
 /// Report schema this build emits.
 ///
-/// Two, not one: M6's generated-check report is schema 1, and this is a
+/// Three, not one: M6's generated-check report is schema 1, and this is a
 /// different document with a different shape. A consumer that keyed on
 /// `schema_version` keeps working.
-pub const SCHEMA_VERSION: u32 = 2;
+///
+/// # Why 2 became 3
+///
+/// M10 changed what a field *means*, which an added field would not have. The
+/// bump is deliberate so a consumer written against schema 2 fails loudly
+/// rather than misreading:
+///
+/// * `regression_expectation` (a string, one declared outcome per contract)
+///   became `regression_expectations` (an analysis-to-outcome object). A reader
+///   looking for the old key now finds nothing where before it found the
+///   generated backend's expectation — and the whole point of the change is
+///   that one value could not describe a fixture whose backends disagree.
+/// * each evidence record gained `artifact`, the full identity of the
+///   executable analyzed, alongside the `artifact_sha256` that keyed it.
+/// * `shared_with` says which other requirements one execution discharged, so
+///   two records are no longer countable as two observations.
+/// * `execution` reports the jobs the run committed to before building.
+/// * evidence gained `dynamic` and `symbolic` payloads next to `check`.
+///
+/// The standalone M3, M5 and M6 report schemas are untouched. Only this
+/// document changed, and only `--all-contracts` emits it.
+pub const SCHEMA_VERSION: u32 = 3;
 
 pub const EXIT_OK: u8 = 0;
 pub const EXIT_LEAK: u8 = 1;
@@ -641,7 +662,7 @@ mod tests {
         );
         let value: serde_json::Value =
             serde_json::from_str(&report.to_json()).expect("the report is JSON");
-        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["schema_version"], 3);
         // Inventory completeness is its own object.
         assert_eq!(value["inventory"]["complete"], true);
         assert_eq!(value["inventory"]["contracts_declared"], 1);

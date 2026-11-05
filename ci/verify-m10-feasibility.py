@@ -53,7 +53,18 @@ def main(argv):
     report = json.loads(pathlib.Path(argv[1]).read_text())
     contract_id = argv[2] if len(argv) == 3 else SPIKE_CONTRACT
 
+    # The unified report's own schema. Bumped by M10 because a field changed
+    # meaning rather than merely appearing, so a validator written against the
+    # old shape must fail loudly rather than quietly read a missing key.
+    EXPECTED_SCHEMA = 3
     problems = []
+    if report.get("schema_version") != EXPECTED_SCHEMA:
+        print(
+            f"unexpected schema_version {report.get('schema_version')!r}; this validator "
+            f"reads {EXPECTED_SCHEMA}",
+            file=sys.stderr,
+        )
+        return 1
 
     def require(condition, message):
         if not condition:
