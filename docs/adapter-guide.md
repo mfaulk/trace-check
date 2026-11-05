@@ -132,14 +132,22 @@ everything and made the whole audit read clean. And the *same* planted leak on
 a public component under both classifications, which must differ between them —
 that is what shows the line moved where it claims to and no further.
 
-**Add a sensitivity control on the operation's output.** A branch on a byte of
-the final result — derived through every hash, reduction and selection the
-operation performs — bounds what a clean result is worth. If it is detected, a
-leak late in the operation would be attributed. If it is not, the clean results
-are compatible with the analysis having gone blind halfway through, and M11
-found a real library where exactly that happens: provenance does not survive
-every hash implementation, so this control is the difference between an audit
-and an assumption.
+**Add a sensitivity control on the operation's output — one per data path.** A
+branch on a byte of the final result, derived through every hash, reduction and
+selection the operation performs, bounds what a clean result is worth. If it is
+detected, a leak late in the operation would be attributed; if not, the clean
+results are compatible with the analysis having gone blind halfway through, and
+M11 found a real library where exactly that happens.
+
+**One such control per path, because paths can carry different secrets.** ML-KEM
+decapsulation is the general case: a valid ciphertext's shared key depends on
+the decryption key and not on the implicit-rejection seed, and a rejected one on
+the seed and not on the decryption. A control on the first says nothing about
+the second, and the rejection path is the one an oracle attacks. Enumerate the
+operation's outcomes, put a control on each, and prove separately that each
+output really depends on the secret you think it does — M11's
+`the_rejected_key_depends_on_z` varies `z` alone and checks that one output
+moves and the other does not.
 
 ## Validating an adapter
 

@@ -1,7 +1,14 @@
 //! Controls, mirroring the `ml-kem` audit's so the two targets' results are
 //! comparable: one that shows the harness marked the seed, one that catches
-//! over-declassification, one on a public component that must stay clean, one
-//! sensitivity control on the shared secret, and a negative control.
+//! over-declassification, one on a public component that must stay clean, **two**
+//! sensitivity controls -- one per data path through the Fujisaki-Okamoto
+//! transform -- and a negative control.
+//!
+//! The two sensitivity controls are not interchangeable. A valid ciphertext's
+//! shared secret depends on `sk_pke` through decryption and re-encryption; a
+//! rejected one is derived from the implicit-rejection seed `z` and the
+//! ciphertext, and from nothing the decryption produced. The rejected path is
+//! the one a decapsulation oracle attacks.
 
 use crate::fixture::{self, PK_OFFSET};
 use crate::sink::consume_all_bytes;
@@ -93,9 +100,12 @@ pub fn public_component_branch(seed: &[u8; 64], m: &[u8; 32]) -> u8 {
     shared ^ 0x04
 }
 
-/// Control 5 — the sensitivity control: a branch on a byte of the shared
-/// secret, derived through the whole FO transform. What this produces bounds
-/// what a clean result on the three real contracts is worth.
+/// Control 5 — the sensitivity control for the **valid** path: a branch on a
+/// byte of the shared secret a genuine ciphertext produces.
+///
+/// That value depends on `sk_pke` through decryption and re-encryption, and
+/// **not** on `z`. [`rejected_shared_secret_branch`] covers the other path, and
+/// neither stands in for the other.
 #[constant_time(secret = "seed", dynamic = false)]
 pub fn shared_secret_branch(seed: &[u8; 64], m: &[u8; 32]) -> u8 {
     let (decap, encap) = fixture::public_keygen(seed);
@@ -108,6 +118,35 @@ pub fn shared_secret_branch(seed: &[u8; 64], m: &[u8; 32]) -> u8 {
         consume_all_bytes(shared.as_bytes())
     });
     shared ^ 0x05
+}
+
+/// Control 7 — the sensitivity control for the **implicit-rejection** secret: a
+/// branch on the shared secret an *invalid* ciphertext produces.
+///
+/// For a corrupted ciphertext the re-encryption check fails and the selection
+/// returns a value derived from `z` and the ciphertext. That is the data a
+/// decapsulation oracle attacks, and it reaches the branch through a hash, so
+/// it needs its own control rather than an argument from control 5.
+///
+/// `the_rejected_secret_depends_on_z` is the independent evidence that the
+/// value branched on here really is `z`-derived.
+#[constant_time(secret = "seed", dynamic = false)]
+pub fn rejected_shared_secret_branch(
+    seed: &[u8; 64],
+    m: &[u8; 32],
+    position: u16,
+    delta: u8,
+) -> u8 {
+    let (decap, encap) = fixture::public_keygen(seed);
+    let ciphertext = fixture::corrupted_ciphertext(&encap, m, position, delta);
+    let shared = fixture::with_key_level_secret(&decap, |key, _| {
+        let shared = key.decapsulate(&fixture::ciphertext(&ciphertext));
+        if shared.as_bytes()[0] & 1 == 1 {
+            record(7);
+        }
+        consume_all_bytes(shared.as_bytes())
+    });
+    shared ^ 0x07
 }
 
 /// Control 6 — the negative control: the boundary with nothing planted.
@@ -128,6 +167,43 @@ pub fn no_planted_leak(seed: &[u8; 64], m: &[u8; 32]) -> u8 {
 mod tests {
     use super::*;
     use crate::fixture::SEED_LEN;
+
+    /// The value [`rejected_shared_secret_branch`] branches on really is
+    /// derived from `z`: changing `z` alone, with everything else and the
+    /// ciphertext fixed, changes it -- and leaves the valid-ciphertext result
+    /// untouched.
+    ///
+    /// Goes through the byte-oriented API because `MlKem768DecapKey` has no byte
+    /// constructor, so a modified `z` cannot be handed to the typed one.
+    /// `the_blob_and_typed_paths_agree` in `tests/functional.rs` is what ties
+    /// the two together, on both ciphertext paths.
+    #[test]
+    #[allow(deprecated)]
+    fn the_rejected_secret_depends_on_z() {
+        use crate::fixture::{SECRET_KEY_LEN, Z_OFFSET};
+
+        let seed = [23u8; SEED_LEN];
+        let m = [7u8; 32];
+        let (decap, encap) = fixture::public_keygen(&seed);
+        let rejecting = fixture::corrupted_ciphertext(&encap, &m, 5, 0x20);
+        let (valid, encapsulated) = fixture::valid_ciphertext(&encap, &m);
+
+        let mut secret: [u8; SECRET_KEY_LEN] = *decap.as_bytes();
+        let before = kyberlib::decapsulate(&rejecting, &secret).expect("lengths are constants");
+
+        secret[Z_OFFSET] ^= 1;
+        let after = kyberlib::decapsulate(&rejecting, &secret).expect("lengths are constants");
+
+        assert_ne!(
+            before, after,
+            "the rejected shared secret must depend on z, or control 7 is not about z"
+        );
+        assert_eq!(
+            kyberlib::decapsulate(&valid, &secret).expect("lengths are constants"),
+            encapsulated,
+            "the valid path must not depend on z"
+        );
+    }
 
     /// Every control still decapsulates correctly, so a detected control is
     /// evidence about observation rather than about a broken fixture.

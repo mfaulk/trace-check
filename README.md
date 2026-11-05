@@ -898,9 +898,9 @@ however, was planted here. M11 points the tool at two independently maintained
 FIPS 203 implementations with nothing planted in the libraries at all:
 
 ```sh
-cargo trace-check check --all-configured --ci --jobs 12 \
+cargo trace-check check --all-contracts --ci --jobs 12 \
   --manifest-path examples/ml-kem-audit/Cargo.toml       # ml-kem 0.3.4
-cargo trace-check check --all-configured --ci --jobs 12 \
+cargo trace-check check --all-contracts --ci --jobs 12 \
   --manifest-path examples/kyberlib-audit/Cargo.toml     # kyberlib 0.0.11
 ```
 
@@ -921,11 +921,15 @@ the line moved where it claims to and no further.
 reasoning; the secret is a 64-byte seed rather than a 2400-byte key because
 being a key includes `H(ek)` matching `ek`, which no input constraint expresses.
 
-A clean result is worth reading only because of the controls, and the one that
-matters most is a planted branch on a byte of the **shared secret** — derived
-through K-PKE decryption, two hashes, a full re-encryption and a constant-time
-selection. It is detected, so a leak late in the transform would be attributed
-rather than silently missed.
+A clean result is worth reading only because of the controls, and the ones that
+matter most are the two **sensitivity** controls — one per data path through the
+FO transform, because the two paths carry different secrets. A valid
+ciphertext's shared key comes from the decryption key through `G` and the
+re-encryption; a rejected one is `J(z ‖ c)` and comes from the
+implicit-rejection seed instead. Both planted branches are detected, so a leak
+late in the transform would be *attributed* on either path rather than silently
+missed — and one of them alone would have left the other path's secret
+untested.
 
 Two things M11 turned up that neither audit alone could have:
 

@@ -253,9 +253,11 @@ because it needs a cryptographic library's own hash stack to appear.
 The dynamic backend calls something a secret dependency only when Memcheck
 traces the undefined value driving a branch or an address back to the client
 request that marked it. Through ordinary arithmetic that works, and it works
-through a whole ML-KEM decapsulation: a branch on a byte of the shared key --
-derived from marked key material through K-PKE decryption, two hashes, a full
-re-encryption and a constant-time selection -- is reported and attributed.
+through both of an ML-KEM decapsulation's data paths: a branch on the shared key
+a valid ciphertext yields -- derived from marked key material through K-PKE
+decryption, `G`, a re-encryption and a constant-time selection -- is reported
+and attributed, and so is a branch on the one a rejected ciphertext yields,
+which comes from the marked implicit-rejection seed through `J`.
 
 Through `shake`'s `ShakeReader` it does not. Marking an ML-KEM key-generation
 seed and letting the library sample its matrix produces

@@ -12,7 +12,7 @@ way it was not for 256-bit arithmetic.
 Reproduce everything below with:
 
 ```sh
-cargo trace-check check --all-configured --ci --jobs 12 \
+cargo trace-check check --all-contracts --ci --jobs 12 \
   --manifest-path examples/ml-kem-audit/Cargo.toml
 ```
 
@@ -22,9 +22,9 @@ cargo trace-check check --all-configured --ci --jobs 12 \
 
 | | |
 | --- | --- |
-| Contracts declared and checked | **12** |
-| Wall clock, all twelve, `--jobs 12` | **114.3 s** |
-| Peak RSS | **156.5 MB** |
+| Contracts declared and checked | **13** |
+| Wall clock, all thirteen, `--jobs 12` | **90.4 s** |
+| Peak RSS | **156.9 MB** |
 | One contract alone, 25 cases | 11.3 s, 154.2 MB |
 | Upstream source changes | **0** |
 | Adapter code, outside tests and controls | 61 lines across `fixture.rs` and `decaps.rs` |
@@ -33,8 +33,14 @@ cargo trace-check check --all-configured --ci --jobs 12 \
 
 The cost risk did not materialize. A single case runs key generation (SHAKE,
 rejection sampling, two NTTs), a deterministic encapsulation, and a
-decapsulation with its re-encryption — and twelve contracts of those fit in two
-minutes. The abort criterion for wall-clock cost was never approached.
+decapsulation with its re-encryption — and thirteen contracts of those fit in a
+minute and a half. The abort criterion for wall-clock cost was never approached.
+
+`--all-contracts` is deliberate and not interchangeable with
+`--all-configured`: it enforces every declaration the *compiled library*
+carries rather than every one the configuration names, and it is the only path
+`--jobs` affects. The same thirteen contracts take 114 s when run
+sequentially.
 
 ---
 
@@ -46,7 +52,8 @@ minutes. The abort criterion for wall-clock cost was never approached.
 | 2 `secret_component_branch` | a byte of `dk_pke`, after re-marking | `LEAK_DETECTED` | branch |
 | 3 `secret_component_address` | `SBOX[dk_pke[7] & 0x1f]` | `LEAK_DETECTED` | **address** |
 | 7 `derived_arithmetic_branch` | the sum of eight `dk_pke` bytes | `LEAK_DETECTED` | branch |
-| 8 `shared_key_branch` | a byte of the **shared key** | `LEAK_DETECTED` | branch |
+| 8 `shared_key_branch` | a byte of the shared key a **valid** ciphertext yields | `LEAK_DETECTED` | branch |
+| 9 `rejected_shared_key_branch` | a byte of the shared key a **rejected** ciphertext yields | `LEAK_DETECTED` | branch |
 | 4 `public_component_branch` | a byte of `ek`, key-level boundary | `NO_LEAK_OBSERVED` | — |
 | 5 `public_component_branch_seed_level` | the same byte of `ek`, seed-level | `INCONCLUSIVE` | §4 |
 | 6 `no_planted_leak` | nothing planted | `NO_LEAK_OBSERVED` | — |
@@ -56,18 +63,30 @@ first so nothing cites it as propagation evidence. Controls 2, 3 and 7 are the
 ones that matter for the boundary, and control 8 is the one that matters for the
 audit.
 
-### Control 8 is the result that makes the clean findings worth reading
+### Controls 8 and 9 are what make the clean findings worth reading
 
-`shared_key_branch` branches on a byte of the shared key — a value derived from
-the marked `dk_pke` through K-PKE decryption, `G`, a full re-encryption, `J`,
-and a constant-time selection. It is `LEAK_DETECTED`.
+These are the audit's **sensitivity** controls, and there are two of them
+because the Fujisaki–Okamoto transform has two secrets and two data paths.
 
-That is the audit's **sensitivity** control. A genuine leak late in
-decapsulation would be driven by exactly that kind of deeply derived value, so
-without this control a clean result on the real contracts would be compatible
-with the analysis having gone blind somewhere in the middle of the FO transform.
-It did not: provenance survives the whole decapsulation path, and a late leak
-would be attributed rather than merely failing closed.
+`shared_key_branch` uses a genuine ciphertext, so `cp.ct_eq(c)` holds and the
+selection returns `Kp = G(mp, H(ek))`: a value derived from the marked `dk_pke`
+through K-PKE decryption, `G`, and a full re-encryption, then through the
+constant-time selection. `J(z ‖ c)` is computed as well, but its result is the
+branch the selection does *not* take, so this control says nothing about `z`.
+
+`rejected_shared_key_branch` corrupts one public byte, so the check fails and
+the selection returns `K̄ = J(z ‖ c)` instead — derived from the
+implicit-rejection seed through SHAKE256, and from nothing the decryption
+produced. That is the value a decapsulation oracle attacks, and it travels a
+hash this project has already caught losing provenance elsewhere, so an argument
+by analogy from control 8 would not do.
+
+Both are `LEAK_DETECTED`. Together they say a late leak would be *attributed*
+on either path rather than merely failing closed; separately, neither would.
+`the_rejected_key_depends_on_z` is the independent evidence that control 9's
+value really is `z`-derived: changing `z` alone, with `dk_pke`, `ek`, `H(ek)`
+and the ciphertext fixed, changes it, and leaves the valid-path result
+untouched.
 
 ### Controls 2 and 7, read together
 

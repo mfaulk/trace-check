@@ -290,7 +290,7 @@ unchanged.
 | PR | Package | State |
 | --- | --- | --- |
 | M11.0 | Target reconnaissance | **done** — four candidates resolved, `crypto-pq-ml-kem` found not to exist, `kyberlib` selected |
-| M11.1 | **Feasibility gate** | **done — passed.** 12 contracts, 114 s, 157 MB; boundary controls intact; `decapsulate` confirmed in the artifact |
+| M11.1 | **Feasibility gate** | **done — passed.** 13 contracts, 90 s, 157 MB; boundary controls intact; `decapsulate` confirmed in the artifact |
 | M11.2 | Audit integration | **done** — 60 NIST ACVP vectors, both FO paths, hermetic fixture |
 | M11.3 | Systematic analysis | **done** — dynamic for both targets; symbolic reaches the target and settles nothing |
 | M11.4 | Candidate triage | **done** — every finding classified; none reaches stage 2 |
@@ -440,8 +440,11 @@ properly.
 - [x] Functional oracles independent of the adapter, at full output width — 60
       ACVP vectors, passing for both targets.
 - [x] Planted controls detected, each with an optimization barrier, covering a
-      branch and an address, including one on data derived through the whole FO
-      transform.
+      branch and an address, including **one per data path** through the FO
+      transform: a branch on the valid path's `Kp`, which depends on `dk_pke`,
+      and one on the rejected path's `K̄ = J(z ‖ c)`, which depends on `z`. One
+      of them alone would have left the other path's secret untested, which is
+      review finding four.
 - [x] A negative control reports no finding — `no_planted_leak`, both targets.
 - [x] Every analysis finding classified; none left unclassified.
 - [x] `rsa` RUSTSEC-2023-0071 detected on current unpatched source, in
@@ -462,7 +465,10 @@ properly.
 - [x] The audit report documents coverage and limits without claiming either
       library is secure.
 - [x] CI validates both audits' own claims, the positive control, and the
-      negative control's premise.
+      negative control's premise — over `check --all-contracts`, so the
+      inventory is the compiled library's and not the configuration's, with
+      `--self-test` requiring the validator to reject reports whose
+      load-bearing evidence has been deleted.
 - [x] M1–M10 tests remain green, including every symbolic expectation after the
       `memcpy` harness fix: crypto-library 6/4, external-library 2/1,
       crypto-bigint-audit 7/11, zero `INCONCLUSIVE`.
@@ -511,3 +517,23 @@ and three things that outlast it:
 * a demonstration that a *negative* control can fail on its premise, and that
   the discipline of checking the premise first is what stops an audit from
   claiming a demonstration it does not have.
+
+### What review changed
+
+Seven findings, all addressed, and two were load-bearing. The boundary pair's
+seed-level half could have passed on the library's unrelated sampling
+diagnostics even if its own planted branch had vanished — the validator now
+requires that branch by frame, and `--self-test` deletes it to prove the
+requirement bites. And the sensitivity control covered only the valid
+ciphertext's `Kp`: the rejected path's `z`-derived `K̄` had no control at all,
+and a doc sentence claimed a dependency through `J` that the valid path does not
+have. Both audits gained a rejection-path control and a test that varies `z`
+alone.
+
+The rest tightened how the audit validates itself rather than what it found:
+`--all-contracts` instead of `--all-configured`, so the inventory comes from the
+compiled library; case budgets, completion counts, calibration and binding
+asserted; a hermetic digest check on the committed ACVP fixture; the negative
+control's premise read from the analyzed executable with every division in the
+library's code accounted for; and the `--jobs 12` timings re-measured, because
+that flag only affects the selection the audits were not using.

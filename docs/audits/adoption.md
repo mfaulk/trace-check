@@ -10,18 +10,25 @@ which tool changes does the friction justify.
 
 | | `ml-kem` | `kyberlib` |
 | --- | --- | --- |
-| Contracts | 12 | 10 |
+| Contracts | 13 | 11 |
 | Adapter code outside tests and controls | 61 lines | 74 lines |
 | Control code | 182 lines | 118 lines |
 | Committed vector fixture | 372 kB, shared | reuses the same file |
 | Upstream source changes | 0 | 0 |
 | `assume` constraints | 0 | 0 |
-| `check --all-configured --ci --jobs 12` | 114 s | 137 s |
+| `check --all-contracts --ci --jobs 12` | 90 s | 93 s |
 | Peak RSS | 157 MB | 158 MB |
 
 Plus the controls: `rsa` 116 s for two contracts, and the two `ml-dsa` halves
-26–28 s each. The symbolic attempt on a whole ML-KEM-768 decapsulation is 8 s
-and 173 MB, and settles nothing.
+26–28 s each, all three sequential. The symbolic attempt on a whole ML-KEM-768
+decapsulation is 8 s and 173 MB, and settles nothing.
+
+`--all-contracts` is what the audits run, for two reasons that are easy to get
+wrong: it enforces every declaration the *compiled library* carries rather than
+the ones `trace-check.toml` happens to name, and it is the only selection
+`--jobs` affects. The same thirteen `ml-kem` contracts take 114 s sequentially,
+so the parallel figure above is a measurement of the command line printed with
+it.
 
 So **the whole milestone's analysis is about seven minutes of compute.** The
 cost that mattered was not machine time. It was three things, in descending
@@ -47,11 +54,12 @@ observation classes, with the public and secret components of the key
 distinguished. Both reproduce NIST's ACVP vectors on both paths through the FO
 transform, so both compute ML-KEM-768 and both halves of it ran.
 
-**The clean results are load-bearing only because the controls are.** Five
-planted controls per target are detected, including a branch on a byte of the
-shared secret — derived through K-PKE decryption, two hashes, a full
-re-encryption and a constant-time selection. Without that one, a clean result
-would be compatible with the analysis having gone blind mid-transform.
+**The clean results are load-bearing only because the controls are.** Six
+planted controls per target are detected, including **two** sensitivity
+controls — one per data path through the FO transform, because a valid
+ciphertext's shared key depends on the decryption key and a rejected one on the
+implicit-rejection seed. Without both, a clean result would be compatible with
+the analysis having gone blind on one of the two paths mid-transform.
 
 **`decapsulate`'s constant-time shape survives `opt-level = 3`:** 743
 instructions, 12 conditional jumps over public bounds, seven `cmov` where

@@ -28,6 +28,7 @@ and does not mean.
 | `controls::secret_component_address` | key-level | `LEAK_DETECTED`, value | 32 |
 | `controls::derived_arithmetic_branch` | key-level | `LEAK_DETECTED`, branch | 32 |
 | `controls::shared_key_branch` | key-level | `LEAK_DETECTED`, branch | 32 |
+| `controls::rejected_shared_key_branch` | key-level | `LEAK_DETECTED`, branch | 96 |
 | `controls::public_component_branch_seed_level` | seed-level | `INCONCLUSIVE` | 32 |
 | `seedlevel::keygen_and_decaps` | seed-level | `INCONCLUSIVE` | 32 |
 | `mlkemsym::keygen_and_decaps` (symbolic) | seed-level | `INCONCLUSIVE` | — |
@@ -88,11 +89,13 @@ Bounded by three measurements:
 | --- | --- | --- |
 | 2 `secret_component_branch` | marked bytes, read directly | yes |
 | 7 `derived_arithmetic_branch` | sum of eight marked bytes | yes |
-| 8 `shared_key_branch` | marked `dk_pke` through K-PKE decrypt, `G`, re-encryption, `J`, `ct_select` | **yes** |
+| 8 `shared_key_branch` | marked `dk_pke` through K-PKE decrypt, `G`, re-encryption, `ct_select` | **yes** |
+| 9 `rejected_shared_key_branch` | marked `z` through `J` (SHAKE256) and `ct_select` | **yes** |
 | A (this finding) | marked seed through SHAKE128 into `sample_ntt` | no |
 
-Provenance survives ordinary arithmetic and survives the entire decapsulation
-path including two Keccak-based hashes. Only the key-generation XOF loses it.
+Provenance survives ordinary arithmetic and survives both of the
+decapsulation's data paths, including `G` and `J`. Only the key-generation XOF
+loses it.
 
 **Open question, deliberately not resolved here.** Whether the loss is Memcheck's
 origin tag being approximate through that particular mixing, or an over-read of a
@@ -163,8 +166,11 @@ cases. That is worth reading **only** because of the controls, and specifically:
   boundary did not declassify key material. The second is reported as a
   secret-dependent *value* use, which is how Memcheck sees a load whose address
   came from marked bytes;
-* `shared_key_branch` is detected, so a leak late in the FO transform would be
-  attributed rather than silently missed;
+* `shared_key_branch` **and** `rejected_shared_key_branch` are detected, so a
+  leak late in the FO transform would be attributed on either of its two paths —
+  the valid path's `Kp`, which depends on `dk_pke`, and the rejected path's
+  `K̄ = J(z ‖ c)`, which depends on `z`. One of them alone would leave the other
+  path's secret untested;
 * `public_component_branch` is clean with zero diagnostics while the same branch
   seed-level is not, so the boundary moved the classification line where it
   claims to;

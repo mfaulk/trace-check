@@ -8,16 +8,16 @@ and nothing else. This file records what differs: the integration, the results,
 and the one cross-target conclusion that neither audit could reach alone.
 
 ```sh
-cargo trace-check check --all-configured --ci --jobs 12 \
+cargo trace-check check --all-contracts --ci --jobs 12 \
   --manifest-path examples/kyberlib-audit/Cargo.toml
 ```
 
 | | |
 | --- | --- |
 | Target | `kyberlib` 0.0.11, pinned `=0.0.11`, features `kyber768` + `std`, `avx2` off |
-| Contracts | 10 |
-| Wall clock, `--jobs 12` | 136.7 s |
-| Peak RSS | 158.3 MB |
+| Contracts | 11 |
+| Wall clock, `--jobs 12` | 93.5 s |
+| Peak RSS | 158.9 MB |
 | Upstream source changes | 0 |
 | `assume` constraints | 0 |
 | CI decision | PASS, every declared expectation reproduced |
@@ -37,11 +37,16 @@ cargo trace-check check --all-configured --ci --jobs 12 \
 | `controls::secret_component_branch` | key-level | `LEAK_DETECTED`, branch |
 | `controls::secret_component_address` | key-level | `LEAK_DETECTED`, value |
 | `controls::shared_secret_branch` | key-level | `LEAK_DETECTED`, branch |
+| `controls::rejected_shared_secret_branch` | key-level | `LEAK_DETECTED`, branch |
 | `seedlevel::keygen_and_decaps` | seed-level | `LEAK_DETECTED`, 2 branches |
 
-Every control behaves as it does for `ml-kem`, including the sensitivity
-control: a branch on a byte of the shared secret is detected, so a leak late in
-the FO transform would be attributed here too.
+Every control behaves as it does for `ml-kem`, including **both** sensitivity
+controls — one per data path through the FO transform. A branch on the shared
+secret a valid ciphertext yields is detected, and so is a branch on the one a
+rejected ciphertext yields, which depends on the implicit-rejection seed
+instead. So a late leak would be attributed here too, on either path.
+`the_rejected_secret_depends_on_z` is the independent evidence that the second
+control's value really is `z`-derived.
 
 The library makes an explicit claim at the site, which is what
 `decaps_corrupted_ciphertext` tests: `MlKem768DecapKey::decapsulate`'s
@@ -136,7 +141,10 @@ directory rather than duplicated:
   inside the secret key;
 * **decapsulation** — 10 vectors: the shared secret matches on all of them, five
   unmodified and five modified, so both FO paths compute what the standard says;
-* **cross-path** — the typed and blob APIs agree.
+* **cross-path** — the typed API the contracts analyze and the blob API the
+  vectors go through agree on **both** ciphertext paths, compared at full
+  32-byte width. Valid-path agreement alone would have left the rejection path
+  resting on source inspection.
 
 That is worth stating plainly because the crate's own `derive` documentation
 cites *draft-schwabe-cfrg-kyber* rather than FIPS 203, and the crate carries a
@@ -152,8 +160,8 @@ here.
 a taint-model artifact, classified as such, reproduced independently in the other
 target, and explained by the standard's own algorithm.
 
-Bounded the same way as the `ml-kem` audit: two observation classes, 352
-generated cases across ten contracts, one parameter set, one portable
+Bounded the same way as the `ml-kem` audit: two observation classes, 512
+generated cases across eleven contracts, one parameter set, one portable
 implementation path with `avx2` off, one compiled build. No `VERIFIED_BOUNDED`
 anywhere — `kyberlib` was not put to the symbolic backend, because
 [`../ml-kem/symbolic-feasibility.md`](../ml-kem/symbolic-feasibility.md) already

@@ -155,6 +155,15 @@ jobs:
       # either library under audit. The decapsulation group carries five
       # unmodified and five modified ciphertexts, so this is also the evidence
       # that both paths through the FO transform are exercised.
+      # The committed vectors must be the ones that were extracted from NIST's
+      # files and reviewed. A fixture edited by hand would be an oracle that
+      # agrees with the adapter by construction, which is the one thing an
+      # independent oracle must never be. `--check-digest` needs nothing but
+      # the repository; `--check` re-derives from the pinned sources and is run
+      # when they are available locally.
+      - name: The M11 vector fixture is the reviewed extraction
+        run: python3 ci/gen-m11-vectors.py --check-digest
+
       - name: The M11 adapters compute ML-KEM-768
         run: |
           set -euo pipefail
@@ -547,23 +556,36 @@ jobs:
       # seed-level contracts are INCONCLUSIVE and kyberlib's is LEAK_DETECTED,
       # which is what localizes the provenance loss. A change that made them
       # agree would be a change in what the audit established.
+      # `--all-contracts`, not `--all-configured`: the claim is about every
+      # `#[constant_time]` declaration in the compiled library, so a declaration
+      # nobody wrote a `[check]` entry for must not be able to hide from the
+      # report *or* from the validator's expectations. It is also the only path
+      # `--jobs` affects, so the timings the audit publishes are measurements of
+      # the command line it prints.
+      #
+      # `--self-test` then mutates the report and requires each mutation to be
+      # caught. A validator that passes on a report with its load-bearing
+      # evidence deleted is not validating anything, and deleting it is the only
+      # way to know.
       - name: The ml-kem audit establishes what it claims
         run: |
           set -euo pipefail
           cargo run --locked --release -p cargo-trace-check -- check \
-            --all-configured --ci --format json \
+            --all-contracts --ci --jobs 4 --format json \
             --manifest-path examples/ml-kem-audit/Cargo.toml \
             > m11-ml-kem.json
           python3 ci/verify-m11-audit.py m11-ml-kem.json
+          python3 ci/verify-m11-audit.py --self-test m11-ml-kem.json
 
       - name: The kyberlib audit establishes what it claims
         run: |
           set -euo pipefail
           cargo run --locked --release -p cargo-trace-check -- check \
-            --all-configured --ci --format json \
+            --all-contracts --ci --jobs 4 --format json \
             --manifest-path examples/kyberlib-audit/Cargo.toml \
             > m11-kyberlib.json
           python3 ci/verify-m11-audit.py m11-kyberlib.json
+          python3 ci/verify-m11-audit.py --self-test m11-kyberlib.json
 
       # The positive control is the one that matters most here: a tool that
       # stops detecting a documented, externally reported secret-dependent
@@ -592,9 +614,10 @@ jobs:
             cargo run --locked --release -p cargo-trace-check -- check \
               --all-configured --ci \
               --manifest-path "examples/ml-dsa-control-$half/Cargo.toml"
-            cargo build --locked --release \
-              --manifest-path "examples/ml-dsa-control-$half/Cargo.toml"
           done
+          # Reads the executable Memcheck analyzed, where `decompose` is inlined
+          # into the signing symbol, and accounts for every division in the
+          # library's code against a reviewed allowlist.
           python3 ci/verify-m11-controls.py
 
       - name: Reproduce the demonstration

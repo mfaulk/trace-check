@@ -66,3 +66,10 @@ rationale = "the comparison that tells finding A apart from an ml-kem-specific q
 cases = 32
 expectation = "analyzer-regression"
 expected_outcome = "LEAK_DETECTED"
+
+[check."kyberaudit::controls::rejected_shared_secret_branch"]
+description = "control 7: a branch on the shared secret an invalid ciphertext produces"
+rationale = "the sensitivity control for the implicit-rejection secret, which control 5 does not reach: a valid ciphertext's shared secret depends on sk_pke and not on z, a rejected one on z and not on the decryption. `the_rejected_secret_depends_on_z` is the independent evidence that the branched-on value really is z-derived"
+cases = 96
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"

@@ -9,6 +9,10 @@
 //! 3. did the declassification boundary move the line where it claims to, and
 //!    only there? ([`public_component_branch`] against
 //!    [`public_component_branch_seed_level`])
+//! 4. would a leak *late* in the operation be attributed, on **each** of the FO
+//!    transform's two data paths? ([`shared_key_branch`] for the valid
+//!    ciphertext's `Kp`, [`rejected_shared_key_branch`] for the rejected
+//!    `K̄ = J(z ‖ c)`)
 //!
 //! The second pair is what makes over-declassification visible. A boundary that
 //! quietly restored definedness for everything would make the whole audit read
@@ -17,6 +21,11 @@
 //! The third pair is the only way to show the boundary is real: the *same*
 //! branch on the *same* byte must be found under the seed-level encoding and
 //! not found under the key-level one.
+//!
+//! The fourth pair exists because the two FO paths carry *different* secrets. A
+//! valid ciphertext's shared key depends on `dk_pke` and not on `z`; a rejected
+//! one depends on `z` and not on the decryption. One control cannot speak for
+//! both, and the rejected path is the one a decapsulation oracle attacks.
 
 use crate::fixture;
 use crate::layout::EK_OFFSET;
@@ -185,11 +194,18 @@ pub fn derived_arithmetic_branch(seed: &[u8; 64], m: &[u8; 32]) -> u8 {
 /// Control 8 — a branch on a byte of the **shared key**, which is derived from
 /// marked key material through the whole FO transform.
 ///
-/// This is the audit's sensitivity control, and the most important one here. A
-/// genuine leak late in decapsulation would be driven by exactly this kind of
-/// deeply derived value, so what this control produces bounds what a clean
-/// result on the real contracts is worth: a `LEAK_DETECTED` here means a late
-/// leak would be attributed, and anything else means it would only fail closed.
+/// One of the audit's two sensitivity controls. A genuine leak late in
+/// decapsulation would be driven by exactly this kind of deeply derived value,
+/// so what this control produces bounds what a clean result on the real
+/// contracts is worth: a `LEAK_DETECTED` here means a late leak would be
+/// attributed, and anything else means it would only fail closed.
+///
+/// **It covers the valid-ciphertext dependency only.** The ciphertext is
+/// genuine, so `cp.ct_eq(c)` holds and the selection returns `Kp = G(mp, H(ek))`
+/// — which depends on `dk_pke` through K-PKE decryption and the re-encryption,
+/// and **not** on `z`. `J(z, c)` is computed either way, but its result is the
+/// branch the selection does *not* take. [`rejected_shared_key_branch`] is the
+/// control for that other dependency, and neither stands in for the other.
 #[constant_time(secret = "seed", dynamic = false)]
 pub fn shared_key_branch(seed: &[u8; 64], m: &[u8; 32]) -> u8 {
     let expanded = fixture::public_keygen(seed);
@@ -202,6 +218,33 @@ pub fn shared_key_branch(seed: &[u8; 64], m: &[u8; 32]) -> u8 {
         consume_all_bytes(shared.as_slice())
     });
     shared ^ 0x08
+}
+
+/// Control 9 — the sensitivity control for the **implicit-rejection** secret: a
+/// branch on a byte of the shared key an *invalid* ciphertext produces.
+///
+/// The FO transform has two secrets and two data paths, and control 8 only
+/// reaches one of them. For a corrupted ciphertext `cp.ct_eq(c)` fails and the
+/// selection returns `K̄ = J(z ‖ c)` — a value derived from the
+/// implicit-rejection seed `z`, through SHAKE256, and from nothing `dk_pke`
+/// touched. That is the data a decapsulation oracle attacks, and it travels a
+/// hash this project has already caught losing provenance elsewhere, so it
+/// needs its own control rather than an argument by analogy.
+///
+/// `the_rejected_key_depends_on_z` is the independent evidence that the value
+/// branched on here really is `z`-derived.
+#[constant_time(secret = "seed", dynamic = false)]
+pub fn rejected_shared_key_branch(seed: &[u8; 64], m: &[u8; 32], position: u16, delta: u8) -> u8 {
+    let expanded = fixture::public_keygen(seed);
+    let ciphertext = fixture::corrupted_ciphertext(&expanded, m, position, delta);
+    let shared = fixture::with_key_level_secret(&expanded, |key, _| {
+        let shared = key.decapsulate(&fixture::ciphertext(&ciphertext));
+        if shared[0] & 1 == 1 {
+            record(9);
+        }
+        consume_all_bytes(shared.as_slice())
+    });
+    shared ^ 0x09
 }
 
 /// Control 6 — the negative control: the key-level boundary with **nothing**
@@ -247,6 +290,49 @@ mod tests {
         assert_eq!(
             secret_component_address(&seed, &m),
             (folded ^ substituted) ^ 0x03
+        );
+    }
+
+    /// The value [`rejected_shared_key_branch`] branches on really is derived
+    /// from `z`: changing `z` alone, with `dk_pke`, `ek`, `H(ek)` and the
+    /// ciphertext all fixed, changes it — and leaves the valid-ciphertext
+    /// result untouched, which is the other half of why the two sensitivity
+    /// controls are not interchangeable.
+    #[test]
+    fn the_rejected_key_depends_on_z() {
+        use crate::layout::{EXPANDED_LEN, Z_OFFSET};
+
+        fn decapsulate(expanded: &[u8; EXPANDED_LEN], ciphertext: &[u8; 1088]) -> [u8; 32] {
+            fixture::with_key_level_secret(expanded, |key, _| {
+                let shared = key.decapsulate(&fixture::ciphertext(ciphertext));
+                let mut out = [0u8; 32];
+                out.copy_from_slice(shared.as_slice());
+                out
+            })
+        }
+
+        let seed = [21u8; SEED_LEN];
+        let m = [6u8; 32];
+        let mut expanded = fixture::public_keygen(&seed);
+        let rejecting = fixture::corrupted_ciphertext(&expanded, &m, 5, 0x20);
+        let (valid, encapsulated) = fixture::valid_ciphertext(&expanded, &m);
+
+        let before = decapsulate(&expanded, &rejecting);
+
+        // One byte of the implicit-rejection seed, and nothing else. `H(ek)`
+        // still matches `ek`, so the key stays well formed.
+        expanded[Z_OFFSET] ^= 1;
+        let after = decapsulate(&expanded, &rejecting);
+
+        assert_ne!(
+            before, after,
+            "the rejected shared key must depend on z, or control 9 is not about z"
+        );
+        assert_eq!(
+            decapsulate(&expanded, &valid),
+            encapsulated,
+            "the valid path must not depend on z, which is why control 8 cannot \
+             stand in for control 9"
         );
     }
 

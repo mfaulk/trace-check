@@ -6,8 +6,8 @@ unmodified crates.io release; nothing here reimplements a cryptographic
 operation.
 
 ```sh
-# twelve contracts, every expectation reproduced, exit 0
-cargo trace-check check --all-configured --ci --jobs 12 \
+# thirteen contracts, every expectation reproduced, exit 0
+cargo trace-check check --all-contracts --ci --jobs 12 \
   --manifest-path examples/ml-kem-audit/Cargo.toml
 
 # one contract, with the analyzed executable kept for disassembly
@@ -15,8 +15,11 @@ cargo trace-check check --contract mlkemaudit::decaps::decaps_valid_ciphertext \
   --artifact-dir /tmp/m11 --manifest-path examples/ml-kem-audit/Cargo.toml
 ```
 
-A run takes about two minutes and peaks around 157 MB. The crate is outside the
-workspace and carries its own lockfile, so it resolves its own dependency graph.
+A run takes about 90 s and peaks around 157 MB. `--all-contracts` rather than
+`--all-configured`, because the claim is about every declaration the compiled
+library carries — and because it is the only path `--jobs` affects. The crate is
+outside the workspace and carries its own lockfile, so it resolves its own
+dependency graph.
 
 ## What is being claimed
 
@@ -51,7 +54,7 @@ src/layout.rs     the expanded key's offsets, checked against the library's own 
 src/fixture.rs    key derivation, the declassification boundary, valid and corrupted ciphertexts
 src/decaps.rs     the three audit targets, one per path through the FO transform
 src/seedlevel.rs  the seed-level encoding, kept as a measurement
-src/controls.rs   eight controls -- five expected detected, two expected clean, one measured
+src/controls.rs   nine controls -- six expected detected, two expected clean, one measured
 src/sink.rs       the fixed-work 32-byte fold
 trace-check.toml  description, rationale and expected outcome per contract
 ```
