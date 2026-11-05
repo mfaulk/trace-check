@@ -104,6 +104,43 @@ secret usually becomes a `cmov` at `opt-level = 3`. Put something the optimizer
 must keep in the taken arm — a volatile write, or `core::hint::black_box` —
 and confirm from the disassembly that the branch is still there.
 
+**A structured secret is not uniformly secret, and saying so is the adapter's
+job.** M11's case is the general one: a FIPS 203 decapsulation key packs
+`dk_pke ‖ ek ‖ H(ek) ‖ z`, and the attacker *holds* `ek`. Mark the whole thing
+and the library's rejection sampling on the public `ρ` reads as a leak — a
+taint-model artifact, and the fastest way to send a maintainer a report that
+discredits the audit. So:
+
+* derive the key from the **seed** the standard defines for deterministic key
+  generation, not from generated key bytes. Being a key is usually a hash
+  preimage condition, which no input constraint expresses, and generated key
+  bytes are keys no key generation can produce;
+* run that derivation on a **declassified copy** of the seed, so the public
+  derivates stay public, and re-mark only the genuinely secret components
+  afterwards with `Secret::new`;
+* draw the boundary on a **documented serialization**, not on the library's
+  private fields, and test the offsets against the library's own accessors so a
+  layout change breaks a test instead of silently declassifying key material;
+* build any public input the fixture needs — a valid ciphertext, say — through
+  the *public* components, so it is public by construction rather than by
+  declassification.
+
+**Two controls make a boundary checkable, and a boundary nobody checks is
+worthless.** One planted leak on a genuinely secret component, which must stay
+detected — that is what catches a boundary that quietly declassified
+everything and made the whole audit read clean. And the *same* planted leak on
+a public component under both classifications, which must differ between them —
+that is what shows the line moved where it claims to and no further.
+
+**Add a sensitivity control on the operation's output.** A branch on a byte of
+the final result — derived through every hash, reduction and selection the
+operation performs — bounds what a clean result is worth. If it is detected, a
+leak late in the operation would be attributed. If it is not, the clean results
+are compatible with the analysis having gone blind halfway through, and M11
+found a real library where exactly that happens: provenance does not survive
+every hash implementation, so this control is the difference between an audit
+and an assumption.
+
 ## Validating an adapter
 
 Before any security result is worth reading:
@@ -111,7 +148,8 @@ Before any security result is worth reading:
 1. `cargo test` — the functional oracle, the sink's all-bytes property, and the
    representation assumptions (limb layout, byte order, modulus).
 2. `cargo trace-check check --all-contracts --ci` — every control detected,
-   every negative control clean.
+   every negative control clean, and if the secret is structured, the boundary
+   pair disagreeing and the sensitivity control detected.
 3. `objdump -d -l` over the analyzed artifact — the library's own frames
    present, operands loaded rather than constant-folded, the result written out
    and read. An inlined operation with no distinct symbol is fine; describing
