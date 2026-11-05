@@ -1,0 +1,68 @@
+# Check settings for the kyberlib audit adapters.
+#
+# Structurally the same contract set as the ml-kem audit, because the point of a
+# second target is to vary the implementation and nothing else. Expected
+# outcomes are recorded from measurement; `docs/audits/kyberlib/findings.md`
+# says what each one means.
+schema_version = 1
+description = "Audit adapters over kyberlib 0.0.11 (ML-KEM-768), with the same boundary controls as the ml-kem audit."
+
+[check."kyberaudit::decaps::decaps_valid_ciphertext"]
+description = "kyberlib ML-KEM-768 decapsulation of a genuine ciphertext, sk_pke and z secret"
+rationale = "the successful FO path. Keys are derived deterministically from a 64-byte seed through the library's typed key generation, which `the_two_key_generation_paths_agree` checks against its documented `derive` and `key_derivation_matches_the_acvp_vectors` checks against NIST. The classification boundary is drawn on the key's own storage, so the marking covers exactly the bytes the library reads"
+cases = 48
+
+[check."kyberaudit::decaps::decaps_corrupted_ciphertext"]
+description = "the same operation on a genuine ciphertext with one public byte flipped"
+rationale = "the implicit-rejection path. The library's own documentation claims decapsulation `never panics, never branches on validity`, which is exactly the claim this contract tests"
+cases = 96
+
+[check."kyberaudit::decaps::decaps_supplied_ciphertext"]
+description = "decapsulation of an arbitrary supplied ciphertext"
+rationale = "the attacker's position. Decapsulation is total under implicit rejection, so a generated 1088-byte value needs no input-domain restriction"
+cases = 48
+
+[check."kyberaudit::controls::pre_keygen_seed_byte"]
+description = "control 1: a branch on seed[0] before key generation"
+rationale = "shows the harness marked the array, and nothing else"
+cases = 32
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"
+
+[check."kyberaudit::controls::secret_component_branch"]
+description = "control 2: a branch on a byte of sk_pke after the boundary is drawn"
+rationale = "the control that catches over-declassification. If this reads as public, the boundary has declassified genuine key material and every clean result here is worthless"
+cases = 32
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"
+
+[check."kyberaudit::controls::secret_component_address"]
+description = "control 3: a secret-derived load address, indexed by a byte of sk_pke"
+rationale = "the address half of the observation model, checked separately because an implementation can be free of one class and not the other"
+cases = 32
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"
+
+[check."kyberaudit::controls::public_component_branch"]
+description = "control 4: a branch on a byte of the public key, under the key-level boundary"
+rationale = "expected clean: the attacker holds the public key, so a finding here would describe the marking rather than the library"
+cases = 32
+
+[check."kyberaudit::controls::shared_secret_branch"]
+description = "control 5: a branch on a byte of the shared secret, derived through the whole FO transform"
+rationale = "the sensitivity control. What this produces bounds what a clean result on the three real contracts is worth: detected means a late leak would be attributed, anything else means it would only fail closed"
+cases = 32
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"
+
+[check."kyberaudit::controls::no_planted_leak"]
+description = "control 6: the negative control -- the boundary with nothing planted"
+rationale = "expected clean. A finding here is in the fixture or in the library, and the other controls are what tell those apart"
+cases = 32
+
+[check."kyberaudit::seedlevel::keygen_and_decaps"]
+description = "key generation and decapsulation with the seed marked and nothing declassified"
+rationale = "the comparison that tells finding A apart from an ml-kem-specific quirk, and it answered: provenance survives kyberlib's own Keccak, so the same rejection-sampling branches that ml-kem reports as unattributable diagnostics are reported here as two attributed findings in reference::indcpa::rej_uniform, called from gen_matrix. Both are taint-model artifacts -- the sampler branches on rho, which the protocol publishes -- and the difference between the two targets is the tool's provenance tracking through their different XOF implementations, not the libraries' behaviour. docs/audits/kyberlib/findings.md has the stacks"
+cases = 32
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"

@@ -1,6 +1,6 @@
 # Milestone 11 — Independent Cryptographic Security Audit and Vulnerability Discovery
 
-**Status:** In progress. M11.0 and M11.1 complete; M11.2-M11.8 outstanding.
+**Status:** In progress. M11.0-M11.5 complete; M11.6-M11.8 outstanding.
 **Gate:** M11.1 passed - see [`audits/ml-kem/integration-report.md`](audits/ml-kem/integration-report.md)
 **Branch:** `feat/m11-independent-audit`, then one branch per package
 **Prerequisite:** Milestone 10, merged
