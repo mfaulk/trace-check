@@ -1108,6 +1108,15 @@ pub fn run_contract_coverage(
             let settings = config
                 .settings(&job.contract)
                 .expect("an outstanding symbolic requirement implies a [verify] entry");
+            // The observation model the *obligation* states, which may be
+            // narrower than the configuration's. A `[verify]` entry quietly
+            // reduced to control flow alone must stop satisfying a policy that
+            // wanted memory addressing too, and nothing may infer the model
+            // from whichever checks the backend happened to run.
+            let required_observations: Vec<symbolic::CheckFeature> = policy
+                .observations_for(&job.contract)
+                .map(<[symbolic::CheckFeature]>::to_vec)
+                .unwrap_or_else(|| settings.checks.clone());
 
             // Staging is per contract and touches no analyzer, so most of its
             // failures are facts about this declaration -- an unsupported
@@ -1157,7 +1166,7 @@ pub fn run_contract_coverage(
                 Ok(verified) => {
                     let report = library_report::contract_report(verified, workspace.is_kept());
                     Ok(AnalysisEvidence::from_symbolic(
-                        &settings.checks,
+                        &required_observations,
                         built,
                         Box::new(report),
                     ))

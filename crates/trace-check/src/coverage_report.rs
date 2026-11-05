@@ -132,6 +132,58 @@ pub struct CoverageReport {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Where each of this evidence's findings actually leaks, innermost first.
+///
+/// Distinct from the contract's declaration site in three ways that matter.
+/// The declaration is one line in the developer's source; a finding is a frame
+/// in a compiled stack. One contract can leak in several places. And the frame
+/// worth printing is the contract's **own** frame rather than the shallowest
+/// located one, which at `-O` is usually an inlined `core` helper -- stable
+/// for matching a finding across runs, useless for acting on it.
+///
+/// Symbolic divergences carry an instruction address and, when debug info
+/// supplied it, a source location; generated findings carry the contract's own
+/// frame and the function the finding was attributed to.
+fn leak_sites(evidence: &crate::enforcement::AnalysisEvidence) -> Vec<String> {
+    let mut sites = Vec::new();
+    if let Some(check) = &evidence.check {
+        for finding in &check.findings {
+            let what = finding.fingerprint.classification.describe();
+            match (&finding.site, &finding.fingerprint.function) {
+                (Some(site), Some(function)) => {
+                    sites.push(format!("{site} in `{function}` ({what})"))
+                }
+                (Some(site), None) => sites.push(format!("{site} ({what})")),
+                (None, Some(function)) => sites.push(format!("`{function}` ({what})")),
+                (None, None) => sites.push(format!("{what} (no source location in this build)")),
+            }
+        }
+    }
+    if let Some(symbolic) = &evidence.symbolic {
+        for divergence in &symbolic.analysis.divergences {
+            let mut line = match &divergence.source {
+                Some(source) => format!("{source} at {}", divergence.instruction),
+                None => format!("{} (no source location)", divergence.instruction),
+            };
+            line.push_str(&format!(" ({})", divergence.description));
+            // Inlined frames, when the analyzer could attribute more than one.
+            // The innermost is the instruction; the rest say how it got there.
+            if !divergence.inline_frames.is_empty() {
+                line.push_str(&format!(" via {}", divergence.inline_frames.join(" <- ")));
+            }
+            sites.push(line);
+        }
+    }
+    if let Some(dynamic) = &evidence.dynamic {
+        for test in &dynamic.tests {
+            for finding in &test.findings {
+                sites.push(format!("{finding} (in `{}`)", test.test));
+            }
+        }
+    }
+    sites
+}
+
 pub fn build(
     provenance: Provenance,
     inventory: &ContractInventory,
@@ -312,6 +364,14 @@ impl CoverageReport {
                     short(&evidence.artifact_sha256),
                     evidence.detail
                 );
+                // The leaking instruction, separately from the declaration
+                // site above. M9 asked for this: `declared at src/tag.rs:18`
+                // is where the contract is written, which is rarely the line
+                // to read when something leaks, and a developer should not
+                // have to open the JSON to find the other one.
+                for site in leak_sites(evidence) {
+                    line!("  leaks at:  {site}");
+                }
             }
             line!("");
         }
@@ -532,6 +592,7 @@ mod tests {
             "crypto::b::probe".to_string(),
             crate::enforcement::ContractPolicy {
                 required: Some(vec![Analysis::Generated, Analysis::Symbolic]),
+                observations: None,
             },
         );
         let report = report_for(

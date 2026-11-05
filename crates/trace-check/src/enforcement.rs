@@ -794,6 +794,20 @@ pub struct ContractPolicy {
     /// Analyses required of this contract, replacing the default.
     #[serde(default)]
     pub required: Option<Vec<Analysis>>,
+    /// Observation classes a `symbolic` requirement must cover.
+    ///
+    /// `None` accepts whatever the contract's `[verify]` entry declared, which
+    /// is M5's behaviour and remains the default. Naming them here states the
+    /// *obligation* rather than the configuration, so a `[verify]` entry
+    /// quietly narrowed to `checks = ["control-flow"]` stops satisfying a
+    /// policy that wanted addressing too.
+    ///
+    /// The distinction is the one M10 exists to keep: a result covering only
+    /// control flow must not be presented as establishing memory-address
+    /// noninterference, and the observation model must not be inferred from
+    /// whichever checks the backend happened to run.
+    #[serde(default)]
+    pub observations: Option<Vec<CheckFeature>>,
 }
 
 /// The assurance policy.
@@ -885,6 +899,37 @@ impl PolicyConfig {
                     ));
                 }
             }
+            if let Some(observations) = &entry.observations {
+                if observations.is_empty() {
+                    return Err(format!(
+                        "[policy.contracts.\"{contract}\"]: `observations` is empty, so the \
+                         requirement would state no observation model at all. Omit it to accept \
+                         whatever [verify] declares, or list the classes explicitly"
+                    ));
+                }
+                if let Some(duplicate) = observations
+                    .iter()
+                    .enumerate()
+                    .find(|(index, class)| observations[..*index].contains(class))
+                    .map(|(_, class)| *class)
+                {
+                    return Err(format!(
+                        "[policy.contracts.\"{contract}\"]: `observations` lists {} twice",
+                        duplicate.property()
+                    ));
+                }
+                if entry
+                    .required
+                    .as_ref()
+                    .is_some_and(|required| !required.contains(&Analysis::Symbolic))
+                {
+                    return Err(format!(
+                        "[policy.contracts.\"{contract}\"]: `observations` constrains the \
+                         `symbolic` requirement, which this contract does not require. Add \
+                         `symbolic` to `required`, or drop `observations`"
+                    ));
+                }
+            }
         }
         for exemption in &self.exemptions {
             exemption.validate(self.mode)?;
@@ -913,6 +958,12 @@ impl PolicyConfig {
         required.sort_unstable();
         required.dedup();
         required
+    }
+
+    /// Observation classes the policy requires of this contract's symbolic
+    /// obligation, if it states any.
+    pub fn observations_for(&self, contract: &str) -> Option<&[CheckFeature]> {
+        self.contracts.get(contract)?.observations.as_deref()
     }
 
     /// The waiver covering this contract and analysis, if any.
@@ -1911,6 +1962,7 @@ mod tests {
             "crypto::a::probe".to_string(),
             ContractPolicy {
                 required: Some(vec![Analysis::Generated, Analysis::Symbolic]),
+                observations: None,
             },
         );
         let (found, mut coverage) = resolved(
@@ -1944,6 +1996,7 @@ mod tests {
             "crypto::a::probe".to_string(),
             ContractPolicy {
                 required: Some(vec![Analysis::Symbolic]),
+                observations: None,
             },
         );
         let (found, mut coverage) = resolved(
@@ -1972,6 +2025,7 @@ mod tests {
             "crypto::a::probe".to_string(),
             ContractPolicy {
                 required: Some(vec![Analysis::Symbolic]),
+                observations: None,
             },
         );
         let (_, mut coverage) = resolved(
@@ -2650,6 +2704,7 @@ mod tests {
             "crypto::a::probe".to_string(),
             ContractPolicy {
                 required: Some(Vec::new()),
+                observations: None,
             },
         );
         assert!(per_contract
@@ -2676,6 +2731,7 @@ mod tests {
                     Analysis::Symbolic,
                     Analysis::Dynamic,
                 ]),
+                observations: None,
             },
         );
         let (found, coverage) = resolved(
@@ -2842,6 +2898,7 @@ mod tests {
             "crypto::a::probe".to_string(),
             ContractPolicy {
                 required: Some(vec![Analysis::Generated, Analysis::Symbolic]),
+                observations: None,
             },
         );
         // What `check` can do: the generated family, with symbolic evidence
@@ -3086,6 +3143,7 @@ mod tests {
             "crypto::tag::verify_tag".to_string(),
             ContractPolicy {
                 required: Some(vec![Analysis::Generated, Analysis::Symbolic]),
+                observations: None,
             },
         );
         let config = VerifyConfig::empty();
@@ -3237,6 +3295,7 @@ mod tests {
             "crypto::a::probe".to_string(),
             ContractPolicy {
                 required: Some(vec![Analysis::Generated, Analysis::Symbolic]),
+                observations: None,
             },
         );
         let mut config = VerifyConfig::empty();
@@ -3336,6 +3395,7 @@ mod tests {
             "crypto::a::probe".to_string(),
             ContractPolicy {
                 required: Some(vec![Analysis::Generated, Analysis::Symbolic]),
+                observations: None,
             },
         );
         // A fixture declared through `[verify]`, with a `[check]` entry that
@@ -3535,5 +3595,97 @@ mod tests {
         let blocking = coverage.blocking(&inventory, &policy);
         assert_eq!(blocking.len(), 1, "{blocking:?}");
         assert!(blocking[0].contains("ct_test"), "{blocking:?}");
+    }
+
+    /// A policy may state the observation model its symbolic obligation needs,
+    /// and a `[verify]` entry narrower than that stops satisfying it.
+    ///
+    /// The distinction M10 exists to keep: a result covering only control flow
+    /// must not be presented as establishing memory-address noninterference,
+    /// and the model must not be inferred from whichever checks the backend
+    /// happened to run.
+    #[test]
+    fn a_policy_may_require_an_observation_model() {
+        let mut policy = PolicyConfig::default();
+        policy.contracts.insert(
+            "crypto::tag::verify_tag".to_string(),
+            ContractPolicy {
+                required: Some(vec![Analysis::Symbolic]),
+                observations: Some(vec![CheckFeature::ControlFlow, CheckFeature::MemoryAccess]),
+            },
+        );
+        policy.validate().expect("a stated model is valid");
+        assert_eq!(
+            policy.observations_for("crypto::tag::verify_tag"),
+            Some([CheckFeature::ControlFlow, CheckFeature::MemoryAccess].as_slice())
+        );
+        // Unstated, which is M5's behaviour and the default.
+        assert_eq!(policy.observations_for("crypto::other::thing"), None);
+
+        // A result covering less than the obligation asked for is rejected,
+        // whatever the contract's own configuration declared.
+        let mut report = crate::library_report::sample_contract_report();
+        report.analysis.checked_features = vec![CheckFeature::ControlFlow];
+        let contract = report.contract.clone();
+        let artifact = report.artifact.sha256.clone();
+        let evidence = AnalysisEvidence::from_symbolic(
+            &[CheckFeature::ControlFlow, CheckFeature::MemoryAccess],
+            crate::evidence::sample_identity(&contract, &artifact),
+            Box::new(report),
+        );
+        assert_eq!(evidence.outcome, Outcome::Inconclusive);
+        assert!(
+            evidence.detail.contains("memory-address noninterference"),
+            "{}",
+            evidence.detail
+        );
+    }
+
+    /// An observation model that states nothing, repeats itself, or constrains
+    /// a requirement the contract does not have is a configuration error.
+    #[test]
+    fn a_meaningless_observation_model_is_refused() {
+        let entry = |observations, required| {
+            let mut policy = PolicyConfig::default();
+            policy.contracts.insert(
+                "crypto::tag::verify_tag".to_string(),
+                ContractPolicy {
+                    required,
+                    observations,
+                },
+            );
+            policy.validate()
+        };
+
+        // Empty: the requirement would state no model at all, which is not the
+        // same as omitting it to accept the configuration's.
+        let error = entry(Some(Vec::new()), Some(vec![Analysis::Symbolic]))
+            .expect_err("an empty model is refused");
+        assert!(error.contains("no observation model"), "{error}");
+
+        // Repeated, which says nothing twice.
+        let error = entry(
+            Some(vec![CheckFeature::ControlFlow, CheckFeature::ControlFlow]),
+            Some(vec![Analysis::Symbolic]),
+        )
+        .expect_err("a duplicate is refused");
+        assert!(error.contains("twice"), "{error}");
+
+        // Constraining an obligation this contract does not have: the model
+        // would be silently inert, which is how a reader comes to believe
+        // something was required that never was.
+        let error = entry(
+            Some(vec![CheckFeature::ControlFlow]),
+            Some(vec![Analysis::Generated]),
+        )
+        .expect_err("an inert model is refused");
+        assert!(error.contains("does not require"), "{error}");
+
+        // And it is fine alongside a symbolic requirement.
+        entry(
+            Some(vec![CheckFeature::MemoryAccess]),
+            Some(vec![Analysis::Generated, Analysis::Symbolic]),
+        )
+        .expect("a model constraining a requirement the contract has is valid");
     }
 }
