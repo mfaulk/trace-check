@@ -120,6 +120,22 @@ impl Staged {
         )
         .expect("write the manifest");
 
+        // The staged copy lives outside the repository, where the workspace's
+        // `rust-toolchain.toml` no longer resolves -- so without this it is
+        // analyzed with whatever toolchain the machine happens to default to.
+        // Every build in a run uses the *library's* toolchain, including the
+        // one whose `llvm-profdata` reads the coverage profiles, so a default
+        // without the `llvm-tools` component breaks coverage-guided discovery.
+        // CI found exactly that.
+        //
+        // Staging the pin makes the copy behave like the in-repo library it is
+        // a copy of, and makes the test independent of the machine it runs on.
+        std::fs::copy(
+            workspace_root().join("rust-toolchain.toml"),
+            root.join("rust-toolchain.toml"),
+        )
+        .expect("the workspace pins a toolchain");
+
         let config = std::fs::read_to_string(source.join("trace-check.toml"))
             .expect("the configuration is committed");
         std::fs::write(root.join("trace-check.toml"), format!("{config}\n{POLICY}"))
