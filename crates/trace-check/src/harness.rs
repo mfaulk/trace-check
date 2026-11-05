@@ -869,9 +869,132 @@ fn render_source(
          #[no_mangle]\nextern \"C\" fn rust_eh_personality() {{}}\n"
     ));
 
+    out.push_str(MEM_INTRINSICS);
+
     let _ = library;
     Ok(out)
 }
+
+/// The byte-copy intrinsics `-nostdlib` leaves unresolved.
+///
+/// rustc lowers a large move or a `copy_from_slice` to a `memcpy` call rather
+/// than to inline code, and the freestanding artifact links
+/// `libcompiler_builtins` without its `mem` feature — so nothing defines the
+/// symbol. Found by M11: every earlier example moved values small enough to be
+/// copied inline, and `ml-kem`, which moves kilobyte-sized polynomial arrays,
+/// failed with `undefined symbol: memcpy` before any analysis ran. The same
+/// shape of blocker as M9's `rust_eh_personality`, in a different part of the
+/// link.
+///
+/// These are the *analyzed* definitions, so they are written to be analyzable:
+/// one byte at a time, with the loop bound taken from `count`. A `count`
+/// derived from a secret would make the loop a secret-dependent branch, and the
+/// analyzer should say so — that is a true statement about such a program, not
+/// an artifact of the shim.
+///
+/// The accesses are **volatile**, which is load-bearing twice over. LLVM's
+/// loop-idiom recognition would otherwise rewrite each body into a call to the
+/// very intrinsic it implements — infinite recursion, and in one measured case
+/// a `rustc` SIGSEGV inside LLVM. The crate-wide `no_builtins` alternative also
+/// stops that, and was rejected: it changes how cross-crate-inlined library
+/// code compiles in this crate, which flipped M5's `verify_tag_early_exit` from
+/// `VERIFIED_BOUNDED` to `LEAK_DETECTED`. A shim must not change the shape of
+/// the code under analysis.
+const MEM_INTRINSICS: &str = r#"
+/// # Safety
+///
+/// The caller guarantees `dest` and `src` are valid for `count` bytes and do
+/// not overlap, as `memcpy` requires.
+#[no_mangle]
+pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, count: usize) -> *mut u8 {
+    let mut index = 0;
+    while index < count {
+        core::ptr::write_volatile(dest.add(index), core::ptr::read_volatile(src.add(index)));
+        index += 1;
+    }
+    dest
+}
+
+/// # Safety
+///
+/// The caller guarantees both pointers are valid for `count` bytes. Overlap is
+/// permitted, which is the whole difference from `memcpy`.
+#[no_mangle]
+pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, count: usize) -> *mut u8 {
+    if (dest as usize) < (src as usize) {
+        let mut index = 0;
+        while index < count {
+            core::ptr::write_volatile(dest.add(index), core::ptr::read_volatile(src.add(index)));
+            index += 1;
+        }
+    } else {
+        let mut index = count;
+        while index > 0 {
+            index -= 1;
+            core::ptr::write_volatile(dest.add(index), core::ptr::read_volatile(src.add(index)));
+        }
+    }
+    dest
+}
+
+/// # Safety
+///
+/// The caller guarantees `dest` is valid for `count` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn memset(dest: *mut u8, value: i32, count: usize) -> *mut u8 {
+    let byte = value as u8;
+    let mut index = 0;
+    while index < count {
+        core::ptr::write_volatile(dest.add(index), byte);
+        index += 1;
+    }
+    dest
+}
+
+/// # Safety
+///
+/// The caller guarantees both pointers are valid for `count` bytes.
+///
+/// Returns at the first difference, like the C function it replaces. That early
+/// exit is a real property of `memcmp`: a comparison over secret bytes is a
+/// secret-dependent branch, and a shim that hid it by comparing the whole
+/// buffer would make the analysis of such a program wrong in the dangerous
+/// direction.
+#[no_mangle]
+pub unsafe extern "C" fn memcmp(left: *const u8, right: *const u8, count: usize) -> i32 {
+    let mut index = 0;
+    while index < count {
+        let a = core::ptr::read_volatile(left.add(index));
+        let b = core::ptr::read_volatile(right.add(index));
+        if a != b {
+            return a as i32 - b as i32;
+        }
+        index += 1;
+    }
+    0
+}
+
+/// # Safety
+///
+/// As `memcmp`, whose answer this reports as zero or non-zero.
+///
+/// Written out rather than delegating: a call between two of these shims is a
+/// call LLVM may inline in either direction, and `memcmp`'s own comparison loop
+/// is itself a `bcmp` idiom.
+#[no_mangle]
+pub unsafe extern "C" fn bcmp(left: *const u8, right: *const u8, count: usize) -> i32 {
+    let mut index = 0;
+    while index < count {
+        let a = core::ptr::read_volatile(left.add(index));
+        let b = core::ptr::read_volatile(right.add(index));
+        if a != b {
+            return 1;
+        }
+        index += 1;
+    }
+    0
+}
+"#;
 
 /// The function-pointer type for a contract, spelled with the real parameter
 /// types so rustc rejects a wrong width, a wrong shape or a wrong order.
@@ -1408,6 +1531,27 @@ mod tests {
             "{}",
             harness.source
         );
+    }
+
+    /// The freestanding harness defines the byte-copy intrinsics, without which
+    /// a library that moves values too large to copy inline fails to link under
+    /// `-nostdlib` with `undefined symbol: memcpy`.
+    #[test]
+    fn the_harness_defines_the_memory_intrinsics() {
+        let harness = generate(
+            &library(),
+            &contract(VERIFY_TAG, "crypto::tag", "verify_tag"),
+        )
+        .unwrap();
+        for symbol in ["memcpy", "memmove", "memset", "memcmp", "bcmp"] {
+            assert!(
+                harness
+                    .source
+                    .contains(&format!("extern \"C\" fn {symbol}(")),
+                "missing {symbol}: {}",
+                harness.source
+            );
+        }
     }
 
     /// The freestanding harness defines `rust_eh_personality`, without which

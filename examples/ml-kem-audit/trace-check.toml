@@ -95,3 +95,20 @@ rationale = "the audit's sensitivity control. A genuine leak late in decapsulati
 cases = 32
 expectation = "analyzer-regression"
 expected_outcome = "LEAK_DETECTED"
+
+# ------------------------------------------------------------------
+# M11.3 -- the symbolic attempt, recorded rather than omitted.
+#
+# ml-kem exposes no leaf operation: `algebra`, `compress`, `crypto`, `pke` and
+# `param` are all private modules, so the smallest thing an external audit can
+# point the symbolic backend at is a whole decapsulation preceded by key
+# generation. The entry exists so the attempt and its outcome are on the
+# record; `docs/audits/ml-kem/symbolic-feasibility.md` has the measurement.
+# ------------------------------------------------------------------
+
+[verify."mlkemaudit::decaps::decaps_valid_ciphertext"]
+description = "the bounded symbolic attempt on a whole ML-KEM-768 decapsulation"
+rationale = "recorded to establish what the backend actually does with a target of this size and shape, rather than asserting it is infeasible"
+max_depth = 2000000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "INCONCLUSIVE"
