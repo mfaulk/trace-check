@@ -137,8 +137,22 @@ pub fn valid_ciphertext(
     expanded: &[u8; EXPANDED_LEN],
     m: &[u8; 32],
 ) -> ([u8; CIPHERTEXT_LEN], [u8; 32]) {
-    let ek_bytes = Array::try_from(&expanded[EK_OFFSET..H_OFFSET])
-        .expect("EK_LEN bytes is an ML-KEM-768 encapsulation key");
+    encapsulate_to(&expanded[EK_OFFSET..H_OFFSET], m)
+}
+
+/// Deterministic encapsulation under a serialized encapsulation key.
+///
+/// Split out of [`valid_ciphertext`] so the ACVP encapsulation vectors, which
+/// supply `ek` without a decapsulation key, exercise the same code the contracts
+/// use rather than a parallel copy of it.
+///
+/// # Panics
+///
+/// If `ek_bytes` is not an ML-KEM-768 encapsulation key.
+#[inline(always)]
+pub fn encapsulate_to(ek_bytes: &[u8], m: &[u8; 32]) -> ([u8; CIPHERTEXT_LEN], [u8; 32]) {
+    let ek_bytes =
+        Array::try_from(ek_bytes).expect("EK_LEN bytes is an ML-KEM-768 encapsulation key");
     let ek = EncapsulationKey768::new(&ek_bytes).expect("a derived encapsulation key must decode");
     let (encapsulated, shared) = ek.encapsulate_deterministic(&Array(*m));
 

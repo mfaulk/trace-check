@@ -12,7 +12,6 @@
 //! finding belongs to.
 
 use crate::fixture;
-use crate::layout::{CIPHERTEXT_LEN, SEED_LEN};
 use crate::sink::consume_all_bytes;
 use ml_kem::Decapsulate;
 use trace_check_macros::constant_time;
@@ -34,6 +33,7 @@ pub fn keygen_and_decaps(seed: &[u8; 64], ciphertext: &[u8; 1088]) -> u8 {
 mod tests {
     use super::*;
     use crate::decaps::decaps_bytes;
+    use crate::layout::{CIPHERTEXT_LEN, SEED_LEN};
 
     /// The two encodings compute the same function: the declassification
     /// boundary changes what is *claimed*, never what is computed.
