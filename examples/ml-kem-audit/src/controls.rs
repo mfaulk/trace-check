@@ -19,7 +19,7 @@
 //! not found under the key-level one.
 
 use crate::fixture;
-use crate::layout::{CIPHERTEXT_LEN, EK_OFFSET, SEED_LEN};
+use crate::layout::EK_OFFSET;
 use crate::sink::consume_all_bytes;
 use ml_kem::{Decapsulate, KeyExport};
 use trace_check_macros::constant_time;
@@ -208,6 +208,7 @@ pub fn no_planted_leak(seed: &[u8; 64], m: &[u8; 32]) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::SEED_LEN;
 
     /// Every control still decapsulates correctly, so a detected control is
     /// evidence about observation and not about a broken fixture.
@@ -216,7 +217,7 @@ mod tests {
         let seed = [13u8; SEED_LEN];
         let m = [4u8; 32];
         let expanded = fixture::public_keygen(&seed);
-        let (ciphertext, expected) = fixture::valid_ciphertext(&expanded, &m);
+        let (_, expected) = fixture::valid_ciphertext(&expanded, &m);
         let folded = consume_all_bytes(&expected);
 
         assert_eq!(pre_keygen_seed_byte(&seed, &m), folded ^ 0x01);
