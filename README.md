@@ -23,7 +23,7 @@ the formal noninterference property, and the roadmap.
 | M7 | Coverage-guided leakage discovery | complete, experimental |
 | M8 | Complete contract coverage and enforcement | complete, experimental |
 | M9 | Real-world cryptography integration — auditing `crypto-bigint` | complete, experimental |
-| M10 | Unified multi-backend verification and CI enforcement | in progress — M10.0–M10.2, M10.4–M10.6 complete |
+| M10 | Unified multi-backend verification and CI enforcement | in progress — M10.0–M10.7 complete |
 | M11 | Hardware-oriented validation — statistical timing | future |
 
 `trace-check` turns that idea into reproducible analysis, from five directions:
@@ -683,6 +683,40 @@ directories would rebuild the library and every dependency per job.
 
 Measured over the eighteen `crypto-bigint` audit contracts, `--jobs 2` takes
 2:25 against 3:58 sequentially for 2 MB more memory.
+
+A policy may also state the **observation model** its symbolic obligation
+needs, rather than accepting whatever the contract's `[verify]` entry declares:
+
+```toml
+[policy.contracts."crypto::tag::verify_tag"]
+required = ["generated", "symbolic"]
+observations = ["control-flow", "memory-access"]
+```
+
+Omitted, the configuration's own `checks` list applies. Given, a `[verify]`
+entry later narrowed to control flow alone stops satisfying the requirement
+instead of silently weakening it — a result covering only control flow must
+never be presented as establishing memory-address noninterference.
+
+**A leak says where it leaks.** The declaration site and the leaking
+instruction are different things, and both are reported:
+
+```
+cbaudit::controls::pre_decode_first_byte
+  declared at src/controls.rs:53
+  leaks at:  controls.rs:55 in `cbaudit::controls::pre_decode_first_byte` (Secret-dependent branch)
+  leaks at:  cbaudit::controls::pre_decode_first_byte (controls.rs:55) at 0x2048c0 (Secret-dependent control flow)
+```
+
+The frame printed is the contract's **own** frame, not the shallowest located
+one — at `-O` that is usually an inlined `core` helper: stable for matching a
+finding across runs, useless for acting on it. A symbolic divergence also
+carries the instruction address.
+
+If the linker folds two contracts with identical bodies onto one address,
+trace-check says so by name and address rather than leaving you to disassemble,
+and points at the remedy: give the bodies something that differs, as this
+repository's own audit adapters do with a per-contract discriminant byte.
 
 `--ci` requires `mode = "strict"` and refuses an advisory policy. Advisory mode
 reports gaps without failing, which is what it is for during adoption and
