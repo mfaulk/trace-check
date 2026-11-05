@@ -16,6 +16,7 @@ use std::path::Path;
 use sha2::{Digest, Sha256};
 use trace_check::dynamic::DynamicTestRun;
 use trace_check::enforcement::{Analysis, PolicyConfig};
+use trace_check::harness::Library;
 use trace_check::native::{self, Limits};
 use trace_check::DynamicRuns;
 
@@ -49,15 +50,25 @@ pub fn wanted(policy: &PolicyConfig) -> bool {
 /// generated metadata tests only, which is M3's existing guarantee and the
 /// reason discovery does not run the developer's suite.
 pub fn collect(
-    manifest_path: &Path,
+    library: &Library,
     profile: Option<&str>,
     features: &[String],
     limits: Limits,
 ) -> Result<DynamicRuns, String> {
+    let manifest_path = Path::new(&library.manifest_path);
     let (valgrind, valgrind_version) = native::prepare_valgrind().map_err(|e| e.to_string())?;
-    let (binaries, used_profile) =
-        discover::build_test_binaries(Some(manifest_path), profile, features)
-            .map_err(|e| e.to_string())?;
+    // The library's own toolchain, for the same reason every other build in a
+    // unified run uses it: these executables are analyzed, and their evidence
+    // records `library.toolchain` as the compiler that built them. Leaving the
+    // ambient resolution here would make that record describe a compiler that
+    // did not -- which is the defect M10.2 exists to have removed.
+    let (binaries, used_profile) = discover::build_test_binaries(
+        Some(manifest_path),
+        profile,
+        features,
+        Some(&library.toolchain),
+    )
+    .map_err(|e| e.to_string())?;
     let discovery = discover::discover(&binaries, &used_profile).map_err(|e| e.to_string())?;
 
     // An unknown or ambiguous target is an error before anything runs, exactly

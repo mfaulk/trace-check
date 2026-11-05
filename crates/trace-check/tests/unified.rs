@@ -879,3 +879,102 @@ fn a_test_targeting_no_contract_is_reported() {
         report.summary.blocking_reasons
     );
 }
+
+/// A leak found by a test that ran is never discarded, even when its contract
+/// required nothing dynamic.
+///
+/// `dynamic` is a whole test suite rather than a per-contract job: a policy
+/// requiring it of contract B makes the run execute every targeted
+/// `#[ct_test]`, including one bound to contract A. If A's test finds a
+/// secret-dependent branch, dropping it because A required only `generated`
+/// would erase positive leakage evidence — which no arrangement of obligations
+/// may do.
+///
+/// Needs no backend: the test results are supplied, and what is under test is
+/// what enforcement does with them.
+#[test]
+fn a_leak_from_an_unrequired_test_still_fails_the_contract() {
+    // A requires only `generated`; B requires `dynamic`. Running B's
+    // requirement is what causes A's test to be executed at all.
+    const A: &str = "cbaudit::monty::mul_both_secret";
+    const B: &str = "cbaudit::monty::mul_secret_left";
+    let config = config_with_policy(&format!(
+        "[policy]\nmode = \"strict\"\ndefault_required = [\"generated\"]\n\n\
+         [policy.contracts.\"{A}\"]\nrequired = [\"generated\"]\n\n\
+         [policy.contracts.\"{B}\"]\nrequired = [\"dynamic\"]\n"
+    ));
+    let mut runs = no_dynamic_runs();
+    // A's hand-written test reached a secret-dependent branch.
+    runs.runs.push(trace_check::dynamic::DynamicTestRun {
+        test: "tests::a_leaks".to_string(),
+        declared_target: Some("monty::mul_both_secret".to_string()),
+        executable: "/t/tests-abc".to_string(),
+        executable_sha256: "exec0".to_string(),
+        outcome: Outcome::LeakDetected,
+        calibrated: true,
+        invoked_target: true,
+        completed: true,
+        message: "secret-dependent branch at monty.rs:41".to_string(),
+        findings: vec!["Secret-dependent branch: mul_both_secret at monty.rs:41".to_string()],
+    });
+
+    let workspace = Workspace::ephemeral().expect("a private workspace");
+    let library =
+        Library::resolve(&library_dir().join("Cargo.toml"), &[]).expect("the audit library");
+    let report = trace_check::run_contract_coverage(
+        &library,
+        &config,
+        &workspace,
+        &trace_check::CheckOverrides::default(),
+        // Only A is selected for analysis, so no backend runs for B.
+        &Selection::Named(vec![A.to_string()]),
+        None,
+        "2026-11-04",
+        Some(UNREACHABLE_RUNTIME),
+        Some(&runs),
+    )
+    .expect("the unified run reports rather than failing");
+
+    let contract = named(&report, A);
+    let dynamic = contract
+        .evidence_for(Analysis::Dynamic)
+        .expect("the executed test's result must be retained");
+    assert_eq!(dynamic.outcome, Outcome::LeakDetected);
+    assert!(
+        dynamic.detail.contains("monty.rs:41"),
+        "the finding must survive: {}",
+        dynamic.detail
+    );
+
+    // No `dynamic` *status*, because A never owed one -- recording CHECKED
+    // would claim it was held to something it was not.
+    assert!(
+        !contract.status.contains_key(&Analysis::Dynamic),
+        "an unrequired analysis must not acquire a status: {:?}",
+        contract.status
+    );
+    assert_eq!(contract.required, vec![Analysis::Generated]);
+
+    // But the leak fails the contract and the run.
+    assert!(
+        contract.violated(),
+        "a leak observed by a test that ran must fail the contract: {:?}",
+        contract.status
+    );
+    assert!(!contract.satisfied());
+    assert!(
+        report
+            .summary
+            .blocking_reasons
+            .iter()
+            .any(|reason| reason.contains(A)),
+        "{:?}",
+        report.summary.blocking_reasons
+    );
+    assert_eq!(
+        report.exit_code(),
+        1,
+        "a leak outranks every other condition: {}",
+        report.to_text()
+    );
+}

@@ -1178,25 +1178,34 @@ fn fold_dynamic(
             detail: detail.clone(),
         });
     }
-    for entry in &plan.entries {
-        if !entry.outstanding().contains(&Analysis::Dynamic) {
-            continue;
-        }
-        let Some(declaration) = found.contract(&entry.id) else {
-            continue;
-        };
-        // No bound test is the absence of evidence, so the requirement keeps
-        // the `NOT_ANALYZED` status it already has. Saying so here would be
-        // the same thing twice; silently folding a clean result would be the
-        // failure this milestone exists to prevent.
-        let Some(tests) = binding.per_contract.get(&entry.id) else {
+    // Which contracts *owe* a dynamic answer. A contract with no bound test
+    // keeps the `NOT_ANALYZED` status it already has: saying so here would be
+    // the same thing twice, and silently folding a clean result would be the
+    // failure this milestone exists to prevent.
+    let required: std::collections::BTreeSet<&str> = plan
+        .entries
+        .iter()
+        .filter(|entry| entry.outstanding().contains(&Analysis::Dynamic))
+        .map(|entry| entry.id.as_str())
+        .collect();
+
+    // Every contract with a bound test, not only those that owe an answer.
+    //
+    // `dynamic` is a whole test suite rather than a per-contract job: a policy
+    // requiring it of one contract makes the run execute every targeted
+    // `#[ct_test]`, including tests bound to contracts that require nothing
+    // dynamic. Those tests have *already run*. Discarding a leak one of them
+    // found, because nobody asked for the analysis, would erase positive
+    // leakage evidence -- and no arrangement of obligations may do that.
+    for (contract, tests) in &binding.per_contract {
+        let Some(declaration) = found.contract(contract) else {
             continue;
         };
         let Some(aggregate) = dynamic::aggregate(tests) else {
             continue;
         };
         let identity = evidence::ArtifactIdentity::developer_test(
-            &entry.id,
+            contract,
             &declaration.descriptor_json,
             library,
             &dynamic::artifact_sha256(&aggregate.executables),
@@ -1204,10 +1213,16 @@ fn fold_dynamic(
             &runs.profile,
             &runs.valgrind_version,
         );
-        coverage.fold(
-            &entry.id,
-            AnalysisEvidence::from_dynamic(identity, aggregate),
-        );
+        let evidence = AnalysisEvidence::from_dynamic(identity, aggregate);
+        if required.contains(contract.as_str()) {
+            coverage.fold(contract, evidence);
+        } else {
+            // No obligation to discharge, so no status is written: recording
+            // CHECKED would claim the contract was held to something it never
+            // was. The evidence is kept, and `violated()` reads evidence as
+            // well as statuses, so a leak still fails the contract.
+            coverage.fold_supplemental(contract, evidence);
+        }
     }
 }
 

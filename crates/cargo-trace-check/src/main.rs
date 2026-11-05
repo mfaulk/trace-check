@@ -550,7 +550,7 @@ fn check(request: CheckRequest) -> Result<u8, String> {
         // have.
         let dynamic_runs = if dynamic_adapter::wanted(&config.policy) {
             Some(dynamic_adapter::collect(
-                &manifest,
+                &library,
                 None,
                 &features,
                 Limits::default(),
@@ -742,8 +742,11 @@ fn test(
     // missing Valgrind is an immediate, clear failure.
     let (valgrind, valgrind_version) = native::prepare_valgrind().map_err(|e| e.to_string())?;
 
-    let (binaries, used_profile) = discover::build_test_binaries(manifest_path, profile, features)
-        .map_err(|e| e.to_string())?;
+    // No toolchain override: `test` runs in the project it is testing, so the
+    // working directory already resolves the right one.
+    let (binaries, used_profile) =
+        discover::build_test_binaries(manifest_path, profile, features, None)
+            .map_err(|e| e.to_string())?;
     let discovery = discover::discover(&binaries, &used_profile).map_err(|e| e.to_string())?;
 
     // An unknown or ambiguous target is an error before anything runs: a test
@@ -950,8 +953,11 @@ fn list(
     features: &[String],
     format: Format,
 ) -> Result<u8, String> {
-    let (binaries, used_profile) = discover::build_test_binaries(manifest_path, profile, features)
-        .map_err(|e| e.to_string())?;
+    // No toolchain override: `test` runs in the project it is testing, so the
+    // working directory already resolves the right one.
+    let (binaries, used_profile) =
+        discover::build_test_binaries(manifest_path, profile, features, None)
+            .map_err(|e| e.to_string())?;
     let discovery = discover::discover(&binaries, &used_profile).map_err(|e| e.to_string())?;
 
     match format {

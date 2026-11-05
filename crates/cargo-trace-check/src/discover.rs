@@ -26,6 +26,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
+use trace_check::toolchain::Toolchain;
 
 /// Build profile M2 defines: optimized, with debug symbols retained because a
 /// finding without a source location is not actionable.
@@ -163,6 +164,16 @@ pub fn build_test_binaries(
     manifest_path: Option<&Path>,
     profile_override: Option<&str>,
     features: &[String],
+    // The toolchain the analyzed library pins, applied to the Cargo builds.
+    //
+    // `None` keeps the ambient resolution, which is what `cargo trace-check
+    // test` wants: it runs in the project it is testing, so the working
+    // directory already resolves the right toolchain. A unified run may be
+    // pointed at a library elsewhere with `--manifest-path`, where it does not
+    // -- and then the test executables would be built by a different compiler
+    // from the one every other artifact used and from the one the evidence
+    // records. See `trace_check::toolchain`.
+    toolchain: Option<&Toolchain>,
 ) -> Result<(Vec<PathBuf>, String), DiscoverError> {
     let feature_args: Vec<String> = if features.is_empty() {
         Vec::new()
@@ -173,13 +184,13 @@ pub fn build_test_binaries(
     if let Some(profile) = profile_override {
         let mut args = profile_args(profile);
         args.extend(feature_args);
-        let binaries = cargo_build(manifest_path, &args)?;
+        let binaries = cargo_build(manifest_path, &args, toolchain)?;
         return Ok((binaries, profile.to_string()));
     }
 
     let mut preferred = profile_args(PREFERRED_PROFILE);
     preferred.extend(feature_args.clone());
-    match cargo_build(manifest_path, &preferred) {
+    match cargo_build(manifest_path, &preferred, toolchain) {
         Ok(binaries) => Ok((binaries, PREFERRED_PROFILE.to_string())),
         Err(DiscoverError::Build { stderr }) if mentions_missing_profile(&stderr) => {
             eprintln!(
@@ -188,7 +199,7 @@ pub fn build_test_binaries(
             );
             let mut fallback = release_with_symbols();
             fallback.extend(feature_args);
-            let binaries = cargo_build(manifest_path, &fallback)?;
+            let binaries = cargo_build(manifest_path, &fallback, toolchain)?;
             Ok((binaries, "release+debug".to_string()))
         }
         Err(other) => Err(other),
@@ -218,8 +229,13 @@ fn mentions_missing_profile(stderr: &str) -> bool {
 fn cargo_build(
     manifest_path: Option<&Path>,
     profile_args: &[String],
+    toolchain: Option<&Toolchain>,
 ) -> Result<Vec<PathBuf>, DiscoverError> {
     let mut command = Command::new("cargo");
+    // Before anything else, so the whole build uses the library's compiler.
+    if let Some(toolchain) = toolchain {
+        toolchain.apply(&mut command);
+    }
     command.arg("test").arg("--no-run");
     command.args(profile_args);
     if let Some(path) = manifest_path {
