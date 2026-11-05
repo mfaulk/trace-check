@@ -29,9 +29,19 @@
 //! # Backend independence
 //!
 //! Nothing here names Valgrind or BINSEC. [`Analysis`] names requirements and
-//! [`Evidence`] records results, so a future backend participates by producing
-//! evidence for an analysis rather than by another redesign of discovery and
-//! enforcement.
+//! [`AnalysisEvidence`] records results, so a future backend participates by
+//! producing evidence for an analysis rather than by another redesign of
+//! discovery and enforcement.
+//!
+//! The one thing this module does know about a backend is what would make its
+//! evidence inadmissible — see [`validate_identity`] and [`validate_coverage`].
+//! That is deliberately a
+//! different question from whether the analysis was sound, which is the
+//! backend's own to answer: enforcement asks only whether the record in hand is
+//! about *this* contract, *this* artifact and the observation classes the
+//! configuration declared. Without that check the only thing enforcement reads
+//! is an outcome, and a correct result about something else would discharge the
+//! obligation.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -41,6 +51,7 @@ use serde::{Deserialize, Serialize};
 use crate::contract::{Descriptor, Repr, Role, VerifyConfig};
 use crate::inventory::{ContractDeclaration, ContractInventory};
 use crate::security::Outcome;
+use crate::symbolic::CheckFeature;
 
 /// An analysis a policy can require of a contract.
 ///
@@ -267,6 +278,19 @@ pub struct AnalysisEvidence {
     /// Exploration evidence, when coverage-guided discovery ran.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discovery: Option<crate::check_report::DiscoveryEvidence>,
+    /// The symbolic verification's whole record, when a symbolic analysis
+    /// produced this evidence.
+    ///
+    /// `VERIFIED_BOUNDED` is meaningless without the conditions it was
+    /// established under, so the record travels with the outcome: the artifact
+    /// analyzed, the symbol it was attributed to, the evidence the analyzer
+    /// reached it, the declared and generated input domain, the observation
+    /// classes checked, the depth bound and the solver timeout.
+    ///
+    /// Boxed because it is an order of magnitude larger than the rest of this
+    /// struct and most evidence is not symbolic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbolic: Option<Box<crate::library_report::ContractReport>>,
     /// Reproducers written for this contract's findings.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub reproducers: Vec<String>,
@@ -288,9 +312,183 @@ impl AnalysisEvidence {
             detail: detail.to_string(),
             check: None,
             discovery: None,
+            symbolic: None,
             reproducers: Vec::new(),
         }
     }
+
+    /// Symbolic evidence, accepted only on the conditions it claims.
+    ///
+    /// # A clean outcome has to survive validation
+    ///
+    /// The backend's own `classify` already refuses a clean verdict unless the
+    /// run earned it -- target reached, exploration complete, no unknown
+    /// solver answers, every requested observation class counted, the depth
+    /// bound held. Those are claims about *the analyzer's output*. This is the
+    /// claim the **enforcement boundary** needs, which is a different one: that
+    /// the record in hand is about *this contract*, *this obligation's
+    /// artifact*, and the observation classes the configuration asked for.
+    ///
+    /// Without it a `VERIFIED_BOUNDED` from a previous run, from a sibling
+    /// contract, or from an artifact that is not the one built here would
+    /// discharge the requirement, because the only thing enforcement reads is
+    /// the outcome. A requirement is specific to an artifact; evidence has to
+    /// be checked against it rather than trusted for containing the right
+    /// word.
+    ///
+    /// A detected leak is **never** downgraded. A satisfiable relational query
+    /// is positive evidence, and no amount of provenance mismatch un-discovers
+    /// it -- the same rule `fold_analysis` applies to incomplete exploration.
+    pub fn from_symbolic(
+        contract_id: &str,
+        configured: &[CheckFeature],
+        artifact_sha256: &str,
+        report: Box<crate::library_report::ContractReport>,
+    ) -> AnalysisEvidence {
+        let outcome = report.analysis.outcome;
+        let mut detail = report.analysis.message.clone();
+        // Identity first, and unconditionally. A result about another contract,
+        // another symbol or another executable is not weak evidence about this
+        // obligation -- it is evidence about something else, and folding its
+        // leak in here would attribute a real finding to the wrong function and
+        // send a developer to read code that is fine.
+        let outcome = match validate_identity(contract_id, artifact_sha256, &report) {
+            Err(reason) => {
+                detail = format!(
+                    "the symbolic result is not about this obligation: {reason}. The analyzer \
+                     reported {outcome} for `{}`: {detail}",
+                    report.contract
+                );
+                Outcome::Inconclusive
+            }
+            // Then whether it covered enough to establish anything. A detected
+            // leak is never downgraded here: it is a satisfiable relational
+            // query against this contract's own artifact, and a narrower
+            // observation model than the configuration asked for cannot
+            // un-discover it.
+            Ok(()) => match validate_coverage(configured, &report) {
+                Ok(()) => outcome,
+                Err(_) if outcome == Outcome::LeakDetected => outcome,
+                Err(reason) => {
+                    detail = format!(
+                        "the symbolic result cannot discharge this obligation: {reason}. The \
+                         analyzer reported {outcome}: {detail}"
+                    );
+                    Outcome::Inconclusive
+                }
+            },
+        };
+        AnalysisEvidence {
+            analysis: Analysis::Symbolic,
+            outcome,
+            artifact_sha256: report.artifact.sha256.clone(),
+            detail,
+            check: None,
+            discovery: None,
+            symbolic: Some(report),
+            reproducers: Vec::new(),
+        }
+    }
+}
+
+/// Why a symbolic record cannot discharge this contract's obligation, if it
+/// cannot.
+///
+/// Identity, artifact and observation-model checks only. Everything about
+/// whether the *analysis itself* was sound is [`crate::symbolic::classify`]'s
+/// job and is not repeated here.
+pub fn validate_identity(
+    contract_id: &str,
+    artifact_sha256: &str,
+    report: &crate::library_report::ContractReport,
+) -> Result<(), String> {
+    if report.contract != contract_id {
+        return Err(format!(
+            "it is about `{}`, not `{contract_id}`",
+            report.contract
+        ));
+    }
+    if report.symbol.contract != contract_id {
+        return Err(format!(
+            "its symbol binding resolved `{}`, not `{contract_id}`",
+            report.symbol.contract
+        ));
+    }
+    if report.artifact.sha256 != artifact_sha256 {
+        return Err(format!(
+            "it describes artifact {} and this obligation is about {artifact_sha256}; a result \
+             is a claim about one executable",
+            short(&report.artifact.sha256)
+        ));
+    }
+    // The per-case hash exists so a result stays interpretable after being
+    // split out of its report. If it disagrees with the report's own artifact,
+    // one of the two is describing something else.
+    if report.analysis.artifact_sha256 != report.artifact.sha256 {
+        return Err(format!(
+            "the case records artifact {} and the report records {}",
+            short(&report.analysis.artifact_sha256),
+            short(&report.artifact.sha256)
+        ));
+    }
+    Ok(())
+}
+
+/// Why a symbolic record does not cover enough to discharge the obligation, if
+/// it does not.
+///
+/// Separate from [`validate_identity`] because the two failures deserve
+/// different treatment: a record about another contract is about something
+/// else, while a record about *this* contract that covered less than the
+/// configuration asked for is genuine but insufficient evidence — and if it
+/// found a leak, insufficient coverage does not un-find it.
+pub fn validate_coverage(
+    configured: &[CheckFeature],
+    report: &crate::library_report::ContractReport,
+) -> Result<(), String> {
+    if !report.symbol.reached {
+        return Err(
+            "the analyzer did not report reaching the contract's symbol, so the run establishes \
+             nothing about it"
+                .to_string(),
+        );
+    }
+    // The observation model comes from the configuration, never from whichever
+    // checks the backend happened to run. A contract configured for control
+    // flow and memory addressing is not discharged by a result covering one of
+    // them, however clean.
+    let missing: Vec<&str> = configured
+        .iter()
+        .filter(|feature| !report.analysis.checked_features.contains(feature))
+        .map(|feature| feature.property())
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "the configuration requires {} and the result does not cover {}",
+            configured
+                .iter()
+                .map(|f| f.property())
+                .collect::<Vec<_>>()
+                .join(" and "),
+            missing.join(" and ")
+        ));
+    }
+    // Unreachable through configuration -- `ContractSettings::validate`
+    // rejects an empty `checks` list on load -- and checked anyway, because
+    // with an empty list the loop above compares nothing and a clean result
+    // would discharge an obligation that declared no observation model at all.
+    // A caller constructing settings in code must not be able to reach that.
+    if configured.is_empty() {
+        return Err(
+            "no observation class was configured, so a clean result would establish nothing"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn short(sha256: &str) -> String {
+    sha256.chars().take(12).collect()
 }
 
 /// Enforcement mode.
@@ -699,6 +897,7 @@ impl Plan {
             let required = policy.required_for(&declaration.id);
             let is_selected = chosen.contains(declaration.id.as_str());
             let mut settled: BTreeMap<Analysis, Status> = BTreeMap::new();
+            let symbolic_conflict = regression_expectation_conflict(config, &declaration.id);
             for analysis in &required {
                 if let Some(status) = settle(
                     declaration,
@@ -708,6 +907,7 @@ impl Plan {
                     available,
                     today,
                     config.settings(&declaration.id).is_some(),
+                    symbolic_conflict.as_deref(),
                 ) {
                     settled.insert(*analysis, status);
                 }
@@ -743,8 +943,36 @@ fn regression_expectation(config: &VerifyConfig, contract: &str) -> Option<Outco
     Outcome::parse(settings.expected_outcome.as_deref()?)
 }
 
+/// Whether a fixture declares one outcome for generated checking and another
+/// for symbolic verification, which this model cannot hold.
+///
+/// Only ever `Some` for a declared analyzer-regression fixture. A security
+/// contract has no expectation to conflict with: `CheckSettings::validate`
+/// refuses an `expected_outcome` on one, and its symbolic obligation is
+/// discharged by `VERIFIED_BOUNDED` or not at all.
+fn regression_expectation_conflict(config: &VerifyConfig, contract: &str) -> Option<String> {
+    let check = config.check.get(contract)?;
+    if check.expectation != crate::contract::Expectation::AnalyzerRegression {
+        return None;
+    }
+    let generated = Outcome::parse(check.expected_outcome.as_deref()?)?;
+    let symbolic = Outcome::parse(&config.verify.get(contract)?.expected_outcome)?;
+    if generated == symbolic {
+        return None;
+    }
+    Some(format!(
+        "`{contract}` is an analyzer-regression fixture declaring {generated} for generated \
+         checking and {symbolic} for symbolic verification. Both can be right -- a leak behind a \
+         public gate is reached by a solver and not by generated inputs -- but enforcement holds \
+         one expected outcome per contract, taken from [check], so the symbolic result would be \
+         judged against the generated expectation. Verify it with `cargo trace-check verify \
+         --contract {contract}` until expectations are modelled per analysis"
+    ))
+}
+
 /// What one requirement's status is before any backend runs, if it is already
 /// decided.
+#[allow(clippy::too_many_arguments)]
 fn settle(
     declaration: &ContractDeclaration,
     analysis: Analysis,
@@ -753,6 +981,7 @@ fn settle(
     available: &Available,
     today: &str,
     configured_for_symbolic: bool,
+    symbolic_conflict: Option<&str>,
 ) -> Option<Status> {
     // An expired waiver is not a waiver. It is reported as the gap it always
     // was, with its reason, so the lapse is visible rather than silent.
@@ -794,6 +1023,27 @@ fn settle(
                      the obligation with a reason",
                     declaration.id
                 ),
+            });
+        }
+    }
+    // An analyzer-regression fixture whose two backends are declared to behave
+    // differently cannot yet be enforced, because the enforcement model holds
+    // one expectation per contract and takes it from `[check]`.
+    //
+    // M9 produced the fixtures that make this concrete: a leak behind an exact
+    // public-input equality is `NO_LEAK_OBSERVED` to generated testing, which
+    // never guesses the gate, and `LEAK_DETECTED` to symbolic execution, which
+    // solves for it. Both are correct. Folding the symbolic result against the
+    // generated expectation would report the fixture as misbehaving when it is
+    // behaving exactly as declared.
+    //
+    // Settled as a gap, not papered over: strict CI fails, the reason names the
+    // configuration, and no result is attributed to the wrong expectation.
+    // Modelling expectations per analysis is M10.1.
+    if analysis == Analysis::Symbolic {
+        if let Some(detail) = symbolic_conflict {
+            return Some(Status::Inconclusive {
+                detail: detail.to_string(),
             });
         }
     }
@@ -2451,5 +2701,221 @@ mod tests {
             assert_eq!(parsed, analysis);
         }
         assert!(serde_json::from_str::<Analysis>("\"nonsense\"").is_err());
+    }
+
+    /// Clean symbolic evidence from the matching contract and artifact
+    /// discharges the symbolic obligation.
+    #[test]
+    fn valid_symbolic_evidence_discharges_a_symbolic_requirement() {
+        let report = crate::library_report::sample_contract_report();
+        let evidence = AnalysisEvidence::from_symbolic(
+            &report.contract.clone(),
+            &[CheckFeature::ControlFlow, CheckFeature::MemoryAccess],
+            &report.artifact.sha256.clone(),
+            Box::new(report),
+        );
+        assert_eq!(evidence.analysis, Analysis::Symbolic);
+        assert_eq!(evidence.outcome, Outcome::VerifiedBounded);
+        assert!(evidence.symbolic.is_some(), "the record travels with it");
+    }
+
+    /// A clean symbolic result about another contract cannot discharge this
+    /// contract's obligation.
+    #[test]
+    fn symbolic_evidence_for_another_contract_is_rejected() {
+        let report = crate::library_report::sample_contract_report();
+        let artifact = report.artifact.sha256.clone();
+        let evidence = AnalysisEvidence::from_symbolic(
+            "crypto::other::function",
+            &[CheckFeature::ControlFlow, CheckFeature::MemoryAccess],
+            &artifact,
+            Box::new(report),
+        );
+        assert_eq!(evidence.outcome, Outcome::Inconclusive);
+        assert!(
+            evidence.detail.contains("not `crypto::other::function`"),
+            "{}",
+            evidence.detail
+        );
+    }
+
+    /// A clean symbolic result about a different executable cannot discharge an
+    /// obligation about this one.
+    #[test]
+    fn symbolic_evidence_from_another_artifact_is_rejected() {
+        let report = crate::library_report::sample_contract_report();
+        let contract = report.contract.clone();
+        let evidence = AnalysisEvidence::from_symbolic(
+            &contract,
+            &[CheckFeature::ControlFlow, CheckFeature::MemoryAccess],
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            Box::new(report),
+        );
+        assert_eq!(evidence.outcome, Outcome::Inconclusive);
+        assert!(
+            evidence.detail.contains("one executable"),
+            "{}",
+            evidence.detail
+        );
+    }
+
+    /// A result the analyzer never attributed to the contract's symbol
+    /// establishes nothing about it.
+    #[test]
+    fn symbolic_evidence_that_never_reached_the_target_is_rejected() {
+        let mut report = crate::library_report::sample_contract_report();
+        report.symbol.reached = false;
+        let contract = report.contract.clone();
+        let artifact = report.artifact.sha256.clone();
+        let evidence = AnalysisEvidence::from_symbolic(
+            &contract,
+            &[CheckFeature::ControlFlow, CheckFeature::MemoryAccess],
+            &artifact,
+            Box::new(report),
+        );
+        assert_eq!(evidence.outcome, Outcome::Inconclusive);
+        assert!(evidence.detail.contains("reaching"), "{}", evidence.detail);
+    }
+
+    /// A result covering control flow alone cannot discharge an obligation that
+    /// declared memory addressing too.
+    ///
+    /// The observation model comes from the configuration. Reading it off
+    /// whichever checks the analyzer ran would let a result define the
+    /// requirement it satisfies.
+    #[test]
+    fn symbolic_evidence_missing_an_observation_class_is_rejected() {
+        let mut report = crate::library_report::sample_contract_report();
+        report.analysis.checked_features = vec![CheckFeature::ControlFlow];
+        let contract = report.contract.clone();
+        let artifact = report.artifact.sha256.clone();
+        let evidence = AnalysisEvidence::from_symbolic(
+            &contract,
+            &[CheckFeature::ControlFlow, CheckFeature::MemoryAccess],
+            &artifact,
+            Box::new(report),
+        );
+        assert_eq!(evidence.outcome, Outcome::Inconclusive);
+        assert!(
+            evidence.detail.contains("memory-address noninterference"),
+            "{}",
+            evidence.detail
+        );
+    }
+
+    /// A detected leak is never downgraded for covering less than the
+    /// configuration asked for. A satisfiable relational query against this
+    /// contract's own artifact is positive evidence, and a narrower observation
+    /// model does not un-discover it.
+    #[test]
+    fn a_detected_leak_survives_insufficient_coverage() {
+        let mut report = crate::library_report::sample_contract_report();
+        report.analysis.outcome = Outcome::LeakDetected;
+        report.analysis.checked_features = vec![CheckFeature::ControlFlow];
+        let contract = report.contract.clone();
+        let artifact = report.artifact.sha256.clone();
+        let evidence = AnalysisEvidence::from_symbolic(
+            &contract,
+            &[CheckFeature::ControlFlow, CheckFeature::MemoryAccess],
+            &artifact,
+            Box::new(report),
+        );
+        assert_eq!(
+            evidence.outcome,
+            Outcome::LeakDetected,
+            "nothing un-discovers a leak in this contract's own artifact"
+        );
+    }
+
+    /// A leak found in *another* contract's run is rejected rather than
+    /// attributed here.
+    ///
+    /// Fail-closed either way -- an unmet requirement fails too -- but
+    /// attributing a real finding to the wrong function sends a developer to
+    /// read code that is fine, and leaves the contract the leak belongs to
+    /// without it.
+    #[test]
+    fn a_leak_about_another_contract_is_rejected_rather_than_attributed() {
+        let mut report = crate::library_report::sample_contract_report();
+        report.analysis.outcome = Outcome::LeakDetected;
+        let artifact = report.artifact.sha256.clone();
+        let evidence = AnalysisEvidence::from_symbolic(
+            "crypto::other::function",
+            &[CheckFeature::ControlFlow, CheckFeature::MemoryAccess],
+            &artifact,
+            Box::new(report),
+        );
+        assert_eq!(evidence.outcome, Outcome::Inconclusive);
+        assert!(
+            evidence.detail.contains("not about this obligation"),
+            "{}",
+            evidence.detail
+        );
+    }
+
+    /// Generated evidence cannot discharge a symbolic requirement, and
+    /// symbolic evidence cannot discharge a generated one: the two want
+    /// different outcomes and no backend produces both.
+    #[test]
+    fn neither_backend_can_discharge_the_other_requirement() {
+        let inventory = inventory(&["crypto::tag::verify_tag"]);
+        let mut policy = PolicyConfig::default();
+        policy.contracts.insert(
+            "crypto::tag::verify_tag".to_string(),
+            ContractPolicy {
+                required: Some(vec![Analysis::Generated, Analysis::Symbolic]),
+            },
+        );
+        let config = VerifyConfig::empty();
+        let plan = Plan::resolve(
+            &inventory,
+            &config,
+            &policy,
+            &["crypto::tag::verify_tag".to_string()],
+            &Available::all(),
+            "2026-11-04",
+        );
+        let mut coverage = Coverage::from_plan(&plan, &inventory);
+
+        // A completed generated check, offered against both requirements.
+        coverage.fold(
+            "crypto::tag::verify_tag",
+            AnalysisEvidence::summary(
+                Analysis::Symbolic,
+                Outcome::NoLeakObserved,
+                "abcd",
+                "a dynamic run",
+            ),
+        );
+        let contract = coverage
+            .contract("crypto::tag::verify_tag")
+            .expect("present");
+        assert_eq!(
+            contract.status.get(&Analysis::Symbolic).map(Status::as_str),
+            Some("INCONCLUSIVE"),
+            "NO_LEAK_OBSERVED is not VERIFIED_BOUNDED"
+        );
+
+        let mut coverage = Coverage::from_plan(&plan, &inventory);
+        coverage.fold(
+            "crypto::tag::verify_tag",
+            AnalysisEvidence::summary(
+                Analysis::Generated,
+                Outcome::VerifiedBounded,
+                "abcd",
+                "a bounded search",
+            ),
+        );
+        let contract = coverage
+            .contract("crypto::tag::verify_tag")
+            .expect("present");
+        assert_eq!(
+            contract
+                .status
+                .get(&Analysis::Generated)
+                .map(Status::as_str),
+            Some("INCONCLUSIVE"),
+            "VERIFIED_BOUNDED for a different artifact is not a dynamic check of this one"
+        );
     }
 }

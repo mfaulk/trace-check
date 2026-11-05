@@ -1,0 +1,18 @@
+# M10.0 feasibility policy.
+#
+# Overlaid on examples/crypto-bigint-audit/trace-check.toml by
+# ci/verify-m10-feasibility.py. It requires *both* generated checking and
+# symbolic verification of one real contract, and leaves every other
+# declaration on the M8 default so the spike costs two backends on one contract
+# rather than thirty-six analyses.
+#
+# Not committed into the audit library's own configuration on purpose: the
+# standalone M9 acceptance checks read that file, and the spike must not change
+# what they measure.
+
+[policy]
+mode = "strict"
+default_required = ["generated"]
+
+[policy.contracts."cbaudit::monty::mul_both_secret"]
+required = ["generated", "symbolic"]

@@ -66,6 +66,43 @@ pub const RUSTFLAGS: [&str; 8] = [
     "link-arg=-static",
 ];
 
+/// Which backend's generated packages and executables a work directory holds.
+///
+/// A path component, not a capability: it exists so that two analyses of one
+/// contract in a single run cannot land on the same directory, the same Cargo
+/// target or -- the part that matters -- the same executable. A result is a
+/// claim about one artifact, and two backends build two different artifacts
+/// from the same contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    /// The only backend analyzing this contract in this run, which is what
+    /// every standalone command is. Keeps the layout earlier milestones used.
+    Standalone,
+    /// M6/M7's generated dynamic checking, under a unified run.
+    Generated,
+    /// M5's bounded symbolic verification, under a unified run.
+    Symbolic,
+}
+
+impl Backend {
+    fn as_str(self) -> &'static str {
+        match self {
+            Backend::Standalone => "standalone",
+            Backend::Generated => "generated",
+            Backend::Symbolic => "symbolic",
+        }
+    }
+
+    /// Cargo target directory name. `Standalone` keeps `target`, so a kept
+    /// artifact directory from an earlier milestone has the same shape.
+    fn target_dir_name(self) -> String {
+        match self {
+            Backend::Standalone => "target".to_string(),
+            other => format!("target-{}", other.as_str()),
+        }
+    }
+}
+
 /// Where generated packages, their Cargo output and the analyzed artifacts
 /// live for one run.
 ///
@@ -129,33 +166,65 @@ impl Workspace {
         matches!(self, Workspace::Kept(_))
     }
 
-    /// A fresh directory for one contract's generated packages.
+    /// A fresh directory for one contract's generated packages, under one
+    /// backend.
     ///
     /// `create_dir`, not `create_dir_all`: inside an atomically created private
     /// root nothing can pre-exist, so an `AlreadyExists` here means two
-    /// contracts collided on a name and is reported rather than written into.
-    fn contract_dir(&self, contract: &str) -> Result<PathBuf, HarnessError> {
+    /// contracts collided on a name *within one backend* and is reported rather
+    /// than written into.
+    ///
+    /// The backend is part of the path because M10 analyzes one contract with
+    /// more than one backend in a single run, and each backend builds its own
+    /// executable from its own generated package. Without the namespace the
+    /// second backend's `create_dir` fails on the first backend's directory --
+    /// a genuine collision check firing on two things that are not in
+    /// collision.
+    fn contract_dir(&self, contract: &str, backend: Backend) -> Result<PathBuf, HarnessError> {
         let contracts = share(&self.root().join("contracts"))?;
-        let directory = contracts.join(package_suffix(contract));
+        let directory = share(&contracts.join(backend.as_str()))?.join(package_suffix(contract));
         std::fs::create_dir(&directory)
             .map_err(|e| HarnessError::Io(format!("{}: {e}", directory.display())))?;
         Ok(directory)
     }
 
-    /// The Cargo target directory shared by every generated package in this
-    /// run.
+    /// The Cargo target directory shared by every generated package of one
+    /// backend in this run.
     ///
-    /// Shared on purpose: per-contract target directories rebuilt `core`, the
-    /// library and its dependencies for every contract and left hundreds of
-    /// megabytes behind. Each generated package is named after its contract, so
-    /// their binaries do not collide.
-    fn target_dir(&self) -> Result<PathBuf, HarnessError> {
-        share(&self.root().join("target"))
+    /// Shared across contracts on purpose: per-contract target directories
+    /// rebuilt `core`, the library and its dependencies for every contract and
+    /// left hundreds of megabytes behind. Each generated package is named after
+    /// its contract, so their binaries do not collide.
+    ///
+    /// Not shared across *backends*. The generated and symbolic harnesses are
+    /// built with different profiles and different link flags, so one target
+    /// directory would have each run invalidating the other's fingerprints --
+    /// and would put two executables that must never be confused for one
+    /// another in the same place.
+    fn target_dir(&self, backend: Backend) -> Result<PathBuf, HarnessError> {
+        share(&self.root().join(backend.target_dir_name()))
     }
 
-    /// The two directories one contract's build needs.
+    /// The two directories one contract's build needs, for a backend that is
+    /// the only one analyzing it in this run.
     pub fn directories_for(&self, contract: &str) -> Result<(PathBuf, PathBuf), HarnessError> {
-        Ok((self.contract_dir(contract)?, self.target_dir()?))
+        self.directories_for_backend(contract, Backend::Standalone)
+    }
+
+    /// The two directories one contract's build needs under a named backend.
+    ///
+    /// The seam a unified run uses, so the generated and symbolic analyses of
+    /// one contract own separate work directories, separate target directories
+    /// and therefore separate, independently hashed executables.
+    pub fn directories_for_backend(
+        &self,
+        contract: &str,
+        backend: Backend,
+    ) -> Result<(PathBuf, PathBuf), HarnessError> {
+        Ok((
+            self.contract_dir(contract, backend)?,
+            self.target_dir(backend)?,
+        ))
     }
 
     /// Target directory for M8's contract-inventory build.
@@ -848,13 +917,27 @@ pub fn build(
     // Target-scoped rather than in `RUSTFLAGS`, and `--target` is passed
     // explicitly below, so freestanding link flags never reach a host build
     // script or proc-macro crate.
+    //
+    // `--remap-path-prefix` is here for the same reason M6's generated harness
+    // carries it. The work directory is randomly named and `debug = true` bakes
+    // the generated source's absolute path into the DWARF, so without it two
+    // builds of one contract against one library produce two different
+    // artifact hashes. That hash *is* the artifact's identity in every report
+    // and in every enforcement decision -- M10 accepts symbolic evidence only
+    // when it names the artifact its obligation is about -- and an identity
+    // that changes every run cannot be compared to anything.
     let cargo_config = format!(
-        "[target.{SUPPORTED_TARGET}]\nrustflags = [{}]\n",
+        "[target.{SUPPORTED_TARGET}]\nrustflags = [{}, \"--remap-path-prefix\", {:?}]\n",
         RUSTFLAGS
             .iter()
             .map(|flag| format!("{flag:?}"))
             .collect::<Vec<_>>()
-            .join(", ")
+            .join(", "),
+        format!(
+            "{}={}",
+            crate_dir.display(),
+            crate::dynamic_harness::REMAPPED_HARNESS_DIR
+        )
     );
     write(&crate_dir.join("Cargo.toml"), &manifest)?;
     write(&crate_dir.join(".cargo/config.toml"), &cargo_config)?;
@@ -1582,6 +1665,30 @@ mod tests {
             .expect("created");
         assert_ne!(first, other);
         assert_eq!(target, same_target);
+    }
+
+    /// Two backends analyzing one contract get separate work and target
+    /// directories, while a collision within one backend is still refused.
+    #[test]
+    fn two_backends_analyze_one_contract_without_colliding() {
+        let workspace = Workspace::ephemeral().expect("created");
+        let contract = "cbaudit::monty::mul_both_secret";
+        let (generated, generated_target) = workspace
+            .directories_for_backend(contract, Backend::Generated)
+            .expect("created");
+        let (symbolic, symbolic_target) = workspace
+            .directories_for_backend(contract, Backend::Symbolic)
+            .expect("the symbolic backend must not collide with the generated one");
+        assert_ne!(generated, symbolic);
+        assert_ne!(
+            generated_target, symbolic_target,
+            "two backends must not share a Cargo target directory: their profiles and link \
+             flags differ, and their executables must never be confused"
+        );
+        // The collision check still fires within one backend.
+        workspace
+            .directories_for_backend(contract, Backend::Symbolic)
+            .expect_err("one backend must not reuse one contract's directory");
     }
 
     /// `nm` output parses to addresses and names, including demangled names

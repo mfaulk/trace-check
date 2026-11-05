@@ -30,12 +30,14 @@ pub const EXIT_INCOMPLETE: u8 = 2;
 
 /// Limits restated in every report, because a stored result outlives the
 /// conversation that produced it.
-pub const LIMITATIONS: [&str; 5] = [
+pub const LIMITATIONS: [&str; 7] = [
     "This report covers the `#[constant_time]` declarations compiled into one library target under one feature selection. Another feature combination may declare different contracts.",
     "It enforces declared requirements. It does not discover functions that ought to carry a declaration, and a function with no annotation is not accounted for here at all.",
     "An enforcement status says whether a required analysis happened. It is not a security outcome: see each contract's evidence for what was actually observed.",
     "A satisfied requirement is as strong as the analysis that satisfied it. A generated dynamic check is NO_LEAK_OBSERVED over the inputs it ran, never a proof.",
     "An exemption records that an obligation was waived. It establishes nothing about the contract, and never suppresses a detected leak.",
+    "Each analysis built and analyzed its own executable, and each result describes only that one. Two requirements satisfied for one contract are two results about two binaries, not one result about the function in general -- compare their `artifact_sha256` values. Neither is the production binary.",
+    "A symbolic VERIFIED_BOUNDED is scoped to the declared input domain, the exploration bound and the observation classes the contract's `[verify]` entry listed. Read the symbolic evidence's `input_domain`, `max_depth` and `checked_features`: it claims nothing outside them.",
 ];
 
 /// Toolchain and library provenance for the run.
