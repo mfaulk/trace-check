@@ -16,7 +16,7 @@
 #![cfg_attr(not(test), no_std)]
 
 use ml_kem::array::Array;
-use ml_kem::{Ciphertext, DecapsulationKey768, Decapsulate, MlKem768};
+use ml_kem::{Ciphertext, Decapsulate, DecapsulationKey768, MlKem768};
 use trace_check_macros::constant_time;
 
 /// Folds a 32-byte shared key into one byte in fixed work.

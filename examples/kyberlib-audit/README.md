@@ -5,12 +5,12 @@ Audit adapters that expose [`kyberlib`](https://crates.io/crates/kyberlib)
 of M11; the dependency is a pinned, unmodified crates.io release.
 
 ```sh
-# ten contracts, every expectation reproduced, exit 0
-cargo trace-check check --all-configured --ci --jobs 12 \
+# eleven contracts, every expectation reproduced, exit 0
+cargo trace-check check --all-contracts --ci --jobs 12 \
   --manifest-path examples/kyberlib-audit/Cargo.toml
 ```
 
-About 137 s and 158 MB. Outside the workspace, with its own lockfile.
+About 93 s and 159 MB. Outside the workspace, with its own lockfile.
 
 ## What is claimed, and why it matches the other audit
 

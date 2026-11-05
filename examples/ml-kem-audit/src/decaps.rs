@@ -78,12 +78,7 @@ pub fn decaps_valid_ciphertext(seed: &[u8; 64], m: &[u8; 32]) -> u8 {
 /// path a decapsulation oracle would attack, and the one a non-constant-time
 /// comparison or selection would expose.
 #[constant_time(secret = "seed", dynamic = false)]
-pub fn decaps_corrupted_ciphertext(
-    seed: &[u8; 64],
-    m: &[u8; 32],
-    position: u16,
-    delta: u8,
-) -> u8 {
+pub fn decaps_corrupted_ciphertext(seed: &[u8; 64], m: &[u8; 32], position: u16, delta: u8) -> u8 {
     let expanded = fixture::public_keygen(seed);
     let ciphertext = fixture::corrupted_ciphertext(&expanded, m, position, delta);
     let shared = fixture::with_key_level_secret(&expanded, |key, _| {

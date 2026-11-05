@@ -96,19 +96,9 @@ cases = 32
 expectation = "analyzer-regression"
 expected_outcome = "LEAK_DETECTED"
 
-# ------------------------------------------------------------------
-# M11.3 -- the symbolic attempt, recorded rather than omitted.
-#
-# ml-kem exposes no leaf operation: `algebra`, `compress`, `crypto`, `pke` and
-# `param` are all private modules, so the smallest thing an external audit can
-# point the symbolic backend at is a whole decapsulation preceded by key
-# generation. The entry exists so the attempt and its outcome are on the
-# record; `docs/audits/ml-kem/symbolic-feasibility.md` has the measurement.
-# ------------------------------------------------------------------
-
-[verify."mlkemaudit::decaps::decaps_valid_ciphertext"]
-description = "the bounded symbolic attempt on a whole ML-KEM-768 decapsulation"
-rationale = "recorded to establish what the backend actually does with a target of this size and shape, rather than asserting it is infeasible"
-max_depth = 2000000
-checks = ["control-flow", "memory-access"]
-expected_outcome = "INCONCLUSIVE"
+[check."mlkemaudit::controls::rejected_shared_key_branch"]
+description = "control 9: a branch on the shared key an invalid ciphertext produces"
+rationale = "the sensitivity control for the *implicit-rejection* secret, which control 8 does not reach. A valid ciphertext's shared key is Kp and depends on dk_pke, not on z; a rejected one is J(z || c) and depends on z, not on the decryption. The rejected path is the one a decapsulation oracle attacks, and it travels a hash this project has already caught losing provenance elsewhere, so it needs its own control rather than an argument by analogy. `the_rejected_key_depends_on_z` is the independent evidence that the branched-on value really is z-derived"
+cases = 96
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"

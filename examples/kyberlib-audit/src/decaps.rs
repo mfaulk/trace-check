@@ -27,7 +27,8 @@ pub fn decaps_valid_ciphertext(seed: &[u8; 64], m: &[u8; 32]) -> u8 {
     let (decap, encap) = fixture::public_keygen(seed);
     let (ciphertext, _) = fixture::valid_ciphertext(&encap, m);
     let shared = fixture::with_key_level_secret(&decap, |key, _| {
-        *key.decapsulate(&fixture::ciphertext(&ciphertext)).as_bytes()
+        *key.decapsulate(&fixture::ciphertext(&ciphertext))
+            .as_bytes()
     });
     consume_all_bytes(&shared) ^ VALID_TAG
 }
@@ -35,16 +36,12 @@ pub fn decaps_valid_ciphertext(seed: &[u8; 64], m: &[u8; 32]) -> u8 {
 /// Target B — one public byte of a valid ciphertext flipped, so the
 /// implicit-rejection path is the one taken.
 #[constant_time(secret = "seed", dynamic = false)]
-pub fn decaps_corrupted_ciphertext(
-    seed: &[u8; 64],
-    m: &[u8; 32],
-    position: u16,
-    delta: u8,
-) -> u8 {
+pub fn decaps_corrupted_ciphertext(seed: &[u8; 64], m: &[u8; 32], position: u16, delta: u8) -> u8 {
     let (decap, encap) = fixture::public_keygen(seed);
     let ciphertext = fixture::corrupted_ciphertext(&encap, m, position, delta);
     let shared = fixture::with_key_level_secret(&decap, |key, _| {
-        *key.decapsulate(&fixture::ciphertext(&ciphertext)).as_bytes()
+        *key.decapsulate(&fixture::ciphertext(&ciphertext))
+            .as_bytes()
     });
     consume_all_bytes(&shared) ^ CORRUPTED_TAG
 }

@@ -86,6 +86,18 @@ jobs:
           # committed fixture out of step with its generator.
           rustfmt --edition 2021 --check examples/crypto-bigint-audit/src/*.rs
           rustfmt --edition 2021 --check examples/crypto-bigint-audit/tests/functional.rs
+          rustfmt --edition 2021 --check examples/ml-kem-audit/src/*.rs
+          rustfmt --edition 2021 --check examples/ml-kem-audit/tests/functional.rs
+          rustfmt --edition 2021 --check examples/ml-kem-symbolic/src/lib.rs
+          rustfmt --edition 2021 --check examples/kyberlib-audit/src/*.rs
+          rustfmt --edition 2021 --check examples/kyberlib-audit/tests/functional.rs
+          rustfmt --edition 2021 --check examples/rsa-control/src/lib.rs
+          # The two halves of the M11.6 negative control share one source file
+          # through `include!`, which rustfmt does not follow, so it is checked
+          # by name here and the two `lib.rs` shims are checked as well.
+          rustfmt --edition 2021 --check examples/ml-dsa-control-vulnerable/src/contracts.rs
+          rustfmt --edition 2021 --check examples/ml-dsa-control-vulnerable/src/lib.rs
+          rustfmt --edition 2021 --check examples/ml-dsa-control-patched/src/lib.rs
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -124,6 +136,42 @@ jobs:
         run: |
           cargo test --locked --all-targets \
             --manifest-path examples/crypto-bigint-audit/Cargo.toml
+
+      # M11 level 1: the same rule as M9's, for six more out-of-workspace
+      # crates. No side-channel result is interpreted before the functional
+      # evidence passes -- an adapter that derives the wrong key or builds the
+      # wrong ciphertext leaves trace-check analyzing something that is not
+      # ML-KEM-768.
+      - name: Clippy the M11 audit crates and controls
+        run: |
+          set -euo pipefail
+          for crate in ml-kem-audit ml-kem-symbolic kyberlib-audit rsa-control \
+                       ml-dsa-control-vulnerable ml-dsa-control-patched; do
+            cargo clippy --locked --all-targets \
+              --manifest-path "examples/$crate/Cargo.toml" -- -D warnings
+          done
+
+      # The adapters against NIST's own ACVP vectors, which share no code with
+      # either library under audit. The decapsulation group carries five
+      # unmodified and five modified ciphertexts, so this is also the evidence
+      # that both paths through the FO transform are exercised.
+      # The committed vectors must be the ones that were extracted from NIST's
+      # files and reviewed. A fixture edited by hand would be an oracle that
+      # agrees with the adapter by construction, which is the one thing an
+      # independent oracle must never be. `--check-digest` needs nothing but
+      # the repository; `--check` re-derives from the pinned sources and is run
+      # when they are available locally.
+      - name: The M11 vector fixture is the reviewed extraction
+        run: python3 ci/gen-m11-vectors.py --check-digest
+
+      - name: The M11 adapters compute ML-KEM-768
+        run: |
+          set -euo pipefail
+          for crate in ml-kem-audit ml-kem-symbolic kyberlib-audit rsa-control \
+                       ml-dsa-control-vulnerable ml-dsa-control-patched; do
+            cargo test --locked --all-targets \
+              --manifest-path "examples/$crate/Cargo.toml"
+          done
 
       # A missing backend must fail rather than silently skip the end-to-end
       # tests. The fast suite runs first so an ordinary regression surfaces
@@ -497,6 +545,81 @@ jobs:
           python3 ci/verify-m8-contracts.py m9-contracts.json --expect-declared 18
           python3 ci/verify-m9-integration.py m9-contracts.json
 
+      # M11 level 2: the two independent audits. `verify-m11-audit.py` asserts
+      # the claims the audits' conclusions rest on rather than the exit code --
+      # the load-bearing controls by name and observation class, the
+      # classification boundary pair including that its clean half reports no
+      # diagnostics at all, and the upstream rejection-sampling frame that
+      # explains each seed-level outcome.
+      #
+      # The two targets are asserted to *disagree* about that last one: ml-kem's
+      # seed-level contracts are INCONCLUSIVE and kyberlib's is LEAK_DETECTED,
+      # which is what localizes the provenance loss. A change that made them
+      # agree would be a change in what the audit established.
+      # `--all-contracts`, not `--all-configured`: the claim is about every
+      # `#[constant_time]` declaration in the compiled library, so a declaration
+      # nobody wrote a `[check]` entry for must not be able to hide from the
+      # report *or* from the validator's expectations. It is also the only path
+      # `--jobs` affects, so the timings the audit publishes are measurements of
+      # the command line it prints.
+      #
+      # `--self-test` then mutates the report and requires each mutation to be
+      # caught. A validator that passes on a report with its load-bearing
+      # evidence deleted is not validating anything, and deleting it is the only
+      # way to know.
+      - name: The ml-kem audit establishes what it claims
+        run: |
+          set -euo pipefail
+          cargo run --locked --release -p cargo-trace-check -- check \
+            --all-contracts --ci --jobs 4 --format json \
+            --manifest-path examples/ml-kem-audit/Cargo.toml \
+            > m11-ml-kem.json
+          python3 ci/verify-m11-audit.py m11-ml-kem.json
+          python3 ci/verify-m11-audit.py --self-test m11-ml-kem.json
+
+      - name: The kyberlib audit establishes what it claims
+        run: |
+          set -euo pipefail
+          cargo run --locked --release -p cargo-trace-check -- check \
+            --all-contracts --ci --jobs 4 --format json \
+            --manifest-path examples/kyberlib-audit/Cargo.toml \
+            > m11-kyberlib.json
+          python3 ci/verify-m11-audit.py m11-kyberlib.json
+          python3 ci/verify-m11-audit.py --self-test m11-kyberlib.json
+
+      # The positive control is the one that matters most here: a tool that
+      # stops detecting a documented, externally reported secret-dependent
+      # operation has nothing useful to say about a clean result on anything
+      # else. RUSTSEC-2023-0071 has no patched version, so this does not
+      # depend on pinning an old release.
+      - name: The rsa positive control is still detected
+        run: |
+          set -euo pipefail
+          cargo run --locked --release -p cargo-trace-check -- check \
+            --all-configured --ci \
+            --manifest-path examples/rsa-control/Cargo.toml | tee m11-rsa.txt
+          grep -q "LEAK_DETECTED" m11-rsa.txt
+
+      # The negative control is recorded as *unavailable* on x86-64: the
+      # advisory's division is strength-reduced away, so neither half's result
+      # can demonstrate the latency blind spot. What CI holds is the
+      # disassembly fact that makes that the honest reading -- no division in
+      # either version's signing path. If a future toolchain emits one, this
+      # fails and docs/audits/controls.md has to be rewritten rather than
+      # quietly kept.
+      - name: The ml-dsa negative control's premise still holds
+        run: |
+          set -euo pipefail
+          for half in vulnerable patched; do
+            cargo run --locked --release -p cargo-trace-check -- check \
+              --all-configured --ci \
+              --manifest-path "examples/ml-dsa-control-$half/Cargo.toml"
+          done
+          # Reads the executable Memcheck analyzed, where `decompose` is inlined
+          # into the signing symbol, and accounts for every division in the
+          # library's code against a reviewed allowlist.
+          python3 ci/verify-m11-controls.py
+
       - name: Reproduce the demonstration
         run: cargo run --locked --release -p trace-check -- demo mac-compare
 
@@ -519,6 +642,8 @@ jobs:
             m6-generated.json
             m8-contracts.json
             m9-contracts.json
+            m11-ml-kem.json
+            m11-kyberlib.json
 
   # M9 level 2: the upstream-mutation experiments. A separate job because each
   # one stages its own copy of the dependency and analyzes it under Valgrind,

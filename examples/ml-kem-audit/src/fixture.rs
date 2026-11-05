@@ -21,7 +21,7 @@
 //! operation.
 
 use crate::layout::{
-    CIPHERTEXT_LEN, DK_PKE_LEN, EXPANDED_LEN, EK_OFFSET, H_OFFSET, SEED_LEN, Z_OFFSET,
+    CIPHERTEXT_LEN, DK_PKE_LEN, EK_OFFSET, EXPANDED_LEN, H_OFFSET, SEED_LEN, Z_OFFSET,
 };
 use ml_kem::array::Array;
 use ml_kem::{Ciphertext, DecapsulationKey768, EncapsulationKey768, MlKem768, Seed};
@@ -49,7 +49,8 @@ pub fn seed_array(seed: &[u8; SEED_LEN]) -> Seed {
 /// type, not of any input value.
 #[inline(always)]
 pub fn ciphertext(bytes: &[u8; CIPHERTEXT_LEN]) -> Ciphertext<MlKem768> {
-    Ciphertext::<MlKem768>::try_from(bytes.as_slice()).expect("1088 bytes is an ML-KEM-768 ciphertext")
+    Ciphertext::<MlKem768>::try_from(bytes.as_slice())
+        .expect("1088 bytes is an ML-KEM-768 ciphertext")
 }
 
 /// Derives a genuine ML-KEM-768 key from `seed`, with key generation **outside**

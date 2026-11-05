@@ -9,6 +9,11 @@
 //! Three results, and the third is the interesting one — see
 //! `docs/audits/kyberlib/findings.md`.
 
+// The encapsulation group is unused here: `kyberlib` encapsulates through an
+// RNG, so a vector supplying explicit randomness has no entry point to use.
+// Allowed rather than trimmed, because the fixture belongs to the other audit
+// and must stay byte-identical to what its generator produces.
+#[allow(dead_code)]
 #[path = "../../ml-kem-audit/tests/vectors/acvp.rs"]
 mod acvp;
 
@@ -16,7 +21,7 @@ use acvp::{DECAPSULATION, KEY_GEN};
 use kyberaudit::fixture::{self, PK_OFFSET, SECRET_KEY_LEN, SEED_LEN};
 
 fn unhex(hex: &str) -> Vec<u8> {
-    assert!(hex.len() % 2 == 0);
+    assert!(hex.len().is_multiple_of(2));
     (0..hex.len() / 2)
         .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).expect("vector hex"))
         .collect()
@@ -33,8 +38,16 @@ fn key_derivation_matches_the_acvp_vectors() {
         seed[32..].copy_from_slice(&unhex(z));
 
         let (decap, encap) = fixture::public_keygen(&seed);
-        assert_eq!(decap.as_bytes().to_vec(), unhex(dk), "tcId {tc}: secret key");
-        assert_eq!(encap.as_bytes().to_vec(), unhex(ek), "tcId {tc}: public key");
+        assert_eq!(
+            decap.as_bytes().to_vec(),
+            unhex(dk),
+            "tcId {tc}: secret key"
+        );
+        assert_eq!(
+            encap.as_bytes().to_vec(),
+            unhex(ek),
+            "tcId {tc}: public key"
+        );
         assert_eq!(
             decap.as_bytes()[PK_OFFSET..PK_OFFSET + 1184].to_vec(),
             unhex(ek),
@@ -75,19 +88,42 @@ fn decapsulation_matches_the_acvp_vectors_on_both_paths() {
 }
 
 /// The blob API the vector test uses and the typed API the contracts use
-/// compute the same shared secret, so the functional evidence transfers to the
-/// code actually analyzed.
+/// compute the same shared secret, **on both ciphertext paths**, so the
+/// functional evidence transfers to the code actually analyzed.
+///
+/// Both paths matter because they are different computations: a valid
+/// ciphertext's shared secret comes from the decryption and re-encryption, a
+/// rejected one from the implicit-rejection seed. Agreement on the valid path
+/// alone would leave the rejection path resting on source inspection, and the
+/// NIST vectors reach it only through the blob API.
 #[test]
 fn the_blob_and_typed_paths_agree() {
     let seed = [21u8; SEED_LEN];
     let m = [5u8; 32];
     let (decap, encap) = fixture::public_keygen(&seed);
-    let (ciphertext, expected) = fixture::valid_ciphertext(&encap, &m);
+    let (valid, expected) = fixture::valid_ciphertext(&encap, &m);
+    let rejecting = fixture::corrupted_ciphertext(&encap, &m, 11, 0x30);
 
-    let typed = *decap.decapsulate(&fixture::ciphertext(&ciphertext)).as_bytes();
-    #[allow(deprecated)]
-    let blob = kyberlib::decapsulate(&ciphertext, decap.as_bytes()).expect("lengths are constants");
-
-    assert_eq!(typed, expected, "the typed path recovers the shared secret");
-    assert_eq!(blob.to_vec(), typed.to_vec());
+    for (name, ciphertext) in [("valid", valid), ("rejecting", rejecting)] {
+        let typed = *decap
+            .decapsulate(&fixture::ciphertext(&ciphertext))
+            .as_bytes();
+        #[allow(deprecated)]
+        let blob =
+            kyberlib::decapsulate(&ciphertext, decap.as_bytes()).expect("lengths are constants");
+        assert_eq!(
+            blob.to_vec(),
+            typed.to_vec(),
+            "{name} ciphertext, compared at full width"
+        );
+        if name == "valid" {
+            assert_eq!(typed, expected, "the typed path recovers the shared secret");
+        } else {
+            assert_ne!(
+                typed, expected,
+                "and implicitly rejects the corrupted one, so the two paths really \
+                 are two paths"
+            );
+        }
+    }
 }

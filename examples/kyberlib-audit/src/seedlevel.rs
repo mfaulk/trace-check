@@ -7,7 +7,6 @@
 //! audit alone cannot: is the lost provenance a property of one implementation,
 //! or of taint tracking through a sponge?
 
-use crate::fixture::{self, SEED_LEN};
 use crate::sink::consume_all_bytes;
 use trace_check_macros::constant_time;
 
@@ -28,6 +27,7 @@ pub fn keygen_and_decaps(seed: &[u8; 64], ciphertext: &[u8; 1088]) -> u8 {
 mod tests {
     use super::*;
     use crate::decaps::decaps_bytes;
+    use crate::fixture::SEED_LEN;
 
     /// Both encodings compute the same function: the boundary changes what is
     /// claimed, never what is computed.

@@ -25,14 +25,14 @@ mod vectors {
     pub mod acvp;
 }
 
+use ml_kem::Decapsulate;
 use mlkemaudit::fixture;
 use mlkemaudit::layout::{CIPHERTEXT_LEN, EK_OFFSET, EXPANDED_LEN, H_OFFSET, SEED_LEN};
-use ml_kem::Decapsulate;
 use vectors::acvp::{DECAPSULATION, ENCAPSULATION, KEY_GEN};
 
 /// Decodes lowercase hex, panicking on anything that is not a vector.
 fn unhex(hex: &str) -> Vec<u8> {
-    assert!(hex.len() % 2 == 0, "hex must be whole bytes");
+    assert!(hex.len().is_multiple_of(2), "hex must be whole bytes");
     (0..hex.len() / 2)
         .map(|index| {
             u8::from_str_radix(&hex[2 * index..2 * index + 2], 16).expect("vector hex is valid")
@@ -78,7 +78,10 @@ fn key_derivation_matches_the_acvp_vectors() {
 /// genuine ML-KEM-768 ciphertext rather than something merely well-formed.
 #[test]
 fn encapsulation_matches_the_acvp_vectors() {
-    assert!(ENCAPSULATION.len() >= 25, "the fixture must not shrink silently");
+    assert!(
+        ENCAPSULATION.len() >= 25,
+        "the fixture must not shrink silently"
+    );
     for &(tc, ek, m, c, k) in ENCAPSULATION {
         let (ciphertext, shared) = fixture::encapsulate_to(&unhex(ek), &fixed::<32>(m));
         assert_eq!(ciphertext.to_vec(), unhex(c), "tcId {tc}: ciphertext");
@@ -114,7 +117,10 @@ fn decapsulation_matches_the_acvp_vectors_on_both_paths() {
 
     // Both FO paths covered, by NIST's own classification rather than by
     // inference from the inputs.
-    assert!(unmodified >= 5, "unmodified ciphertext vectors: {unmodified}");
+    assert!(
+        unmodified >= 5,
+        "unmodified ciphertext vectors: {unmodified}"
+    );
     assert!(modified >= 5, "modified ciphertext vectors: {modified}");
 }
 

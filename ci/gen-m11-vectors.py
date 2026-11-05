@@ -27,6 +27,7 @@ Fetch them with:
 Usage:
     ci/gen-m11-vectors.py --acvp-dir DIR            # rewrite the committed fixture
     ci/gen-m11-vectors.py --acvp-dir DIR --check    # fail if the fixture is out of date
+    ci/gen-m11-vectors.py --check-digest            # hermetic: fixture vs its recorded hash
 """
 
 import argparse
@@ -47,6 +48,18 @@ SOURCES = {
     "key-gen.json": "0fdca41ed30f49c828af80c73a6424ece3accc1e3430ae14492363aaadeb0e48",
     "encap-decap.json": "4b5afd6c7075b1ffebc099a70dcf907b189daadd42921223127732e3ec83c333",
 }
+
+# The digest of the committed extraction, recorded when it was generated from
+# the sources above.
+#
+# `--check` needs those sources and so cannot run in a hermetic CI job;
+# `--check-digest` needs nothing but the repository, and catches the failure
+# that actually matters -- a fixture edited by hand to agree with an adapter,
+# which is the one thing an independent oracle must never do. Both are real
+# checks and neither replaces the other: this one says "the committed bytes are
+# the bytes somebody generated and reviewed", and `--check` says "those bytes
+# are what NIST's files produce".
+FIXTURE_SHA256 = "9efb3554ab60976bf2238de27badedb07a9da9239002a2360f983d82e6d44365"
 
 # Widths of the ML-KEM-768 encodings, in bytes. A vector whose field is the
 # wrong width is a vector for another parameter set, and silently accepting one
@@ -197,7 +210,6 @@ def main() -> int:
     parser.add_argument(
         "--acvp-dir",
         type=pathlib.Path,
-        required=True,
         help="directory holding key-gen.json and encap-decap.json",
     )
     parser.add_argument(
@@ -205,7 +217,34 @@ def main() -> int:
         action="store_true",
         help="exit non-zero if the committed fixture differs from the extraction",
     )
+    parser.add_argument(
+        "--check-digest",
+        action="store_true",
+        help="verify the committed fixture against its recorded SHA-256, with no "
+        "need for the ACVP sources. Hermetic, and what CI runs",
+    )
     args = parser.parse_args()
+
+    if args.check_digest:
+        if not FIXTURE.is_file():
+            print(f"{FIXTURE} is missing", file=sys.stderr)
+            return 1
+        digest = hashlib.sha256(FIXTURE.read_bytes()).hexdigest()
+        if digest != FIXTURE_SHA256:
+            print(
+                f"{FIXTURE} has SHA-256 {digest}, expected {FIXTURE_SHA256}.\n"
+                "The committed vectors are not the ones that were extracted and "
+                "reviewed. Regenerate from the pinned ACVP sources with --acvp-dir "
+                "and update FIXTURE_SHA256 in the same commit; do not edit the "
+                "fixture by hand.",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"{FIXTURE} matches its recorded digest ({len(SOURCES)} pinned source(s))")
+        return 0
+
+    if args.acvp_dir is None:
+        parser.error("--acvp-dir is required unless --check-digest is given")
 
     rendered = render(*collect(args.acvp_dir))
 
@@ -224,7 +263,10 @@ def main() -> int:
 
     FIXTURE.parent.mkdir(parents=True, exist_ok=True)
     FIXTURE.write_text(rendered)
+    digest = hashlib.sha256(FIXTURE.read_bytes()).hexdigest()
     print(f"wrote {FIXTURE} ({len(rendered)} bytes)")
+    if digest != FIXTURE_SHA256:
+        print(f"set FIXTURE_SHA256 = \"{digest}\" in this script, in this commit")
     return 0
 
 
