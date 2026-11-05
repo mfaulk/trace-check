@@ -550,3 +550,76 @@ fn the_inverse_disagreement_is_enforced_too() {
     let symbolic = contract.evidence_for(Analysis::Symbolic).expect("present");
     assert_ne!(generated.artifact_sha256, symbolic.artifact_sha256);
 }
+
+/// Two tables declaring different purposes for one contract is refused when the
+/// configuration loads, before any backend runs.
+///
+/// The dangerous direction is explicit: `[check]` saying `security-contract`
+/// with `[verify]` saying `analyzer-regression` would make the contract a
+/// fixture, so one section would override the other's stated security intent
+/// and a declared leak would satisfy strict CI.
+///
+/// Distinct from the covered case of one table declaring a purpose while the
+/// other is silent, which is a complete declaration and stays legal.
+#[test]
+fn contradictory_contract_purposes_are_refused_at_load() {
+    const CONTESTED: &str = "crypto::operation";
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join(CONFIG_FILE);
+    let write = |check_purpose: &str, verify_purpose: &str| {
+        std::fs::write(
+            &path,
+            format!(
+                "schema_version = 1\n\n[check.\"{CONTESTED}\"]\n{check_purpose}\n\n\
+                 [verify.\"{CONTESTED}\"]\nmax_depth = 4000\n\
+                 checks = [\"control-flow\", \"memory-access\"]\n\
+                 expected_outcome = \"LEAK_DETECTED\"\n{verify_purpose}\n"
+            ),
+        )
+        .expect("write the configuration");
+    };
+
+    // The contradiction.
+    write(
+        "expectation = \"security-contract\"",
+        "expectation = \"analyzer-regression\"",
+    );
+    let error = VerifyConfig::load(&path).expect_err("a contradiction must be refused");
+    let message = error.to_string();
+    assert!(message.contains("security-contract"), "{message}");
+    assert!(message.contains("analyzer-regression"), "{message}");
+    assert!(
+        message.contains("State the purpose once"),
+        "the refusal must say what to do: {message}"
+    );
+
+    // The same contradiction the other way round.
+    write(
+        "expectation = \"analyzer-regression\"\nexpected_outcome = \"LEAK_DETECTED\"",
+        "expectation = \"security-contract\"",
+    );
+    VerifyConfig::load(&path).expect_err("a contradiction must be refused either way round");
+
+    // Agreement is fine.
+    write(
+        "expectation = \"analyzer-regression\"\nexpected_outcome = \"LEAK_DETECTED\"",
+        "expectation = \"analyzer-regression\"",
+    );
+    let config = VerifyConfig::load(&path).expect("agreeing declarations are valid");
+    assert_eq!(
+        config.purpose(CONTESTED),
+        trace_check::contract::Expectation::AnalyzerRegression
+    );
+
+    // And so is one table declaring it while the other stays silent, which is
+    // the shape every fixture in this repository already uses.
+    write(
+        "expectation = \"analyzer-regression\"\nexpected_outcome = \"LEAK_DETECTED\"",
+        "",
+    );
+    let config = VerifyConfig::load(&path).expect("a silent table does not contradict");
+    assert_eq!(
+        config.purpose(CONTESTED),
+        trace_check::contract::Expectation::AnalyzerRegression
+    );
+}

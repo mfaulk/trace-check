@@ -2539,7 +2539,7 @@ mod tests {
         regression.check.insert(
             "crypto::a::probe".to_string(),
             CheckSettings {
-                expectation: Expectation::AnalyzerRegression,
+                declared_expectation: Some(Expectation::AnalyzerRegression),
                 expected_outcome: Some("LEAK_DETECTED".to_string()),
                 ..CheckSettings::default()
             },
@@ -2598,7 +2598,7 @@ mod tests {
         config.check.insert(
             "crypto::a::probe".to_string(),
             CheckSettings {
-                expectation: Expectation::AnalyzerRegression,
+                declared_expectation: Some(Expectation::AnalyzerRegression),
                 expected_outcome: Some("LEAK_DETECTED".to_string()),
                 ..CheckSettings::default()
             },
@@ -2996,7 +2996,7 @@ mod tests {
         config.check.insert(
             "crypto::a::probe".to_string(),
             CheckSettings {
-                expectation: Expectation::AnalyzerRegression,
+                declared_expectation: Some(Expectation::AnalyzerRegression),
                 expected_outcome: Some("NO_LEAK_OBSERVED".to_string()),
                 ..CheckSettings::default()
             },
@@ -3046,7 +3046,7 @@ mod tests {
         config.check.insert(
             "crypto::a::probe".to_string(),
             CheckSettings {
-                expectation: Expectation::AnalyzerRegression,
+                declared_expectation: Some(Expectation::AnalyzerRegression),
                 expected_outcome: Some("NO_LEAK_OBSERVED".to_string()),
                 ..CheckSettings::default()
             },
