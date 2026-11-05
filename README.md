@@ -24,7 +24,8 @@ the formal noninterference property, and the roadmap.
 | M8 | Complete contract coverage and enforcement | complete, experimental |
 | M9 | Real-world cryptography integration — auditing `crypto-bigint` | complete, experimental |
 | M10 | Unified multi-backend verification and CI enforcement | complete, experimental |
-| M11 | Hardware-oriented validation — statistical timing | future |
+| M11 | Independent cryptographic audit — vulnerability discovery in upstream code | planned |
+| M12 | Hardware-oriented validation — statistical timing | future |
 
 `trace-check` turns that idea into reproducible analysis, from five directions:
 
