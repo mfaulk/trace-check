@@ -42,9 +42,13 @@ Usage:
 
 `--unified` runs the mutation through `check --all-contracts --ci` instead,
 with a policy requiring both generated and symbolic analysis of the affected
-contract. The exit code and the survival of *both* analyses are what it checks:
-a run that stopped at the first failure would report one backend and leave the
-other un-analyzed.
+contract. It runs the clean dependency through the *same* policy first and
+requires it to pass: without that, a leaking run proves nothing about the
+mutation, because the policy might have been unsatisfiable to begin with.
+
+What it checks is the transition, the exit codes, and the survival of *both*
+analyses in both reports -- a run that stopped at the first failure would
+report one backend and leave the other un-analyzed.
 
     ci/mutate-m9.py --mutation mutation-a-carry-branch \
         --contract cbaudit::add::wrapping_add_secret_left \
@@ -343,16 +347,24 @@ def unified_policy(work, contract, base_config):
     them would make this experiment test a different configuration from the one
     the project ships.
 
-    Every *other* contract is given a requirement this build cannot satisfy, so
-    the run schedules only the contract under test. Eighteen generated checks
-    and three symbolic verifications to observe one mutation would be a slow
-    way to learn nothing extra -- and the contracts are all `dynamic = false`,
-    so `dynamic` settles as UNSUPPORTED without running anything.
+    `default_required = ["generated"]` deliberately, so a *clean* dependency
+    passes this policy. An earlier version required `dynamic` of everything
+    else, which every audit contract declares `dynamic = false`; strict
+    enforcement was then incomplete whatever the mutation did, so the run could
+    only ever exit 2 or 1 and the experiment could not show a clean baseline
+    becoming a leaking one. The audit's own `[check]` entries already declare
+    what each contract is expected to produce, including the eleven controls
+    that are supposed to be detected, so the whole suite passes on an
+    unmutated dependency.
+
+    The contract under test additionally owes symbolic verification, with its
+    observation model stated as part of the obligation rather than left to the
+    configuration.
     """
     text = base_config.read_text()
     text += (
         "\n[policy]\nmode = \"strict\"\n"
-        "default_required = [\"dynamic\"]\n\n"
+        "default_required = [\"generated\"]\n\n"
         f'[policy.contracts."{contract}"]\n'
         'required = ["generated", "symbolic"]\n'
         'observations = ["control-flow", "memory-access"]\n'
@@ -419,7 +431,24 @@ def check_replay(manifest, reproducer):
         fail(f"replaying {reproducer} produced no report:\n{result.stdout}{result.stderr}")
 
 
-def require_unified(run, expect_outcome, expect_exit):
+def require_controlled(baseline, mutated):
+    """The patch must be the only variable between the two runs."""
+    if baseline.artifact == mutated.artifact:
+        fail(
+            "the clean and mutated runs analyzed the same artifact hash, so the mutated "
+            "build was not actually analyzed"
+        )
+    if baseline.graph_digest != mutated.graph_digest:
+        fail(
+            "the clean and mutated runs resolved different dependency graphs "
+            f"({baseline.graph_digest[:12]} against {mutated.graph_digest[:12]}), so the "
+            "comparison is not controlled"
+        )
+    print(f"artifacts:    {baseline.artifact[:12]} != {mutated.artifact[:12]}")
+    print("graphs:       identical")
+
+
+def require_unified(run, expect_outcome, expect_exit, label):
     """Holds a unified run to the outcome, the exit code, and both analyses.
 
     The exit code is checked separately from the outcomes because it encodes a
@@ -432,26 +461,26 @@ def require_unified(run, expect_outcome, expect_exit):
     outcomes = {name: item["outcome"] for name, item in by_analysis.items()}
     if expect_outcome not in outcomes.values():
         fail(
-            f"[mutated] no backend reported {expect_outcome}; the unified run saw {outcomes}"
+            f"[{label}] no backend reported {expect_outcome}; the unified run saw {outcomes}"
         )
     # Every analysis that reported is still in the report: a backend failing
     # must not discard what another established.
     for analysis in ("generated", "symbolic"):
         if analysis not in by_analysis:
-            fail(f"[mutated] {analysis} evidence is missing from the report")
+            fail(f"[{label}] {analysis} evidence is missing from the report")
     states = {name: value["state"] for name, value in (row.get("status") or {}).items()}
     if expect_outcome == "LEAK_DETECTED" and "leak-detected" not in states.values():
         fail(
-            f"[mutated] a leak was reported as evidence but no requirement is "
+            f"[{label}] a leak was reported as evidence but no requirement is "
             f"leak-detected: {states}"
         )
     if expect_exit is not None and run.unified_exit != expect_exit:
         fail(
-            f"[mutated] the unified run exited {run.unified_exit}, expected {expect_exit}. "
+            f"[{label}] the unified run exited {run.unified_exit}, expected {expect_exit}. "
             "A detected leak must outrank an incomplete analysis"
         )
-    print(f"[mutated] statuses:    {states}")
-    print(f"[mutated] both analyses preserved, exit {run.unified_exit}")
+    print(f"[{label}] statuses:    {states}")
+    print(f"[{label}] both analyses preserved, exit {run.unified_exit}")
 
 
 class Run:
@@ -675,6 +704,30 @@ def main():
             print("PASS")
             return
 
+        if arguments.unified:
+            # The clean baseline through the *same* unified policy, so the
+            # experiment demonstrates a transition rather than only an outcome.
+            # Without it a leaking run proves nothing about the mutation: the
+            # policy might have been unsatisfiable to begin with.
+            baseline = experiment(
+                root / "clean", source, None, arguments.contract, "clean", unified=True
+            )
+            require_unified(baseline, "NO_LEAK_OBSERVED", 0, "clean")
+            mutated = experiment(
+                root / "mutated",
+                source,
+                patch,
+                arguments.contract,
+                "mutated",
+                unified=True,
+            )
+            require_unified(
+                mutated, arguments.expect_outcome, arguments.expect_exit, "mutated"
+            )
+            require_controlled(baseline, mutated)
+            print("PASS")
+            return
+
         baseline = None
         if arguments.compare_clean:
             # A separate staging directory per run: never a shared tree that
@@ -694,10 +747,6 @@ def main():
             reproducers=arguments.verify_reproducer,
             unified=arguments.unified,
         )
-        if arguments.unified:
-            require_unified(mutated, arguments.expect_outcome, arguments.expect_exit)
-            print("PASS")
-            return
         require_outcome(mutated.evidence, arguments.expect_outcome, "mutated")
         if arguments.expect_class:
             require_class(mutated.evidence, arguments.expect_class, "mutated")

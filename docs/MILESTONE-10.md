@@ -1,6 +1,7 @@
 # Milestone 10 — Unified Multi-Backend Verification and CI Enforcement
 
-**Status:** Implemented. M10.0–M10.8 complete; the outstanding items are in §11.
+**Status:** Implemented. M10.0–M10.8 complete, with a review round recorded in
+§11; the outstanding items are in §13.
 **Branch:** `feat/m10-unified-verification`, then one branch per package
 **Prerequisite:** Milestone 9, merged
 **Primary platform:** Linux x86-64, pinned Rust toolchain
@@ -705,22 +706,40 @@ differ, and the adapter's own tests including the 1012 independent-oracle
 vectors must still pass, so a mutation that changed the *arithmetic* is
 rejected rather than reported as a side channel.
 
-Acceptance experiment C, measured:
+Acceptance experiment C, measured. Both dependencies run through the **same**
+unified policy, so what is demonstrated is a transition and not merely an
+outcome:
 
 ```
+[clean]   generated: NO_LEAK_OBSERVED in 7eb93e534e8f
+[clean]   symbolic:  VERIFIED_BOUNDED in 5f23c0b6e6d6
+[clean]   exit code:   0
+[clean]   statuses:    {'generated': 'checked', 'symbolic': 'checked'}
+
 [mutated] mutation:    mutation-a-carry-branch.patch
 [mutated] functional:  inline tests and the 1012 oracle vectors pass
-[mutated] generated: LEAK_DETECTED in 86bbb88eedf5
-[mutated] symbolic:  LEAK_DETECTED in c8300aff3169
+[mutated] generated: LEAK_DETECTED in 5a5a1247b3d5
+[mutated] symbolic:  LEAK_DETECTED in ac9c274433aa
 [mutated] exit code:   1
 [mutated] statuses:    {'generated': 'leak-detected', 'symbolic': 'leak-detected'}
-[mutated] both analyses preserved, exit 1
+
+artifacts:    7eb93e534e8f != 5a5a1247b3d5
+graphs:       identical
 ```
 
-Both backends found the planted carry branch, in two different executables, and
-the run exited 1. The script fails if either analysis is **missing** from the
-report, which is the half that matters: a run stopping at the first failure
-would report one backend and leave the other un-analyzed.
+A clean dependency passes the policy and exits 0; the mutated one is found by
+both backends, in two different executables, and exits 1. The dependency graphs
+are identical and the artifacts are not, so the patch is the only variable.
+
+The clean baseline is what makes this an experiment. Without it a leaking run
+proves nothing about the mutation: the policy might have been unsatisfiable to
+begin with — and in the first version of this script it was, because it
+required `dynamic` of every other contract and every audit contract declares
+`dynamic = false`.
+
+The script also fails if either analysis is **missing** from either report. A
+run stopping at the first failure would report one backend and leave the other
+un-analyzed.
 
 ### What orchestration costs
 
@@ -773,7 +792,69 @@ graph, which is not what this measures.
 
 ---
 
-## 11. Definition of done
+## 11. Review round: seven corrections
+
+A review of the stacked implementation found seven defects. All are fixed, each
+with a regression that fails when the fix is reverted. Two are worth recording
+in full, because both are instances of the same mistake.
+
+### Evidence gated on an obligation
+
+Twice in this milestone, something was gated on a *requirement* when it existed
+independently of one.
+
+**A leak found by a test that ran could be discarded.** `dynamic` is a whole
+test suite rather than a per-contract job, so a policy requiring it of one
+contract makes the run execute *every* targeted `#[ct_test]` — including tests
+bound to contracts that require nothing dynamic. Folding results only for
+contracts with an outstanding dynamic obligation threw the rest away. A
+hand-written test that reached a secret-dependent branch in a contract whose
+generated corpus happened to be clean was silently dropped, and the run could
+pass strict CI having executed a test that found a leak. That is the one thing
+the milestone's central rule forbids outright.
+
+Evidence is now folded for every contract with a bound test.
+`Coverage::fold_supplemental` keeps it without writing a status, because an
+unrequired analysis has no obligation to discharge and recording `CHECKED`
+against one would claim the contract was held to something it never was.
+`violated()` reads evidence as well as statuses, so the leak fails the contract
+either way.
+
+**And the same mistake again, one package later.** Driving the fold from the
+execution plan re-gated it on a dynamic *job* existing — `execution.dynamic` is
+`Some` only when some contract has an outstanding dynamic requirement — so a
+run where the only such contract was already settled folded nothing at all. The
+job now decides which results get a status, never which get kept. The
+unresolved-target diagnostic had already been fixed for exactly this reason
+during M10.5; the lesson did not generalise the first time.
+
+### Provenance that described the wrong compiler, twice more
+
+M10.2 fixed the generated and symbolic harnesses. It missed two others.
+
+**M3 test binaries** were built with the ambient toolchain while their evidence
+recorded `library.toolchain` — so pointed at a library elsewhere with
+`--manifest-path`, the test executables were compiled by a different compiler
+from every other artifact and from the one their own identity claimed. The
+toolchain is threaded through `build_test_binaries`; `cargo trace-check test`
+passes `None`, because it runs in the project it is testing.
+
+**The symbolic report's `compilation.rustc`** came from `AnalyzerIdentity`,
+measured in trace-check's own environment. The artifact was built correctly and
+the document disagreed with itself. It now comes from the library's toolchain.
+
+### The remaining five
+
+| Finding | Fix |
+| --- | --- |
+| `[check]` saying `security-contract` with `[verify]` saying `analyzer-regression` made the contract a fixture, so one section overrode the other's explicit security intent | `[check]`'s purpose is `Option`, so silence is distinguishable from an explicit default; contradictory declarations are refused at load |
+| `allow_inactive_config` suppressed unresolved `#[ct_test]` bindings along with inactive configuration | the two are scoped separately; an unresolved test binding always blocks |
+| the leak-site diagnostic paired `finding.site` with `fingerprint.function`, which are different frames — rendering an upstream mutation as the adapter's line beside the library's function | instruction and function come from one frame; the contract's frame is labelled as attribution and shown only when it differs |
+| the unified mutation experiment never established a clean baseline, and its policy made strict enforcement incomplete regardless | both dependencies run through the same policy; the clean one must pass and exit 0 before the mutated one is required to fail |
+
+---
+
+## 12. Definition of done
 
 The milestone plan's checklist, against what is built. Each line names where
 the claim is checked, because a checklist that cannot be re-run is a claim and
@@ -812,7 +893,7 @@ not a check.
 | Runtime and memory costs are measured | `benchmark-m10.py`; §10 |
 | M1–M9 tests remain green | 846 tests, 37 binaries, both backends required |
 
-Two lines of the plan's checklist are **not** fully met, and are listed in §12
+Two lines of the plan's checklist are **not** fully met, and are listed in §13
 rather than ticked here: the five clean M9 contracts are exercised with both
 backends for three of them rather than all five (the other two differ only in
 which operand is secret, and the policy overlay is a CI cost), and cold/warm
@@ -820,7 +901,7 @@ runtime is measured warm in CI with cold available but not run.
 
 ---
 
-## 12. What is not done
+## 13. What is not done
 
 Every package is implemented. These are the limits that remain inside them,
 and the non-goals the plan set that are still non-goals.
