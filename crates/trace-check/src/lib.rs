@@ -35,6 +35,7 @@ pub mod compare;
 pub mod contract;
 pub mod coverage;
 pub mod coverage_report;
+pub mod dynamic;
 pub mod dynamic_harness;
 pub mod enforcement;
 pub mod evidence;
@@ -872,6 +873,7 @@ pub fn run_contract_coverage(
     reproducer_dir: Option<&Path>,
     today: &str,
     runtime: Option<&str>,
+    dynamic_runs: Option<&DynamicRuns>,
 ) -> Result<CoverageReport, CheckRunError> {
     let policy = &config.policy;
     let inventory_dir = workspace.inventory_target_dir()?;
@@ -942,6 +944,7 @@ pub fn run_contract_coverage(
         valgrind.is_some(),
         tools.is_some(),
         symbolic_backend.as_ref().is_some_and(Result::is_ok),
+        dynamic_runs.is_some(),
     );
 
     let plan = Plan::resolve(&found, config, policy, &selected, &available, today);
@@ -1104,11 +1107,17 @@ pub fn run_contract_coverage(
         }
     }
 
+    // Stage four: developer-written `#[ct_test]` evidence, discovered and
+    // executed by the caller and bound to the inventory here. The binding is
+    // where the security decision is: a test that ran is not evidence about a
+    // contract unless it provably invoked it.
+    if let Some(runs) = dynamic_runs {
+        fold_dynamic(&mut coverage, &plan, &found, library, runs);
+    }
+
     let provenance = coverage_report::Provenance {
-        rustc_version: native::tool_version(Path::new("rustc"), &["--version"])
-            .unwrap_or_else(|_| "rustc (version unavailable)".to_string()),
-        cargo_version: native::tool_version(Path::new("cargo"), &["--version"])
-            .unwrap_or_else(|_| "cargo (version unavailable)".to_string()),
+        rustc_version: library.toolchain.rustc_version.clone(),
+        cargo_version: library.toolchain.cargo_version.clone(),
         target: symbolic::SUPPORTED_TARGET.to_string(),
         library_package: library.package.clone(),
         library_version: library.version.clone(),
@@ -1123,6 +1132,98 @@ pub fn run_contract_coverage(
         selected,
         selection.describe(),
     ))
+}
+
+/// Everything the caller discovered and executed for the `dynamic` analysis.
+///
+/// Passed in rather than produced here: discovering `#[ct_test]`s means
+/// building Cargo test binaries and running them under Valgrind, which lives in
+/// the CLI. What this crate owns is the part a security decision depends on —
+/// binding them to the compiler-derived inventory, and refusing to count one
+/// that establishes nothing.
+pub struct DynamicRuns {
+    pub runs: Vec<dynamic::DynamicTestRun>,
+    /// Compilation settings of the test binaries, for the artifact identity.
+    pub profile: String,
+    /// `sha256` of the library's dependency lockfile, which decides the code
+    /// compiled into those binaries.
+    pub lockfile_sha256: String,
+    /// What Valgrind reports about itself.
+    pub valgrind_version: String,
+}
+
+/// Binds the caller's test runs to contracts and folds one aggregate each.
+fn fold_dynamic(
+    coverage: &mut Coverage,
+    plan: &Plan,
+    found: &ContractInventory,
+    library: &Library,
+    runs: &DynamicRuns,
+) {
+    let binding = dynamic::bind(&runs.runs, found);
+    // A test whose target names no contract in this build, or more than one,
+    // binds to nothing. That is already fail-closed -- the obligation stays
+    // un-analyzed and strict CI fails -- but silently so, and "failed without
+    // saying why" is the shape of problem this milestone exists to remove.
+    //
+    // Reported in the same place configuration that matches no declaration is
+    // reported, because it is the same class of mistake: something names a
+    // contract this build does not have. The CLI's `resolve_targets` rejects
+    // these up front, so reaching here means the inventory and the test
+    // binaries' own metadata disagree -- which a developer must hear about.
+    for detail in &binding.unresolved {
+        coverage.stale.push(enforcement::StaleEntry {
+            contract: detail.split('`').nth(1).unwrap_or_default().to_string(),
+            source: "ct_test",
+            detail: detail.clone(),
+        });
+    }
+    // Which contracts *owe* a dynamic answer. A contract with no bound test
+    // keeps the `NOT_ANALYZED` status it already has: saying so here would be
+    // the same thing twice, and silently folding a clean result would be the
+    // failure this milestone exists to prevent.
+    let required: std::collections::BTreeSet<&str> = plan
+        .entries
+        .iter()
+        .filter(|entry| entry.outstanding().contains(&Analysis::Dynamic))
+        .map(|entry| entry.id.as_str())
+        .collect();
+
+    // Every contract with a bound test, not only those that owe an answer.
+    //
+    // `dynamic` is a whole test suite rather than a per-contract job: a policy
+    // requiring it of one contract makes the run execute every targeted
+    // `#[ct_test]`, including tests bound to contracts that require nothing
+    // dynamic. Those tests have *already run*. Discarding a leak one of them
+    // found, because nobody asked for the analysis, would erase positive
+    // leakage evidence -- and no arrangement of obligations may do that.
+    for (contract, tests) in &binding.per_contract {
+        let Some(declaration) = found.contract(contract) else {
+            continue;
+        };
+        let Some(aggregate) = dynamic::aggregate(tests) else {
+            continue;
+        };
+        let identity = evidence::ArtifactIdentity::developer_test(
+            contract,
+            &declaration.descriptor_json,
+            library,
+            &dynamic::artifact_sha256(&aggregate.executables),
+            &runs.lockfile_sha256,
+            &runs.profile,
+            &runs.valgrind_version,
+        );
+        let evidence = AnalysisEvidence::from_dynamic(identity, aggregate);
+        if required.contains(contract.as_str()) {
+            coverage.fold(contract, evidence);
+        } else {
+            // No obligation to discharge, so no status is written: recording
+            // CHECKED would claim the contract was held to something it never
+            // was. The evidence is kept, and `violated()` reads evidence as
+            // well as statuses, so a leak still fails the contract.
+            coverage.fold_supplemental(contract, evidence);
+        }
+    }
 }
 
 /// Resolves the policy and reports the matrix **without running anything**.
@@ -1161,6 +1262,8 @@ pub fn report_contract_coverage(
         valgrind,
         coverage::LlvmTools::locate(Some(&library.toolchain)).is_ok(),
         needs_symbolic(&found, policy) && prepare_symbolic_backend(runtime).is_ok(),
+        // `coverage` runs nothing, so it never performs the dynamic analysis.
+        false,
     );
     let plan = Plan::resolve(&found, config, policy, &selected, &available, today);
     let coverage = Coverage::from_plan(&plan, &found);
@@ -1206,15 +1309,22 @@ pub fn read_contract_inventory(
 /// `symbolic` used to be in that same category. It is not any more: this
 /// command runs it, so a missing analyzer image is now honestly
 /// BACKEND_UNAVAILABLE, and nothing else is allowed to stand in for it.
-fn check_capabilities(valgrind: bool, tools: bool, symbolic: bool) -> Available {
+fn check_capabilities(valgrind: bool, tools: bool, symbolic: bool, dynamic: bool) -> Available {
     let mut elsewhere = std::collections::BTreeMap::new();
-    elsewhere.insert(Analysis::Dynamic, "cargo trace-check test".to_string());
+    let mut performs = vec![Analysis::Generated, Analysis::Explore, Analysis::Symbolic];
+    if dynamic {
+        performs.push(Analysis::Dynamic);
+    } else {
+        // Not something this invocation does, which is a claim about the
+        // command and not about the machine. See `Available::performs`.
+        elsewhere.insert(Analysis::Dynamic, "cargo trace-check test".to_string());
+    }
     Available {
         generated: valgrind,
         explore: valgrind && tools,
         symbolic,
-        dynamic: valgrind,
-        performs: vec![Analysis::Generated, Analysis::Explore, Analysis::Symbolic],
+        dynamic: valgrind && dynamic,
+        performs,
         elsewhere,
     }
 }

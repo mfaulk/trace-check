@@ -203,17 +203,17 @@ pub fn build(
 
 /// Whether a test's declared target names this contract.
 ///
-/// Accepts the bare function name or any suffix of the qualified identity, so
-/// `target = "verify"` matches `my_crate::auth::verify`. Ambiguity is rejected
-/// before this point, in [`resolve_targets`].
+/// Accepts the bare function name or any suffix of the qualified identity
+/// ending at a path boundary, so `target = "verify"` matches
+/// `my_crate::auth::verify` and `rify` does not. Ambiguity is rejected before
+/// this point, in [`resolve_targets`].
+///
+/// Delegates to [`trace_check::dynamic::matches_target`] so that the unified
+/// run's binding and this one cannot drift: a rule that decided coverage one
+/// way for `test` and another way for `check --all-contracts` would make the
+/// two commands disagree about what a test established.
 fn targets(target: Option<&str>, contract: &ContractRecord) -> bool {
-    let Some(target) = target else { return false };
-    // Either the full identity, or a suffix of it ending at a path boundary,
-    // so `verify` matches `my_crate::auth::verify` but `rify` does not.
-    contract
-        .id
-        .strip_suffix(target)
-        .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with("::"))
+    target.is_some_and(|target| trace_check::dynamic::matches_target(target, &contract.id))
 }
 
 /// Rejects tests whose declared target names no contract, or more than one.

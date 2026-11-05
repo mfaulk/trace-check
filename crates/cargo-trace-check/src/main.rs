@@ -5,6 +5,7 @@
 //! the binary directly also works, which is what the integration tests do.
 
 mod discover;
+mod dynamic_adapter;
 mod report;
 mod run;
 
@@ -542,6 +543,21 @@ fn check(request: CheckRequest) -> Result<u8, String> {
                 config_path.display()
             ));
         }
+        // Developer-written `#[ct_test]`s, collected only when some policy asks
+        // for the `dynamic` analysis. Building Cargo test binaries is not free,
+        // and a project requiring nothing dynamic must not pay for it -- nor
+        // have a missing test suite reported against an obligation it does not
+        // have.
+        let dynamic_runs = if dynamic_adapter::wanted(&config.policy) {
+            Some(dynamic_adapter::collect(
+                &library,
+                None,
+                &features,
+                Limits::default(),
+            )?)
+        } else {
+            None
+        };
         let report = trace_check::run_contract_coverage(
             &library,
             &config,
@@ -551,6 +567,7 @@ fn check(request: CheckRequest) -> Result<u8, String> {
             reproducer_dir.as_deref(),
             &today(),
             None,
+            dynamic_runs.as_ref(),
         )
         .map_err(|e| e.to_string())?;
         match format {
@@ -725,8 +742,11 @@ fn test(
     // missing Valgrind is an immediate, clear failure.
     let (valgrind, valgrind_version) = native::prepare_valgrind().map_err(|e| e.to_string())?;
 
-    let (binaries, used_profile) = discover::build_test_binaries(manifest_path, profile, features)
-        .map_err(|e| e.to_string())?;
+    // No toolchain override: `test` runs in the project it is testing, so the
+    // working directory already resolves the right one.
+    let (binaries, used_profile) =
+        discover::build_test_binaries(manifest_path, profile, features, None)
+            .map_err(|e| e.to_string())?;
     let discovery = discover::discover(&binaries, &used_profile).map_err(|e| e.to_string())?;
 
     // An unknown or ambiguous target is an error before anything runs: a test
@@ -933,8 +953,11 @@ fn list(
     features: &[String],
     format: Format,
 ) -> Result<u8, String> {
-    let (binaries, used_profile) = discover::build_test_binaries(manifest_path, profile, features)
-        .map_err(|e| e.to_string())?;
+    // No toolchain override: `test` runs in the project it is testing, so the
+    // working directory already resolves the right one.
+    let (binaries, used_profile) =
+        discover::build_test_binaries(manifest_path, profile, features, None)
+            .map_err(|e| e.to_string())?;
     let discovery = discover::discover(&binaries, &used_profile).map_err(|e| e.to_string())?;
 
     match format {

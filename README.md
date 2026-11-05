@@ -23,7 +23,7 @@ the formal noninterference property, and the roadmap.
 | M7 | Coverage-guided leakage discovery | complete, experimental |
 | M8 | Complete contract coverage and enforcement | complete, experimental |
 | M9 | Real-world cryptography integration — auditing `crypto-bigint` | complete, experimental |
-| M10 | Unified multi-backend verification and CI enforcement | in progress — M10.0–M10.2 complete |
+| M10 | Unified multi-backend verification and CI enforcement | in progress — M10.0–M10.2, M10.4 complete |
 | M11 | Hardware-oriented validation — statistical timing | future |
 
 `trace-check` turns that idea into reproducible analysis, from five directions:
@@ -634,6 +634,17 @@ than read as a pass. A symbolic requirement additionally needs a
 `[verify."…"]` entry: a bounded search has no declared depth or observation
 model without one, and that is reported as a configuration gap before any
 container starts.
+
+Developer-written `#[ct_test]`s join the same model. A policy requiring
+`dynamic` makes the unified command build the test binaries, run the tests that
+declare a target under Memcheck, and bind each to its contract — by
+path-boundary suffix, with an ambiguous target binding to nothing. A test
+satisfies a contract's obligation only if it **provably invoked** that contract
+through the instrumented adapter: one that runs, passes, and never calls the
+function it names establishes nothing about it. Several tests covering one
+contract aggregate deterministically — a leak is preserved, any test that did
+not complete with valid controls prevents a clean result, and a duplicate
+execution counts once.
 
 `--ci` requires `mode = "strict"` and refuses an advisory policy. Advisory mode
 reports gaps without failing, which is what it is for during adoption and

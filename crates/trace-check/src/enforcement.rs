@@ -304,6 +304,11 @@ pub struct AnalysisEvidence {
     /// struct and most evidence is not symbolic.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbolic: Option<Box<crate::library_report::ContractReport>>,
+    /// The developer-written tests a `dynamic` result rests on, when M3 tests
+    /// produced this evidence: each test's identity, its executable, its
+    /// controls, whether it provably invoked the contract, and its findings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dynamic: Option<crate::dynamic::DynamicEvidence>,
     /// Reproducers written for this contract's findings.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub reproducers: Vec<String>,
@@ -327,6 +332,7 @@ impl AnalysisEvidence {
             check: None,
             discovery: None,
             symbolic: None,
+            dynamic: None,
             reproducers: Vec::new(),
         }
     }
@@ -404,6 +410,7 @@ impl AnalysisEvidence {
             check: None,
             discovery: None,
             symbolic: Some(report),
+            dynamic: None,
             reproducers: Vec::new(),
         }
     }
@@ -451,7 +458,34 @@ impl AnalysisEvidence {
             check: Some(check),
             discovery,
             symbolic: None,
+            dynamic: None,
             reproducers,
+        }
+    }
+
+    /// Developer-written dynamic evidence, from tests already bound to this
+    /// contract and aggregated.
+    ///
+    /// The validation that matters here happened in [`crate::dynamic`]: a test
+    /// that never invoked the contract, whose controls did not fire, or that
+    /// did not complete cannot contribute to a clean aggregate, and the
+    /// aggregate is what arrives. This constructor exists so that dynamic
+    /// evidence, like the other two, can only be built one way.
+    pub fn from_dynamic(
+        artifact: crate::evidence::ArtifactIdentity,
+        dynamic: crate::dynamic::DynamicEvidence,
+    ) -> AnalysisEvidence {
+        AnalysisEvidence {
+            analysis: Analysis::Dynamic,
+            outcome: dynamic.outcome,
+            artifact_sha256: artifact.artifact_sha256.clone(),
+            artifact,
+            detail: dynamic.detail.clone(),
+            check: None,
+            discovery: None,
+            symbolic: None,
+            dynamic: Some(dynamic),
+            reproducers: Vec::new(),
         }
     }
 }
@@ -1503,6 +1537,31 @@ impl Coverage {
         contract.evidence.push(evidence);
     }
 
+    /// Records evidence for an analysis the contract did **not** require.
+    ///
+    /// # Why unrequired evidence is kept at all
+    ///
+    /// The `dynamic` analysis is a whole test suite, not a per-contract job: a
+    /// policy requiring it of one contract makes the run execute every
+    /// targeted `#[ct_test]`, including tests bound to contracts that require
+    /// nothing dynamic. If one of those tests finds a secret-dependent branch,
+    /// dropping its result because nobody asked for the analysis would be
+    /// exactly the thing this milestone forbids -- positive leakage evidence
+    /// erased by the absence of an obligation.
+    ///
+    /// So the evidence is retained and [`ContractCoverage::violated`] sees it,
+    /// because that reads the evidence as well as the statuses. What is *not*
+    /// written is a status: an unrequired analysis has no obligation to
+    /// discharge, and recording `CHECKED` against one would claim the contract
+    /// was held to something it never was. A clean result is supplemental; a
+    /// leak is a violation either way.
+    pub fn fold_supplemental(&mut self, id: &str, evidence: AnalysisEvidence) {
+        let Some(contract) = self.contracts.iter_mut().find(|entry| entry.id == id) else {
+            return;
+        };
+        contract.evidence.push(evidence);
+    }
+
     /// Records a status for one requirement without any backend evidence.
     ///
     /// For a failure that *is* the answer: a contract whose harness cannot be
@@ -1610,13 +1669,25 @@ impl Coverage {
                 ));
             }
         }
-        if !policy.allow_inactive_config {
-            for entry in &self.stale {
-                blocking.push(format!(
-                    "[{}.\"{}\"]: {}",
-                    entry.source, entry.contract, entry.detail
-                ));
+        for entry in &self.stale {
+            // `allow_inactive_config` exists for one case: a single
+            // configuration file serving several build variants, where an
+            // entry for a feature-gated contract legitimately matches no
+            // declaration in *this* build. It is a statement about
+            // configuration.
+            //
+            // A `#[ct_test]` whose target names no contract, or more than one,
+            // is not that. It is a security test that ran and whose coverage
+            // claim could not be resolved, and tolerating it would let an
+            // unresolved binding sit in the report without blocking. Scoped
+            // deliberately rather than sharing one switch.
+            if policy.allow_inactive_config && entry.source != "ct_test" {
+                continue;
             }
+            blocking.push(format!(
+                "[{}.\"{}\"]: {}",
+                entry.source, entry.contract, entry.detail
+            ));
         }
         blocking
     }
@@ -3392,5 +3463,58 @@ mod tests {
             Outcome::LeakDetected,
             "a finding from the security artifact does not depend on a later case completing"
         );
+    }
+
+    /// `allow_inactive_config` tolerates configuration that matches no
+    /// declaration. It does not tolerate a `#[ct_test]` whose coverage claim
+    /// could not be resolved.
+    ///
+    /// The switch exists for one configuration file serving several build
+    /// variants. An unresolved test binding is a different thing: a security
+    /// test that ran and whose target names no contract, or more than one.
+    /// Sharing one switch let that sit in the report without blocking.
+    #[test]
+    fn tolerating_inactive_configuration_does_not_tolerate_unresolved_tests() {
+        let inventory = inventory(&["crypto::a::probe"]);
+        let policy = PolicyConfig {
+            allow_inactive_config: true,
+            ..PolicyConfig::default()
+        };
+        let config = VerifyConfig::empty();
+        let plan = Plan::resolve(
+            &inventory,
+            &config,
+            &policy,
+            &["crypto::a::probe".to_string()],
+            &Available::all(),
+            TODAY,
+        );
+        let mut coverage = Coverage::from_plan(&plan, &inventory);
+        coverage.fold(
+            "crypto::a::probe",
+            evidence(Analysis::Generated, Outcome::NoLeakObserved),
+        );
+
+        // Configuration naming a contract this build does not have: tolerated.
+        coverage.stale.push(StaleEntry {
+            contract: "crypto::gone::away".to_string(),
+            source: "check",
+            detail: "no active declaration matches it".to_string(),
+        });
+        assert!(
+            coverage.blocking(&inventory, &policy).is_empty(),
+            "an inactive configuration entry is what the switch is for"
+        );
+
+        // A test whose coverage claim could not be resolved: never tolerated.
+        coverage.stale.push(StaleEntry {
+            contract: "crypto::a::prob".to_string(),
+            source: "ct_test",
+            detail: "`tests::typo` targets `prob`, which this build declares no contract for"
+                .to_string(),
+        });
+        let blocking = coverage.blocking(&inventory, &policy);
+        assert_eq!(blocking.len(), 1, "{blocking:?}");
+        assert!(blocking[0].contains("ct_test"), "{blocking:?}");
     }
 }

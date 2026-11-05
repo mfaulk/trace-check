@@ -43,6 +43,15 @@ pub enum Backend {
     /// BINSEC relational symbolic execution.
     #[serde(rename = "binsec-relational")]
     Symbolic,
+    /// Valgrind Memcheck over developer-written `#[ct_test]`s.
+    ///
+    /// The same analyzer as [`Backend::Memcheck`] and a different *source of
+    /// inputs*, which is what the name records. A developer choosing the
+    /// inputs and a generator choosing them are different evidence about the
+    /// same property, and a reader comparing two results needs to know which
+    /// one they are looking at.
+    #[serde(rename = "valgrind-ct-test")]
+    DeveloperTest,
 }
 
 impl Backend {
@@ -52,6 +61,7 @@ impl Backend {
         match self {
             Backend::Memcheck => "valgrind-memcheck",
             Backend::Symbolic => "binsec-relational",
+            Backend::DeveloperTest => "valgrind-ct-test",
         }
     }
 }
@@ -168,6 +178,41 @@ impl ArtifactIdentity {
                 .clone()
                 .unwrap_or_else(|| analyzer.analyzer.clone()),
             analyzer_image: Some(analyzer.analyzer_image.clone()),
+        }
+    }
+
+    /// The identity of the test executables a developer-written `#[ct_test]`
+    /// result rests on.
+    ///
+    /// `harness_sha256` names the same executable as `artifact_sha256` when one
+    /// test target participates. That is not a fudge: for a developer-written
+    /// test there is no *generated* harness to fingerprint separately — the
+    /// test code is the harness, and it is compiled into the executable being
+    /// analyzed.
+    pub fn developer_test(
+        contract: &str,
+        descriptor_json: &str,
+        library: &Library,
+        artifact_sha256: &str,
+        lockfile_sha256: &str,
+        profile: &str,
+        valgrind_version: &str,
+    ) -> ArtifactIdentity {
+        ArtifactIdentity {
+            contract: contract.to_string(),
+            descriptor_sha256: fingerprint(descriptor_json),
+            library_package: library.package.clone(),
+            library_version: library.version.clone(),
+            features: library.features.clone(),
+            target: crate::symbolic::SUPPORTED_TARGET.to_string(),
+            toolchain: library.toolchain.clone(),
+            profile: profile.to_string(),
+            artifact_sha256: artifact_sha256.to_string(),
+            lockfile_sha256: lockfile_sha256.to_string(),
+            harness_sha256: artifact_sha256.to_string(),
+            backend: Backend::DeveloperTest,
+            backend_version: valgrind_version.to_string(),
+            analyzer_image: None,
         }
     }
 
