@@ -22,7 +22,7 @@ import json
 import pathlib
 import sys
 
-EXPECTED_SCHEMA = 2
+EXPECTED_SCHEMA = 3
 
 # Statuses that discharge an obligation. Everything else is a gap or a
 # violation.

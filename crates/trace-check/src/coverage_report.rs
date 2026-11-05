@@ -19,10 +19,31 @@ use crate::inventory::ContractInventory;
 
 /// Report schema this build emits.
 ///
-/// Two, not one: M6's generated-check report is schema 1, and this is a
+/// Three, not one: M6's generated-check report is schema 1, and this is a
 /// different document with a different shape. A consumer that keyed on
 /// `schema_version` keeps working.
-pub const SCHEMA_VERSION: u32 = 2;
+///
+/// # Why 2 became 3
+///
+/// M10 changed what a field *means*, which an added field would not have. The
+/// bump is deliberate so a consumer written against schema 2 fails loudly
+/// rather than misreading:
+///
+/// * `regression_expectation` (a string, one declared outcome per contract)
+///   became `regression_expectations` (an analysis-to-outcome object). A reader
+///   looking for the old key now finds nothing where before it found the
+///   generated backend's expectation — and the whole point of the change is
+///   that one value could not describe a fixture whose backends disagree.
+/// * each evidence record gained `artifact`, the full identity of the
+///   executable analyzed, alongside the `artifact_sha256` that keyed it.
+/// * `shared_with` says which other requirements one execution discharged, so
+///   two records are no longer countable as two observations.
+/// * `execution` reports the jobs the run committed to before building.
+/// * evidence gained `dynamic` and `symbolic` payloads next to `check`.
+///
+/// The standalone M3, M5 and M6 report schemas are untouched. Only this
+/// document changed, and only `--all-contracts` emits it.
+pub const SCHEMA_VERSION: u32 = 3;
 
 pub const EXIT_OK: u8 = 0;
 pub const EXIT_LEAK: u8 = 1;
@@ -132,6 +153,79 @@ pub struct CoverageReport {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Where each of this evidence's findings actually leaks, innermost first.
+///
+/// Distinct from the contract's declaration site in three ways that matter.
+/// The declaration is one line in the developer's source; a finding is a frame
+/// in a compiled stack. One contract can leak in several places. And the frame
+/// worth printing is the contract's **own** frame rather than the shallowest
+/// located one, which at `-O` is usually an inlined `core` helper -- stable
+/// for matching a finding across runs, useless for acting on it.
+///
+/// Symbolic divergences carry an instruction address and, when debug info
+/// supplied it, a source location; generated findings carry the contract's own
+/// frame and the function the finding was attributed to.
+fn leak_sites(evidence: &crate::enforcement::AnalysisEvidence) -> Vec<String> {
+    let mut sites = Vec::new();
+    if let Some(check) = &evidence.check {
+        for finding in &check.findings {
+            let what = finding.fingerprint.classification.describe();
+            // `fingerprint.function` and `fingerprint.location` describe the
+            // *same* frame -- the innermost located one, which is where the
+            // leaking instruction is. `finding.site` describes a different
+            // frame: the contract's own, which is how the finding was
+            // attributed to this contract.
+            //
+            // Pairing one with the other printed a function from an upstream
+            // dependency beside a line number from the audit adapter. For M9's
+            // mutation inside `crypto-bigint`'s `carrying_add` that read as
+            // "add.rs:38 in `carrying_add`", where add.rs:38 is the adapter and
+            // the instruction is in the library -- a confident sentence about
+            // somewhere the leak is not, which is the exact problem M9 raised.
+            let instruction = match (&finding.fingerprint.location, &finding.fingerprint.function) {
+                (Some(at), Some(function)) => format!("{at} in `{function}`"),
+                (Some(at), None) => at.clone(),
+                (None, Some(function)) => format!("`{function}`"),
+                (None, None) => "an unlocated frame".to_string(),
+            };
+            let mut line = format!("{instruction} ({what})");
+            // The contract's own frame, named as what it is. Shown when it
+            // differs, because at `-O` the instruction is usually in an
+            // inlined callee and the attribution frame is the line a developer
+            // opens first.
+            if let Some(site) = &finding.site {
+                if Some(site) != finding.fingerprint.location.as_ref() {
+                    line.push_str(&format!(", attributed to {site}"));
+                }
+            }
+            sites.push(line);
+        }
+    }
+    if let Some(symbolic) = &evidence.symbolic {
+        for divergence in &symbolic.analysis.divergences {
+            let mut line = match &divergence.source {
+                Some(source) => format!("{source} at {}", divergence.instruction),
+                None => format!("{} (no source location)", divergence.instruction),
+            };
+            line.push_str(&format!(" ({})", divergence.description));
+            // Inlined frames, when the analyzer could attribute more than one.
+            // The innermost is the instruction; the rest say how it got there.
+            if !divergence.inline_frames.is_empty() {
+                line.push_str(&format!(" via {}", divergence.inline_frames.join(" <- ")));
+            }
+            sites.push(line);
+        }
+    }
+    if let Some(dynamic) = &evidence.dynamic {
+        for test in &dynamic.tests {
+            for finding in &test.findings {
+                sites.push(format!("{finding} (in `{}`)", test.test));
+            }
+        }
+    }
+    sites
+}
+
 pub fn build(
     provenance: Provenance,
     inventory: &ContractInventory,
@@ -312,6 +406,14 @@ impl CoverageReport {
                     short(&evidence.artifact_sha256),
                     evidence.detail
                 );
+                // The leaking instruction, separately from the declaration
+                // site above. M9 asked for this: `declared at src/tag.rs:18`
+                // is where the contract is written, which is rarely the line
+                // to read when something leaks, and a developer should not
+                // have to open the JSON to find the other one.
+                for site in leak_sites(evidence) {
+                    line!("  leaks at:  {site}");
+                }
             }
             line!("");
         }
@@ -532,6 +634,7 @@ mod tests {
             "crypto::b::probe".to_string(),
             crate::enforcement::ContractPolicy {
                 required: Some(vec![Analysis::Generated, Analysis::Symbolic]),
+                observations: None,
             },
         );
         let report = report_for(
@@ -580,7 +683,7 @@ mod tests {
         );
         let value: serde_json::Value =
             serde_json::from_str(&report.to_json()).expect("the report is JSON");
-        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["schema_version"], 3);
         // Inventory completeness is its own object.
         assert_eq!(value["inventory"]["complete"], true);
         assert_eq!(value["inventory"]["contracts_declared"], 1);
@@ -617,5 +720,84 @@ mod tests {
         assert_eq!(report.summary.enforcement_rate, None);
         assert!(report.to_text().contains("n/a (no unwaived requirements)"));
         assert_eq!(report.exit_code(), EXIT_OK);
+    }
+
+    /// The leak site names one frame at a time: the leaking instruction from
+    /// the fingerprint, and the contract's attribution frame separately.
+    ///
+    /// Pairing `finding.site` with `fingerprint.function` mixed two frames.
+    /// For an upstream mutation -- M9's planted branch inside
+    /// `crypto-bigint`'s `carrying_add` -- it printed the adapter's line
+    /// number beside the library's function name: a confident sentence about
+    /// somewhere the leak is not, which is the problem M9 raised.
+    #[test]
+    fn a_leak_site_does_not_mix_two_frames() {
+        use crate::check::{Finding, Fingerprint, Isolation};
+        use crate::memcheck::Classification;
+
+        let upstream = Finding {
+            fingerprint: Fingerprint {
+                classification: Classification::SecretDependentBranch,
+                // The leaking instruction, in the dependency.
+                function: Some("crypto_bigint::uint::add::carrying_add".to_string()),
+                location: Some("src/uint/add.rs:94".to_string()),
+            },
+            classification: Classification::SecretDependentBranch,
+            description: "Secret-dependent branch".to_string(),
+            what: "Conditional jump depends on undefined value".to_string(),
+            origin: "a secret".to_string(),
+            stack: Vec::new(),
+            attributed: true,
+            // The contract's own frame, in the audit adapter.
+            site: Some("src/add.rs:38".to_string()),
+            isolation: Isolation::Single { id: 0 },
+            shrunk: None,
+        };
+        let check = crate::check::ContractCheck {
+            contract: "cbaudit::add::wrapping_add_secret_left".to_string(),
+            function: "wrapping_add_secret_left".to_string(),
+            secret_parameters: vec!["left".to_string()],
+            marked_bytes: 32,
+            outcome: Outcome::LeakDetected,
+            message: "1 finding(s)".to_string(),
+            calibration: crate::check::Control::Confirmed,
+            binding: crate::check::Control::Confirmed,
+            cases_planned: 64,
+            cases_executed: 64,
+            cases_completed: 64,
+            analyzer_runs: 2,
+            findings: vec![upstream],
+            unattributed: Vec::new(),
+            other_diagnostics: Vec::new(),
+        };
+        let evidence = crate::enforcement::AnalysisEvidence::from_generated(
+            Analysis::Generated,
+            Outcome::LeakDetected,
+            crate::evidence::sample_identity("cbaudit::add::wrapping_add_secret_left", "artifact"),
+            "a finding",
+            check,
+            None,
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let sites = leak_sites(&evidence);
+        assert_eq!(sites.len(), 1, "{sites:?}");
+        let site = &sites[0];
+        // The instruction and its function come from one frame.
+        assert!(
+            site.starts_with("src/uint/add.rs:94 in `crypto_bigint::uint::add::carrying_add`"),
+            "the leaking instruction must name its own frame: {site}"
+        );
+        // The adapter's line is labelled as attribution, not as the leak.
+        assert!(
+            site.contains("attributed to src/add.rs:38"),
+            "the contract's frame must be named as attribution: {site}"
+        );
+        // And never as the instruction's location.
+        assert!(
+            !site.starts_with("src/add.rs:38"),
+            "the adapter's line must not be presented as the leaking instruction: {site}"
+        );
     }
 }

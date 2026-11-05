@@ -1292,3 +1292,51 @@ fn one_contract_failing_does_not_stop_the_others() {
         assert_eq!(report.exit_code(), 2);
     }
 }
+
+/// A detected leak names the instruction that leaks, separately from the line
+/// the contract was declared on.
+///
+/// `declared at src/controls.rs:53` is where the annotation is written, which
+/// is rarely the line to read when something leaks. M9 asked for the other one
+/// and a developer should not have to open the JSON to find it.
+#[test]
+fn a_leak_names_its_instruction_and_not_only_the_declaration() {
+    if !analyzer_available() {
+        return;
+    }
+    const LEAKY: &str = "cbaudit::controls::pre_decode_first_byte";
+    let config = write_config(&format!(
+        "schema_version = 1\n\n[check.\"{LEAKY}\"]\ncases = 64\n\n\
+         [verify.\"{LEAKY}\"]\nmax_depth = 20000\n\
+         checks = [\"control-flow\", \"memory-access\"]\n\
+         expected_outcome = \"VERIFIED_BOUNDED\"\n\n\
+         [policy]\nmode = \"strict\"\ndefault_required = [\"generated\"]\n\n\
+         [policy.contracts.\"{LEAKY}\"]\nrequired = [\"generated\", \"symbolic\"]\n"
+    ));
+    let report = unified_for(&config, LEAKY, None);
+    let contract = named(&report, LEAKY);
+    assert!(contract.violated(), "{:?}", contract.status);
+
+    let text = report.to_text();
+    assert!(
+        text.contains(&format!("declared at {}", contract.site)),
+        "the declaration site must still be shown:\n{text}"
+    );
+    let leak_lines: Vec<&str> = text
+        .lines()
+        .filter(|line| line.trim_start().starts_with("leaks at:"))
+        .collect();
+    assert!(
+        !leak_lines.is_empty(),
+        "a detected leak must name where it leaks:\n{text}"
+    );
+    // Distinct from the declaration: the contract is declared on one line and
+    // the leak is attributed to a frame, which is the point of reporting both.
+    assert!(
+        leak_lines
+            .iter()
+            .any(|line| line.contains("secret") || line.contains("branch") || line.contains("0x")),
+        "a leak site must say what was found and where: {leak_lines:?}"
+    );
+    assert_eq!(report.exit_code(), 1);
+}

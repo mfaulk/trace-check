@@ -719,7 +719,11 @@ fn the_json_report_separates_inventory_from_enforcement() {
     let report: serde_json::Value =
         serde_json::from_str(&text).unwrap_or_else(|e| panic!("the report is JSON: {e}\n{text}"));
 
-    assert_eq!(report["schema_version"], 2);
+    // Three as of M10: `regression_expectation` became the per-analysis
+    // `regression_expectations`, which changes what a field means rather than
+    // only adding one, so a consumer written against schema 2 must fail
+    // loudly instead of reading a missing key.
+    assert_eq!(report["schema_version"], 3);
     // Inventory completeness is its own object, not folded into a percentage.
     assert_eq!(report["inventory"]["complete"], true);
     assert_eq!(report["inventory"]["contracts_declared"], 2);

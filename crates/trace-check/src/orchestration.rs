@@ -246,6 +246,7 @@ mod tests {
             CONTRACT.to_string(),
             ContractPolicy {
                 required: Some(required.to_vec()),
+                observations: None,
             },
         );
         // A `[verify]` entry, so a symbolic requirement is not settled as a
@@ -362,6 +363,7 @@ mod tests {
             CONTRACT.to_string(),
             ContractPolicy {
                 required: Some(vec![Analysis::Generated, Analysis::Symbolic]),
+                observations: None,
             },
         );
         // No `[verify]` entry, so `symbolic` is settled as a configuration gap.

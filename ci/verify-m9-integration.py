@@ -29,7 +29,7 @@ import json
 import pathlib
 import sys
 
-EXPECTED_SCHEMA = 2
+EXPECTED_SCHEMA = 3
 
 # The contracts this integration declares, and what each one must report.
 # Written here rather than read from the report: a validator that learns its

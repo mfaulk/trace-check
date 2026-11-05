@@ -1062,10 +1062,13 @@ pub fn resolve_symbol(artifact: &Path, contract: &str) -> Result<ResolvedSymbol,
             similar,
         });
     }
+    // The contract's own name at more than one address: two distinct compiled
+    // copies, which is a different problem from folding and reported as such.
     if addresses.len() > 1 {
         return Err(HarnessError::SymbolAmbiguous {
             contract: contract.to_string(),
-            count: addresses.len(),
+            addresses: addresses.iter().map(|at| format!("{at:#x}")).collect(),
+            sharing: Vec::new(),
         });
     }
 
@@ -1076,9 +1079,21 @@ pub fn resolve_symbol(artifact: &Path, contract: &str) -> Result<ResolvedSymbol,
         .map(|(_, name)| name)
         .collect();
     let [symbol] = candidates.as_slice() else {
+        // One address, several names: the linker folded functions with
+        // identical machine code onto each other. M9 hit this and had to
+        // diagnose it by disassembling, so the names that collided and the
+        // address they share are reported rather than only their count.
+        let mut sharing: Vec<String> = demangled
+            .iter()
+            .filter(|(at, _)| *at == address)
+            .map(|(_, name)| name.clone())
+            .collect();
+        sharing.sort();
+        sharing.dedup();
         return Err(HarnessError::SymbolAmbiguous {
             contract: contract.to_string(),
-            count: candidates.len(),
+            addresses: vec![format!("{address:#x}")],
+            sharing,
         });
     };
 
@@ -1194,9 +1209,22 @@ pub enum HarnessError {
         artifact: String,
         similar: Vec<String>,
     },
+    /// The contract's symbol could not be pinned to exactly one compiled
+    /// function.
+    ///
+    /// Two distinct causes, reported differently because the remedies differ:
+    /// one name at several addresses means several compiled copies, while
+    /// several names at one address means the linker folded identical bodies
+    /// together. M9 hit the second and had to diagnose it by disassembling,
+    /// which is why the colliding names and the shared address are carried
+    /// here rather than only their count.
     SymbolAmbiguous {
         contract: String,
-        count: usize,
+        /// Addresses the contract's own name resolved to.
+        addresses: Vec<String>,
+        /// Every name sharing one address, when that is the problem. Empty
+        /// when the contract simply has more than one copy.
+        sharing: Vec<String>,
     },
     /// Unsupported check classes, missing analyzer, and everything else the
     /// symbolic engine itself refuses.
@@ -1252,11 +1280,38 @@ impl fmt::Display for HarnessError {
                     similar.join(", ")
                 }
             ),
-            HarnessError::SymbolAmbiguous { contract, count } => write!(
+            HarnessError::SymbolAmbiguous {
+                contract,
+                addresses,
+                sharing,
+            } if sharing.len() > 1 => write!(
                 f,
-                "`{contract}` resolves to {count} symbols in the verification artifact. \
-                 trace-check refuses to choose: a verified result must name one compiled \
-                 function"
+                "`{contract}` shares the machine code at {} with {}. The linker folded \
+                 functions with identical bodies onto one another, so there is no instruction \
+                 that belongs to this contract alone and a result could not be attributed to \
+                 it. Give the bodies something that differs -- this repository's own audit \
+                 adapters each mix in a per-contract discriminant byte for exactly this reason \
+                 -- or verify the contracts one at a time. trace-check refuses to choose: a \
+                 verified result must name one compiled function",
+                addresses.join(", "),
+                sharing
+                    .iter()
+                    .filter(|name| *name != contract)
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+            HarnessError::SymbolAmbiguous {
+                contract,
+                addresses,
+                ..
+            } => write!(
+                f,
+                "`{contract}` resolves to {} distinct addresses in the verification artifact \
+                 ({}), so more than one compiled copy of it exists. trace-check refuses to \
+                 choose: a verified result must name one compiled function",
+                addresses.len(),
+                addresses.join(", ")
             ),
             HarnessError::Symbolic(error) => write!(f, "{error}"),
         }
@@ -1771,5 +1826,48 @@ mod tests {
         assert!(with_features
             .dependency_stanza()
             .contains("features = [\"experimental\"]"));
+    }
+
+    /// Folded symbols are diagnosed by name and address, not by count.
+    ///
+    /// M9 hit this and had to disassemble to work out what had happened: the
+    /// linker had folded two contracts with identical bodies onto one address,
+    /// so neither had an instruction of its own to attribute a result to. The
+    /// message now names the collision and the remedy.
+    #[test]
+    fn a_folded_symbol_is_diagnosed_by_name() {
+        let folded = HarnessError::SymbolAmbiguous {
+            contract: "crypto::left::probe".to_string(),
+            addresses: vec!["0x2012b0".to_string()],
+            sharing: vec![
+                "crypto::left::probe".to_string(),
+                "crypto::right::probe".to_string(),
+            ],
+        };
+        let message = folded.to_string();
+        assert!(message.contains("0x2012b0"), "{message}");
+        assert!(message.contains("`crypto::right::probe`"), "{message}");
+        assert!(
+            message.contains("folded"),
+            "the cause must be named, not left to a disassembler: {message}"
+        );
+        assert!(
+            message.contains("discriminant"),
+            "the remedy must be named: {message}"
+        );
+        // The contract itself is not listed as one of its own collisions.
+        assert!(!message.contains("with `crypto::left::probe`"), "{message}");
+
+        // Several addresses is the other cause and reads differently: more
+        // than one compiled copy, which folding is not.
+        let copies = HarnessError::SymbolAmbiguous {
+            contract: "crypto::left::probe".to_string(),
+            addresses: vec!["0x2012b0".to_string(), "0x2013c0".to_string()],
+            sharing: Vec::new(),
+        };
+        let message = copies.to_string();
+        assert!(message.contains("2 distinct addresses"), "{message}");
+        assert!(message.contains("0x2013c0"), "{message}");
+        assert!(!message.contains("folded"), "{message}");
     }
 }

@@ -36,11 +36,11 @@ are two results about two binaries, not one result about the function.
 | M10.0 | Real two-backend feasibility gate and integration seams | complete |
 | M10.1 | Per-analysis expectations and security-policy semantics | complete |
 | M10.2 | Typed artifact-bound evidence model | complete |
-| M10.3 | Refactor and integrate the M5 symbolic runner | partial — see §5 |
+| M10.3 | Refactor and integrate the M5 symbolic runner | complete |
 | M10.4 | Integrate M3 developer-written dynamic tests | complete |
 | M10.5 | Unified execution planner and backend deduplication | complete |
 | M10.6 | Bounded scheduling, isolation and failure handling | complete |
-| M10.7 | Unified CLI, reporting and schema migration | partial — see §5 |
+| M10.7 | Unified CLI, reporting and schema migration | complete |
 | M10.8 | Acceptance, mutation tests, benchmarks, CI and documentation | not started |
 
 ---
@@ -603,19 +603,104 @@ positional arguments is a signature callers get subtly wrong.
 
 ---
 
-## 9. What is not done
+## 9. M10.7 — reporting, the schema, and two diagnostics M9 asked for
 
-* **M10.3** — the per-contract symbolic seam exists (`stage_symbolic` /
-  `verify_staged`) and the standalone command uses it. Observation-model policy
-  is validated against the `[verify]` configuration, not declarable in policy.
+### The schema moved to 3
+
+M10 changed what a field *means*, which an added field would not have, so the
+unified report's schema version is bumped and consumers assert it. A reader
+written against schema 2 now fails loudly rather than misreading:
+
+* `regression_expectation` (a string: one declared outcome per contract) became
+  `regression_expectations` (an analysis-to-outcome object). A reader looking
+  for the old key finds nothing where it previously found the generated
+  backend's expectation — and the whole point of the change is that one value
+  could not describe a fixture whose backends disagree;
+* each evidence record gained `artifact`, the full identity of the executable
+  analyzed, alongside the `artifact_sha256` that keyed it;
+* `shared_with` says which other requirements one execution discharged;
+* `execution` reports the jobs the run committed to before building anything;
+* evidence gained `dynamic` and `symbolic` payloads next to `check`.
+
+The standalone M3, M5 and M6 report schemas are untouched. Only this document
+changed, and only `--all-contracts` emits it.
+
+### The leaking instruction, separately from the declaration
+
+`declared at src/controls.rs:53` is where the annotation is written. It is
+rarely the line to read when something leaks, and before this a developer had
+to open the JSON to find the other one. Both are now in the text report:
+
+```
+cbaudit::controls::pre_decode_first_byte
+  declared at src/controls.rs:53
+  generated  LEAK_DETECTED        a secret-dependent branch or address was found
+  symbolic   LEAK_DETECTED        a secret-dependent branch or address was found
+  evidence:  generated produced LEAK_DETECTED in 6a582e2f50fd -- 1 finding(s) …
+  leaks at:  controls.rs:55 in `cbaudit::controls::pre_decode_first_byte` (Secret-dependent branch)
+  evidence:  symbolic produced LEAK_DETECTED in c41bb4a43776 -- 1 divergence site(s) …
+  leaks at:  cbaudit::controls::pre_decode_first_byte (controls.rs:55) at 0x2048c0 (Secret-dependent control flow)
+```
+
+Three things make the leak site a different thing from the declaration, not
+just a second copy of it. A contract can leak in several places. The frame
+worth printing is the contract's **own** frame rather than the shallowest
+located one, which at `-O` is usually an inlined `core` helper — stable for
+matching a finding across runs, useless for acting on it. And a symbolic
+divergence carries an instruction address, which no source line can supply.
+
+### Folded symbols are diagnosed, not disassembled
+
+M9 hit a case where the linker folded two contracts with identical bodies onto
+one address, so neither had an instruction of its own for a result to be
+attributed to. The message said only `resolves to 2 symbols`, which left the
+developer to work out what had happened by disassembling.
+
+`SymbolAmbiguous` now distinguishes the two causes, because the remedies
+differ, and names the evidence for each:
+
+* **several names at one address** — folding. The message names the colliding
+  contracts and the shared address, says the linker folded identical bodies,
+  and points at the remedy this repository's own audit adapters already use: a
+  per-contract discriminant byte that makes the bodies differ.
+* **one name at several addresses** — more than one compiled copy, which is a
+  different problem and reads differently.
+
+### The observation model can be an obligation (M10.3's remainder)
+
+`[verify."…"].checks` declares what a contract's symbolic analysis *will*
+check. It could not state what the requirement *needs*, so a `[verify]` entry
+quietly narrowed to `checks = ["control-flow"]` kept satisfying a policy that
+wanted memory addressing too.
+
+`[policy.contracts."…"].observations` states it as part of the obligation.
+Omitted, it accepts whatever `[verify]` declared, which is M5's behaviour and
+remains the default. Given, the evidence is checked against the policy's list
+rather than the configuration's — so narrowing the configuration stops
+discharging the requirement instead of silently weakening it.
+
+Refused as configuration errors: an empty list (which would state no model at
+all, and is not the same as omitting it), a repeated class, and a list
+constraining a `symbolic` requirement the contract does not have — that last
+because an inert model is how a reader comes to believe something was required
+that never was.
+
+This completes M10.3. The plan offered two options — require observations in
+policy and validate the configuration against them, or define a conservative
+default requiring both classes. The first is implemented; the second is not,
+because defaulting to both classes would retroactively invalidate every
+existing single-class `[verify]` entry, and the plan is explicit that existing
+configurations must not be silently reinterpreted.
+
+---
+
+## 10. What is not done
+
 * **M10.4** — M3 expectations are not modelled, so an analyzer-regression
   fixture cannot declare an outcome for `dynamic`; such a requirement is
   reported as a configuration gap rather than guessed at. A `dynamic`
   requirement is still reported as produced elsewhere when no policy asks for
   it, which is what keeps `coverage` and a generated-only run honest.
-* **M10.7** — `--ci` is now honoured on the `--all-contracts` path and refuses
-  an advisory policy. No schema migration, and no leaking-instruction/folded-
-  symbol diagnostics.
 * **M10.8** — no benchmark comparing unified execution against
   standalone-plus-standalone, and no mutation experiment run through the unified
   command.
