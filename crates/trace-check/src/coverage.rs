@@ -359,10 +359,31 @@ pub struct LlvmTools {
 }
 
 impl LlvmTools {
-    pub fn locate() -> Result<LlvmTools, CoverageError> {
+    /// Locates the tools in `toolchain`'s sysroot.
+    ///
+    /// # The profile format is a compatibility boundary
+    ///
+    /// `llvm-profdata` reads a raw profile whose format version is decided by
+    /// the compiler that produced the instrumented artifact. Resolving the
+    /// tools from a *different* toolchain than the one that built it is not a
+    /// reporting inaccuracy, it is a hard failure:
+    ///
+    /// ```text
+    /// raw profile version mismatch: Profile uses raw profile format
+    /// version = 11; expected version = 10
+    /// ```
+    ///
+    /// The generated harnesses are built with the analyzed library's
+    /// toolchain, so the tools have to come from there too. `None` keeps the
+    /// ambient resolution, which is right when the caller is not analyzing a
+    /// library -- the bundled M4 cases, a test asking only whether the tools
+    /// exist at all.
+    pub fn locate(
+        toolchain: Option<&crate::toolchain::Toolchain>,
+    ) -> Result<LlvmTools, CoverageError> {
         let directory = match std::env::var_os(LLVM_TOOLS_ENV) {
             Some(from_env) => PathBuf::from(from_env),
-            None => sysroot_tools_dir()?,
+            None => sysroot_tools_dir(toolchain)?,
         };
         let profdata = directory.join("llvm-profdata");
         let cov = directory.join("llvm-cov");
@@ -396,8 +417,16 @@ impl LlvmTools {
 
 /// `<sysroot>/lib/rustlib/<target>/bin`, where `rustup component add
 /// llvm-tools` installs them.
-fn sysroot_tools_dir() -> Result<PathBuf, CoverageError> {
-    let output = Command::new("rustc")
+fn sysroot_tools_dir(
+    toolchain: Option<&crate::toolchain::Toolchain>,
+) -> Result<PathBuf, CoverageError> {
+    let mut command = Command::new("rustc");
+    // The sysroot of the toolchain that will build the instrumented artifact,
+    // not of whichever one this process resolves. See `LlvmTools::locate`.
+    if let Some(toolchain) = toolchain {
+        toolchain.apply(&mut command);
+    }
+    let output = command
         .args(["--print", "sysroot"])
         .output()
         .map_err(|e| CoverageError::Io(format!("cannot run rustc: {e}")))?;

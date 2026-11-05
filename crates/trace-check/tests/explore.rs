@@ -42,7 +42,7 @@ fn library_manifest() -> PathBuf {
 }
 
 fn llvm_tools() -> Option<LlvmTools> {
-    match LlvmTools::locate() {
+    match LlvmTools::locate(None) {
         Ok(tools) => Some(tools),
         Err(error) => {
             assert!(

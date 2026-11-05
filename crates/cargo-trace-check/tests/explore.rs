@@ -53,7 +53,7 @@ fn valgrind_available() -> bool {
 }
 
 fn llvm_tools_available() -> bool {
-    let present = trace_check::coverage::LlvmTools::locate().is_ok();
+    let present = trace_check::coverage::LlvmTools::locate(None).is_ok();
     if !present {
         assert!(
             std::env::var_os("TRACE_CHECK_REQUIRE_BACKEND").is_none(),

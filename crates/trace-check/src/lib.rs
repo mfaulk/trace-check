@@ -583,7 +583,7 @@ pub fn run_generated_checks(
         // stage are the same whether it ran or not.
         let (corpus, discovery) = if settings.explore.enabled {
             if tools.is_none() {
-                tools = Some(coverage::LlvmTools::locate()?);
+                tools = Some(coverage::LlvmTools::locate(Some(&library.toolchain))?);
             }
             let tools = tools.as_ref().expect("located just above");
             let (corpus, evidence) = explore_contract(
@@ -927,7 +927,7 @@ pub fn run_contract_coverage(
         // A hard error, as in `run_generated_checks`: a run asked to explore
         // that cannot explore must fail rather than quietly analyze a
         // different corpus.
-        Some(coverage::LlvmTools::locate()?)
+        Some(coverage::LlvmTools::locate(Some(&library.toolchain))?)
     } else {
         None
     };
@@ -1159,7 +1159,7 @@ pub fn report_contract_coverage(
     let valgrind = native::prepare_valgrind().is_ok();
     let available = check_capabilities(
         valgrind,
-        coverage::LlvmTools::locate().is_ok(),
+        coverage::LlvmTools::locate(Some(&library.toolchain)).is_ok(),
         needs_symbolic(&found, policy) && prepare_symbolic_backend(runtime).is_ok(),
     );
     let plan = Plan::resolve(&found, config, policy, &selected, &available, today);

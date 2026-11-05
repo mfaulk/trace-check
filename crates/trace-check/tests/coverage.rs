@@ -37,7 +37,7 @@ fn library_manifest() -> PathBuf {
 /// Returns the LLVM tools, or `None` (after reporting) when they are absent and
 /// the environment has not demanded them.
 fn llvm_tools() -> Option<LlvmTools> {
-    match LlvmTools::locate() {
+    match LlvmTools::locate(None) {
         Ok(tools) => Some(tools),
         Err(error) => {
             assert!(
