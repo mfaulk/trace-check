@@ -1,0 +1,97 @@
+# Check settings for the ml-kem audit adapters.
+#
+# What is NOT here: which parameters are secret. That comes from
+# `#[constant_time(secret = …)]` on the adapter. Configuration decides only
+# *how* each declaration is analyzed, never what it claims.
+#
+# `expected_outcome` is a regression fixture, never an input to the decision.
+# The controls below are expected to be detected — except the two that are
+# expected to be clean, which is the more interesting half: `public_component_branch`
+# proves the declassification boundary moved the classification line, and the
+# audit's real results are worth nothing without it.
+schema_version = 1
+description = "Audit adapters over RustCrypto ml-kem 0.3.4 (ML-KEM-768), with the M11.1 boundary controls."
+
+# ------------------------------------------------------------------
+# The audit targets. One contract per path through the Fujisaki--Okamoto
+# transform, because a corpus that reached only one of them would report a
+# clean result for an operation half of which never ran.
+# ------------------------------------------------------------------
+
+[check."mlkemaudit::decaps::decaps_valid_ciphertext"]
+description = "ML-KEM-768 decapsulation of a genuine ciphertext, dk_pke and z secret"
+rationale = "the successful FO path: re-encryption agrees and the constant-time selection returns the true shared key. Every secret analyzed is a real key, because it comes from the library's own from_seed on a 64-byte seed -- the input FIPS 203 defines for deterministic key generation. The ciphertext is public by construction: it is built through an encapsulation key reconstructed from the public bytes of the expanded encoding, so no secret component is read while building it"
+cases = 48
+
+[check."mlkemaudit::decaps::decaps_corrupted_ciphertext"]
+description = "the same operation on a genuine ciphertext with one public byte flipped"
+rationale = "the implicit-rejection path, which is the one a decapsulation oracle attacks. `position` and `delta` are public -- the attacker's choice of corruption -- and `delta | 1` keeps the corruption from being a no-op, so the rejection branch is reached for every generated input rather than for most of them"
+cases = 96
+
+[check."mlkemaudit::decaps::decaps_supplied_ciphertext"]
+description = "decapsulation of an arbitrary supplied ciphertext"
+rationale = "decapsulation is total: FIPS 203 rejects implicitly, so a malformed ciphertext is a pseudorandom key rather than an error path, and a generated 1088-byte value needs no input-domain restriction. Essentially every generated ciphertext takes the rejection path, which is why the two contracts above exist"
+cases = 48
+
+[check."mlkemaudit::seedlevel::keygen_and_decaps"]
+description = "key generation and decapsulation with the seed marked and nothing declassified"
+rationale = "the seed-level encoding, kept beside the key-level contracts as a measurement rather than replaced by them. Measured: ten undefined-value uses inside ml_kem::algebra::rej_uniform, which branches on XOF output derived from rho. Memcheck attributes their origin to a stack allocation rather than to the client request, so trace-check cannot tie them to the declared secret and fails closed. INCONCLUSIVE is therefore the recorded outcome -- not clean, and not a leak this tool can attribute. docs/audits/ml-kem/findings.md has the evidence"
+cases = 32
+expectation = "analyzer-regression"
+expected_outcome = "INCONCLUSIVE"
+
+# ------------------------------------------------------------------
+# M11.1 controls. Each names the way of being wrong it rules out.
+# ------------------------------------------------------------------
+
+[check."mlkemaudit::controls::pre_keygen_seed_byte"]
+description = "control 1: a branch on seed[0] before key generation"
+rationale = "necessary but insufficient. It shows the harness marked the array; it shows nothing about ml-kem and nothing about the boundary, because it reads the seed before either is involved"
+cases = 32
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"
+
+[check."mlkemaudit::controls::secret_component_branch"]
+description = "control 2: a branch on a byte of dk_pke after the boundary is drawn"
+rationale = "the control that catches over-declassification. dk_pke is the K-PKE decryption key: if this reads as public then the boundary has declassified genuine key material, and every clean result in this audit is worthless. This is the one that must keep passing"
+cases = 32
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"
+
+[check."mlkemaudit::controls::secret_component_address"]
+description = "control 3: a secret-derived load address, indexed by a byte of dk_pke"
+rationale = "the address half of the observation model, checked separately because an implementation can be free of one class and not the other. Every secret executes the same instructions here, so a control-flow-only analysis reports it clean"
+cases = 32
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"
+
+[check."mlkemaudit::controls::public_component_branch"]
+description = "control 4: a branch on a byte of the encapsulation key, under the key-level boundary"
+rationale = "expected clean. ek is public in the protocol -- the attacker holds it -- so a finding here would describe the marking rather than the library. Read with control 5, which is the same branch on the same byte with nothing declassified"
+cases = 32
+
+[check."mlkemaudit::controls::public_component_branch_seed_level"]
+description = "control 5: the same branch on the same byte of ek, with the seed marked"
+rationale = "the boundary pair, measured. Control 4 is clean with zero diagnostics; this one reports its own planted branch at controls.rs:137 among ten unattributable diagnostics, because the seed-level encoding routes the branch through the key-generation XOF and provenance does not survive it. So the pair still shows the boundary moved the classification line -- invisible under the key-level boundary, visible but unattributable under the seed-level one -- and the planned LEAK_DETECTED is not reachable here. See docs/audits/ml-kem/findings.md"
+cases = 32
+expectation = "analyzer-regression"
+expected_outcome = "INCONCLUSIVE"
+
+[check."mlkemaudit::controls::no_planted_leak"]
+description = "control 6: the negative control -- the key-level boundary with nothing planted"
+rationale = "expected clean. A finding here is in the fixture or in the library, and the other controls are what tell those apart. It is also the cheapest reproduction of the audit's main claim"
+cases = 32
+
+[check."mlkemaudit::controls::derived_arithmetic_branch"]
+description = "control 7: a branch on the sum of eight marked dk_pke bytes"
+rationale = "control 2 branches on a byte Memcheck was told about directly; this one branches on something the program computed from those bytes. The pair separates `provenance is lost by derivation` from `provenance is lost by derivation through something specific`"
+cases = 32
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"
+
+[check."mlkemaudit::controls::shared_key_branch"]
+description = "control 8: a branch on a byte of the shared key, derived through the whole FO transform"
+rationale = "the audit's sensitivity control. A genuine leak late in decapsulation would be driven by exactly this kind of deeply derived value, so what this control produces bounds what a clean result on the three real contracts is worth. The expected outcome is recorded from measurement"
+cases = 32
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"
