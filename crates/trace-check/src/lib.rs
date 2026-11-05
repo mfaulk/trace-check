@@ -656,7 +656,7 @@ pub fn run_generated_checks(
             })
             .collect();
         let (policy, policy_detail) = ContractEntry::evaluate(
-            settings.expectation,
+            settings.expectation(),
             settings.expected_outcome.as_deref(),
             &outcome,
             discovery.as_ref(),
@@ -670,7 +670,7 @@ pub fn run_generated_checks(
             harness_sha256: generated.source_sha256.clone(),
             artifact_sha256: artifact.sha256.clone(),
             lockfile_sha256: artifact.lockfile_sha256.clone(),
-            expectation: settings.expectation,
+            expectation: settings.expectation(),
             expected_outcome: settings.expected_outcome.clone(),
             policy,
             policy_detail,

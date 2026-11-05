@@ -23,7 +23,7 @@ the formal noninterference property, and the roadmap.
 | M7 | Coverage-guided leakage discovery | complete, experimental |
 | M8 | Complete contract coverage and enforcement | complete, experimental |
 | M9 | Real-world cryptography integration — auditing `crypto-bigint` | complete, experimental |
-| M10 | Unified multi-backend verification and CI enforcement | in progress — M10.0 feasibility gate complete |
+| M10 | Unified multi-backend verification and CI enforcement | in progress — M10.0, M10.1 complete |
 | M11 | Hardware-oriented validation — statistical timing | future |
 
 `trace-check` turns that idea into reproducible analysis, from five directions:
@@ -420,6 +420,32 @@ A security contract **cannot declare an `expected_outcome` at all** — the sche
 refuses it. That is what stops a stray expectation from turning a real leak into
 a green build, and it is why this project's own deliberately vulnerable fixtures
 have to say `expectation = "analyzer-regression"` out loud.
+
+`[verify."…"]` carries the same `expectation` field, for a fixture that has no
+`[check]` entry to declare it in. A security contract there may declare
+`VERIFIED_BOUNDED` — a useful tripwire on the analyzer and the toolchain — but
+`expected_outcome = "LEAK_DETECTED"` on one is refused when the configuration
+loads, because "this must not leak" and "I expect a leak" cannot both hold.
+
+**One purpose, one outcome per backend (M10.1).** A contract is a security
+contract or an analyzer-regression fixture — never one for one backend and the
+other for another, since that is how a declared leak would excuse a real one.
+The declared *outcome*, though, is per analysis: `[check]` governs `generated`
+and `explore`, `[verify]` governs `symbolic`.
+
+That is not a nicety. Two of this project's fixtures genuinely disagree by
+backend, in opposite directions:
+
+| Fixture | `generated` | `symbolic` | Why |
+| --- | --- | --- | --- |
+| `cbaudit::hidden::magic_gate` | `NO_LEAK_OBSERVED` | `LEAK_DETECTED` | the leak sits behind an exact public-input equality: generated inputs never guess it, a solver solves for it |
+| `crypto::tag::verify_tag_early_exit` | `LEAK_DETECTED` | `VERIFIED_BOUNDED` | the dynamic backend's artifact keeps the per-byte branch; the symbolic backend's vectorizes it away |
+
+Both are two honest answers about two compilations — which is why each result
+carries the hash of the executable it analyzed. A leak from a backend the
+fixture declared *clean* is a real surprise and still fails: the declaration
+excuses only the finding it predicted. A fixture that declares nothing for a
+required analysis cannot pass it either, since there is no claim to reproduce.
 
 | Exit | Meaning |
 | --- | --- |
@@ -1171,6 +1197,8 @@ ci/mutate-m9.py                  one upstream-mutation experiment, with the
 ci/verify-m9-integration.py      asserts the M9 audit report, not its exit code
 ci/verify-m10-feasibility.py     asserts that two backends discharged two
                                  obligations over two distinct artifacts
+docs/MILESTONE-10.md             the M10 record: what each package changed,
+                                 its measured evidence, and what is not done
 docs/spikes/m10-unified-verification/
                                  the recorded M10.0 feasibility gate, its
                                  policy overlay, and the three defects it found

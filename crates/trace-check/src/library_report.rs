@@ -606,6 +606,7 @@ pub(crate) mod tests {
             checks: vec![CheckFeature::ControlFlow, CheckFeature::MemoryAccess],
             assumptions: Vec::new(),
             expected_outcome: expected.into(),
+            expectation: None,
             inputs: Default::default(),
         };
         let case = crate::harness::verification_case(&contract, &symbol, &harness, &settings);

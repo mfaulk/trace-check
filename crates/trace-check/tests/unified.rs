@@ -100,6 +100,11 @@ fn both_required() -> VerifyConfig {
 /// `NOT_SELECTED` and the run costs two backends on one contract instead of
 /// thirty-six analyses.
 fn unified(config: &VerifyConfig, runtime: Option<&str>) -> CoverageReport {
+    unified_for(config, CONTRACT, runtime)
+}
+
+/// The unified checker over one named contract of the audit library.
+fn unified_for(config: &VerifyConfig, contract: &str, runtime: Option<&str>) -> CoverageReport {
     let workspace = Workspace::ephemeral().expect("a private workspace");
     let library =
         Library::resolve(&library_dir().join("Cargo.toml"), &[]).expect("the audit library");
@@ -108,7 +113,7 @@ fn unified(config: &VerifyConfig, runtime: Option<&str>) -> CoverageReport {
         config,
         &workspace,
         &trace_check::CheckOverrides::default(),
-        &Selection::Named(vec![CONTRACT.to_string()]),
+        &Selection::Named(vec![contract.to_string()]),
         None,
         "2026-11-04",
         runtime,
@@ -137,11 +142,18 @@ fn assert_no_blocking_reason_names(report: &CoverageReport, contract: &str) {
 }
 
 fn contract_of(report: &CoverageReport) -> &trace_check::enforcement::ContractCoverage {
+    named(report, CONTRACT)
+}
+
+fn named<'a>(
+    report: &'a CoverageReport,
+    contract: &str,
+) -> &'a trace_check::enforcement::ContractCoverage {
     report
         .contracts
         .iter()
-        .find(|entry| entry.id == CONTRACT)
-        .expect("the audit library declares the contract")
+        .find(|entry| entry.id == contract)
+        .unwrap_or_else(|| panic!("`{contract}` is not declared in this build"))
 }
 
 /// One invocation runs both backends, each obligation is discharged by its own
@@ -321,15 +333,59 @@ fn a_symbolic_requirement_without_declared_bounds_is_incomplete() {
     assert_eq!(report.exit_code(), 2, "{}", report.to_text());
 }
 
-/// A declared leak cannot satisfy a security contract's symbolic obligation.
+/// A security contract cannot declare that it leaks. The contradiction is
+/// refused when the configuration loads, not resolved when a result arrives.
 ///
-/// `cbaudit::controls::pre_decode_first_byte` branches on `secret[0]`. Declared
-/// a **security contract** — which is what dropping the audit configuration's
-/// `expectation = "analyzer-regression"` does — the leak both backends find
-/// must fail the run, and the `[verify]` entry's `expected_outcome` must not
-/// turn it into a pass.
+/// `[check]` has refused `expected_outcome` on a security contract since M6.
+/// `[verify]` could still say `LEAK_DETECTED`, because M4 and M5 predate the
+/// split and had no purpose to check it against — so the only thing standing
+/// between a stray declaration and an excused leak was enforcement getting it
+/// right every time.
 #[test]
-fn an_expected_leak_cannot_make_a_security_contract_pass() {
+fn a_security_contract_declaring_a_leak_is_refused_at_load() {
+    const LEAKY: &str = "cbaudit::controls::pre_decode_first_byte";
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join(CONFIG_FILE);
+    std::fs::write(
+        &path,
+        format!(
+            "schema_version = 1\n\n[verify.\"{LEAKY}\"]\nmax_depth = 20000\n\
+             checks = [\"control-flow\", \"memory-access\"]\n\
+             expected_outcome = \"LEAK_DETECTED\"\n"
+        ),
+    )
+    .expect("write the configuration");
+    let error = VerifyConfig::load(&path).expect_err("the contradiction must be refused");
+    let message = error.to_string();
+    assert!(message.contains("security contract"), "{message}");
+    assert!(
+        message.contains("analyzer-regression"),
+        "the refusal must name the way to declare a deliberate fixture: {message}"
+    );
+
+    // The same entry is fine once it says what it is.
+    std::fs::write(
+        &path,
+        format!(
+            "schema_version = 1\n\n[verify.\"{LEAKY}\"]\nmax_depth = 20000\n\
+             checks = [\"control-flow\", \"memory-access\"]\n\
+             expectation = \"analyzer-regression\"\n\
+             expected_outcome = \"LEAK_DETECTED\"\n"
+        ),
+    )
+    .expect("write the configuration");
+    VerifyConfig::load(&path).expect("a declared fixture is valid");
+}
+
+/// A leak fails a security contract that declared it would verify bounded.
+///
+/// The realistic shape of the rule the load-time check cannot cover: the
+/// configuration asserts `VERIFIED_BOUNDED`, which is a legitimate tripwire on
+/// the analyzer and the toolchain, and the function leaks anyway. The
+/// declaration is not consulted — a security contract's obligation is
+/// discharged by what the analysis established, and a leak is a violation.
+#[test]
+fn a_leak_fails_a_security_contract_that_declared_it_clean() {
     if !analyzer_available() {
         return;
     }
@@ -338,37 +394,20 @@ fn an_expected_leak_cannot_make_a_security_contract_pass() {
         "schema_version = 1\n\n[check.\"{LEAKY}\"]\ncases = 64\n\n\
          [verify.\"{LEAKY}\"]\nmax_depth = 20000\n\
          checks = [\"control-flow\", \"memory-access\"]\n\
-         expected_outcome = \"LEAK_DETECTED\"\n\n\
+         expected_outcome = \"VERIFIED_BOUNDED\"\n\n\
          [policy]\nmode = \"strict\"\ndefault_required = [\"generated\"]\n\n\
          [policy.contracts.\"{LEAKY}\"]\nrequired = [\"generated\", \"symbolic\"]\n"
     ));
-    let workspace = Workspace::ephemeral().expect("a private workspace");
-    let library =
-        Library::resolve(&library_dir().join("Cargo.toml"), &[]).expect("the audit library");
-    let report = trace_check::run_contract_coverage(
-        &library,
-        &config,
-        &workspace,
-        &trace_check::CheckOverrides::default(),
-        &Selection::Named(vec![LEAKY.to_string()]),
-        None,
-        "2026-11-04",
-        None,
-    )
-    .expect("the unified run reports rather than failing");
+    let report = unified_for(&config, LEAKY, None);
+    let contract = named(&report, LEAKY);
 
-    let contract = report
-        .contracts
-        .iter()
-        .find(|entry| entry.id == LEAKY)
-        .expect("declared");
     assert!(
-        contract.regression_expectation.is_none(),
-        "without an explicit analyzer-regression expectation this is a security contract"
+        contract.regression_expectations.is_empty(),
+        "without an explicit analyzer-regression declaration this is a security contract"
     );
     assert!(
         contract.violated(),
-        "a detected leak fails a security contract whatever `expected_outcome` says: {:?}",
+        "a detected leak fails a security contract whatever it declared: {:?}",
         contract.status
     );
     assert!(!contract.satisfied());
@@ -380,65 +419,207 @@ fn an_expected_leak_cannot_make_a_security_contract_pass() {
     );
 }
 
-/// A fixture that declares different outcomes for the two backends cannot be
-/// enforced by a model holding one expectation per contract, and says so.
+/// A fixture may declare that generated inputs will not reach its gate while a
+/// solver will, and both declarations are enforced independently.
 ///
 /// `cbaudit::hidden::magic_gate` hides a leak behind an exact public-input
-/// equality. Generated testing never guesses the gate and declares
-/// `NO_LEAK_OBSERVED`; symbolic execution solves for it and declares
-/// `LEAK_DETECTED`. Both are correct, and `regression_expectation` is a single
-/// value read from `[check]` -- so folding the symbolic result against it would
-/// report a fixture that is behaving exactly as declared as misbehaving.
-///
-/// Until expectations are modelled per analysis (M10.1) the obligation is
-/// settled as a gap: strict CI fails, the diagnostic names the conflict, and no
-/// result is judged against the wrong expectation. Settled before any backend
-/// runs, so this test needs no analyzer.
+/// equality. `[check]` declares `NO_LEAK_OBSERVED` -- generated inputs never
+/// guess the magic value -- and `[verify]` declares `LEAK_DETECTED`, because a
+/// solver does. Both are correct, and this is the disagreement M10.0 could only
+/// report as a gap: one expected outcome per contract had to judge the symbolic
+/// result against the generated declaration.
 #[test]
-fn a_backend_disagreement_fixture_is_not_judged_against_the_wrong_expectation() {
+fn a_fixture_may_declare_a_different_outcome_per_backend() {
+    if !analyzer_available() {
+        return;
+    }
     const DISAGREES: &str = "cbaudit::hidden::magic_gate";
     let config = config_with_policy(&format!(
         "[policy]\nmode = \"strict\"\ndefault_required = [\"generated\"]\n\n\
-         [policy.contracts.\"{DISAGREES}\"]\nrequired = [\"symbolic\"]\n"
+         [policy.contracts.\"{DISAGREES}\"]\nrequired = [\"generated\", \"symbolic\"]\n"
+    ));
+    let report = unified_for(&config, DISAGREES, None);
+    let contract = named(&report, DISAGREES);
+
+    assert_eq!(
+        contract.regression_expectations.get(&Analysis::Generated),
+        Some(&Outcome::NoLeakObserved)
+    );
+    assert_eq!(
+        contract.regression_expectations.get(&Analysis::Symbolic),
+        Some(&Outcome::LeakDetected)
+    );
+
+    // Each backend reproduced its own declaration.
+    assert_eq!(
+        contract
+            .evidence_for(Analysis::Generated)
+            .map(|e| e.outcome),
+        Some(Outcome::NoLeakObserved)
+    );
+    assert_eq!(
+        contract.evidence_for(Analysis::Symbolic).map(|e| e.outcome),
+        Some(Outcome::LeakDetected)
+    );
+    for analysis in [Analysis::Generated, Analysis::Symbolic] {
+        assert_eq!(
+            contract.status.get(&analysis).map(|s| s.as_str()),
+            Some("CHECKED"),
+            "{analysis} must be judged against its own declaration: {:?}",
+            contract.status
+        );
+    }
+
+    // The declared leak is the fixture passing, not a violation -- and the
+    // declaration excuses only the backend that predicted it.
+    assert!(!contract.violated(), "{:?}", contract.status);
+    assert!(contract.satisfied(), "{:?}", contract.status);
+    assert_no_blocking_reason_names(&report, DISAGREES);
+}
+
+/// The same disagreement inverted: generated testing finds the leak and
+/// symbolic verification does not.
+///
+/// `crypto::tag::verify_tag_early_exit` is written with a per-byte branch. The
+/// symbolic backend's freestanding artifact vectorizes it away and verifies
+/// bounded; the dynamic backend's artifact keeps the branch and finds it. Two
+/// honest answers about two compilations, which is why the artifact hashes are
+/// part of the evidence. A model that took the generated declaration as the
+/// contract's would have failed the symbolic result here.
+#[test]
+fn the_inverse_disagreement_is_enforced_too() {
+    if !analyzer_available() {
+        return;
+    }
+    const INVERTED: &str = "crypto::tag::verify_tag_early_exit";
+    let base = std::fs::read_to_string(
+        workspace_root()
+            .join("examples/crypto-library")
+            .join(CONFIG_FILE),
+    )
+    .expect("the bundled configuration is committed");
+    let config = write_config(&format!(
+        "{base}\n[policy]\nmode = \"strict\"\ndefault_required = [\"generated\"]\n\n\
+         [policy.contracts.\"{INVERTED}\"]\nrequired = [\"generated\", \"symbolic\"]\n"
     ));
     let workspace = Workspace::ephemeral().expect("a private workspace");
-    let library =
-        Library::resolve(&library_dir().join("Cargo.toml"), &[]).expect("the audit library");
+    let library = Library::resolve(
+        &workspace_root().join("examples/crypto-library/Cargo.toml"),
+        &[],
+    )
+    .expect("the bundled library");
     let report = trace_check::run_contract_coverage(
         &library,
         &config,
         &workspace,
         &trace_check::CheckOverrides::default(),
-        // Selected, so the gap cannot be mistaken for NOT_SELECTED.
-        &Selection::Named(vec![DISAGREES.to_string()]),
+        &Selection::Named(vec![INVERTED.to_string()]),
         None,
         "2026-11-04",
-        Some(UNREACHABLE_RUNTIME),
+        None,
     )
     .expect("the unified run reports rather than failing");
+    let contract = named(&report, INVERTED);
 
-    let contract = report
-        .contracts
-        .iter()
-        .find(|entry| entry.id == DISAGREES)
-        .expect("declared");
-    let status = contract
-        .status
-        .get(&Analysis::Symbolic)
-        .expect("a required analysis always has a status");
-    assert_eq!(status.as_str(), "INCONCLUSIVE", "{status:?}");
-    let detail = status.describe();
-    assert!(
-        detail.contains("NO_LEAK_OBSERVED") && detail.contains("LEAK_DETECTED"),
-        "the diagnostic must name both declared outcomes: {detail}"
+    assert_eq!(
+        contract
+            .evidence_for(Analysis::Generated)
+            .map(|e| e.outcome),
+        Some(Outcome::LeakDetected),
+        "the dynamic artifact keeps the per-byte branch"
     );
-    assert!(
-        detail.contains("verify --contract"),
-        "the diagnostic must name the command that can still verify it: {detail}"
+    assert_eq!(
+        contract.evidence_for(Analysis::Symbolic).map(|e| e.outcome),
+        Some(Outcome::VerifiedBounded),
+        "the symbolic artifact vectorizes it away"
     );
-    assert!(!contract.satisfied(), "{:?}", contract.status);
+    for analysis in [Analysis::Generated, Analysis::Symbolic] {
+        assert_eq!(
+            contract.status.get(&analysis).map(|s| s.as_str()),
+            Some("CHECKED"),
+            "{analysis}: {:?}",
+            contract.status
+        );
+    }
+    assert!(!contract.violated(), "{:?}", contract.status);
+    assert!(contract.satisfied(), "{:?}", contract.status);
+
+    // The two results describe two different executables, which is the whole
+    // reason they are allowed to disagree.
+    let generated = contract.evidence_for(Analysis::Generated).expect("present");
+    let symbolic = contract.evidence_for(Analysis::Symbolic).expect("present");
+    assert_ne!(generated.artifact_sha256, symbolic.artifact_sha256);
+}
+
+/// Two tables declaring different purposes for one contract is refused when the
+/// configuration loads, before any backend runs.
+///
+/// The dangerous direction is explicit: `[check]` saying `security-contract`
+/// with `[verify]` saying `analyzer-regression` would make the contract a
+/// fixture, so one section would override the other's stated security intent
+/// and a declared leak would satisfy strict CI.
+///
+/// Distinct from the covered case of one table declaring a purpose while the
+/// other is silent, which is a complete declaration and stays legal.
+#[test]
+fn contradictory_contract_purposes_are_refused_at_load() {
+    const CONTESTED: &str = "crypto::operation";
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join(CONFIG_FILE);
+    let write = |check_purpose: &str, verify_purpose: &str| {
+        std::fs::write(
+            &path,
+            format!(
+                "schema_version = 1\n\n[check.\"{CONTESTED}\"]\n{check_purpose}\n\n\
+                 [verify.\"{CONTESTED}\"]\nmax_depth = 4000\n\
+                 checks = [\"control-flow\", \"memory-access\"]\n\
+                 expected_outcome = \"LEAK_DETECTED\"\n{verify_purpose}\n"
+            ),
+        )
+        .expect("write the configuration");
+    };
+
+    // The contradiction.
+    write(
+        "expectation = \"security-contract\"",
+        "expectation = \"analyzer-regression\"",
+    );
+    let error = VerifyConfig::load(&path).expect_err("a contradiction must be refused");
+    let message = error.to_string();
+    assert!(message.contains("security-contract"), "{message}");
+    assert!(message.contains("analyzer-regression"), "{message}");
     assert!(
-        contract.evidence_for(Analysis::Symbolic).is_none(),
-        "nothing ran, so there is no symbolic evidence to mis-attribute"
+        message.contains("State the purpose once"),
+        "the refusal must say what to do: {message}"
+    );
+
+    // The same contradiction the other way round.
+    write(
+        "expectation = \"analyzer-regression\"\nexpected_outcome = \"LEAK_DETECTED\"",
+        "expectation = \"security-contract\"",
+    );
+    VerifyConfig::load(&path).expect_err("a contradiction must be refused either way round");
+
+    // Agreement is fine.
+    write(
+        "expectation = \"analyzer-regression\"\nexpected_outcome = \"LEAK_DETECTED\"",
+        "expectation = \"analyzer-regression\"",
+    );
+    let config = VerifyConfig::load(&path).expect("agreeing declarations are valid");
+    assert_eq!(
+        config.purpose(CONTESTED),
+        trace_check::contract::Expectation::AnalyzerRegression
+    );
+
+    // And so is one table declaring it while the other stays silent, which is
+    // the shape every fixture in this repository already uses.
+    write(
+        "expectation = \"analyzer-regression\"\nexpected_outcome = \"LEAK_DETECTED\"",
+        "",
+    );
+    let config = VerifyConfig::load(&path).expect("a silent table does not contradict");
+    assert_eq!(
+        config.purpose(CONTESTED),
+        trace_check::contract::Expectation::AnalyzerRegression
     );
 }

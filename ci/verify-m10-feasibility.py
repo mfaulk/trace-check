@@ -205,20 +205,66 @@ def main(argv):
             "harness that marked nothing is not a clean result",
         )
 
-    # ---- nothing passed a symbolic requirement without symbolic evidence
+    # ---- nothing passed a required analysis without matching evidence
+    #
+    # A security contract is discharged by what its backend establishes. An
+    # analyzer-regression fixture is discharged by reproducing what it declared
+    # -- per analysis, so a fixture may be NO_LEAK_OBSERVED to generated
+    # testing and LEAK_DETECTED to symbolic execution. Either way the status
+    # must rest on evidence that actually says so.
     for row in report.get("contracts", []):
-        if "symbolic" not in row.get("required", []):
-            continue
-        if row.get("status", {}).get("symbolic", {}).get("state") != "checked":
-            continue
-        outcomes = [
-            item["outcome"]
-            for item in row.get("evidence", [])
-            if item["analysis"] == "symbolic"
+        declared = row.get("regression_expectations") or {}
+        for analysis in row.get("required", []):
+            if row.get("status", {}).get(analysis, {}).get("state") != "checked":
+                continue
+            outcomes = [
+                item["outcome"]
+                for item in row.get("evidence", [])
+                if item["analysis"] == analysis
+            ]
+            wanted = declared.get(analysis) or DISCHARGED_BY.get(analysis)
+            require(
+                outcomes == [wanted],
+                f"`{row['id']}` reports {analysis} as checked on evidence {outcomes!r}, "
+                f"which is not the {wanted} it is discharged by",
+            )
+
+    # ---- at least one fixture must prove the backends are judged separately
+    disagreeing = [
+        row["id"]
+        for row in report.get("contracts", [])
+        if len(set((row.get("regression_expectations") or {}).values())) > 1
+    ]
+    require(
+        disagreeing,
+        "no contract in this report declares different outcomes for different backends, so "
+        "nothing here would notice if one backend's result were judged against another's "
+        "declaration -- the failure per-analysis expectations exist to prevent",
+    )
+    for name in disagreeing:
+        row = next(r for r in report["contracts"] if r["id"] == name)
+        declared = row["regression_expectations"]
+        for analysis, expected in declared.items():
+            if analysis not in row.get("required", []):
+                continue
+            state = row.get("status", {}).get(analysis, {}).get("state")
+            require(
+                state == "checked",
+                f"`{name}` declares {expected} for {analysis} and reports {state!r}; a "
+                f"fixture that reproduces its declaration must pass",
+            )
+        # A violation surfaces as LEAK_DETECTED in the enforcement dimension,
+        # so that is what is asserted -- there is no `violated` field to read,
+        # and a check against a missing key would quietly pass.
+        violated = [
+            analysis
+            for analysis, state in (row.get("status") or {}).items()
+            if state.get("state") == "leak-detected"
         ]
         require(
-            outcomes == ["VERIFIED_BOUNDED"],
-            f"`{row['id']}` reports symbolic as checked on evidence {outcomes!r}",
+            not violated,
+            f"`{name}` is a declared fixture reproducing its declarations, and {violated} "
+            "is reported as a violation",
         )
 
     # The unified report is meant to become the standard CI interface, so the
