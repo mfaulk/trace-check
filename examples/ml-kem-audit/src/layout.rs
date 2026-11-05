@@ -65,9 +65,9 @@ pub fn z_range(expanded: &[u8; EXPANDED_LEN]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ml_kem::{DecapsulationKey768, KeyExport};
     #[allow(deprecated)]
     use ml_kem::ExpandedKeyEncoding;
+    use ml_kem::{DecapsulationKey768, KeyExport};
 
     /// The offsets agree with `ml-kem`'s own accessors: the bytes this module
     /// calls `ek` are exactly what `encapsulation_key().to_bytes()` returns, so
@@ -111,7 +111,9 @@ mod tests {
         assert_eq!(Z_OFFSET + Z_LEN, EXPANDED_LEN);
         let expanded = [0u8; EXPANDED_LEN];
         assert_eq!(
-            dk_pke_range(&expanded).len() + public_range(&expanded).len() + z_range(&expanded).len(),
+            dk_pke_range(&expanded).len()
+                + public_range(&expanded).len()
+                + z_range(&expanded).len(),
             EXPANDED_LEN
         );
     }

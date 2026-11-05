@@ -1,6 +1,6 @@
 # Milestone 11 — Independent Cryptographic Security Audit and Vulnerability Discovery
 
-**Status:** In progress. M11.0-M11.6 complete; M11.7 and M11.8 outstanding.
+**Status:** Implemented. M11.0-M11.8 complete; the outcome is **baseline success** and §10 says why not more.
 **Gate:** M11.1 passed - see [`audits/ml-kem/integration-report.md`](audits/ml-kem/integration-report.md)
 **Branch:** `feat/m11-independent-audit`, then one branch per package
 **Prerequisite:** Milestone 10, merged
@@ -287,17 +287,22 @@ unchanged.
 
 ## 5. Work packages
 
-| PR | Package | Deliverable |
+| PR | Package | State |
 | --- | --- | --- |
-| M11.0 | Target reconnaissance | Resolve every candidate to a crates.io version, source checksum and license; identify secret-bearing entry points and which implementation paths compile; record existing advisories and audit status; pin the two discovery targets |
-| M11.1 | **Feasibility gate** | For ML-KEM-768 under the §3 encoding: secret propagation confirmed through SHAKE, NTT and the FO check by planted control; the §3.1 declassification boundary chosen and both of its controls passing; valid and invalid ciphertext paths both shown to execute; the library's decapsulation confirmed present in the artifact by disassembly; wall time and peak RSS for one case measured |
-| M11.2 | Audit integration | Adapters for the pinned targets, independent functional oracles against FIPS 203 KATs, a fixed-work output fold, `trace-check.toml` with a rationale and expected outcome per contract |
-| M11.3 | Systematic analysis | `check --all-contracts --ci` over the declared contracts; `check --explore` where the public surface admits it; symbolic verification of the leaf operations scoped in §4 |
-| M11.4 | Candidate triage | Every finding classified: public-data variation, **taint-model artifact** (§3.1), intentional variable time, adapter artifact, out-of-model, or a genuine secret dependency. No finding leaves this package unclassified |
-| M11.5 | Independent confirmation | For each surviving candidate: a minimal local reproducer, the leaking instruction read from disassembly, the attacker model written down, and a candidate fix tested |
-| M11.6 | Controls | `rsa` RUSTSEC-2023-0071 detected on current source; `ml-dsa` RUSTSEC-2025-0144 **not** detected on the affected version, with the miss explained |
-| M11.7 | Disclosure | Private report to maintainers for anything credible, with reproducing evidence and a proposed mitigation; public material held until coordinated |
-| M11.8 | Audit report | What was analyzed, what was found, what it cost, what the analysis could not cover, and which tool changes the audit's own friction points justify |
+| M11.0 | Target reconnaissance | **done** — four candidates resolved, `crypto-pq-ml-kem` found not to exist, `kyberlib` selected |
+| M11.1 | **Feasibility gate** | **done — passed.** 12 contracts, 114 s, 157 MB; boundary controls intact; `decapsulate` confirmed in the artifact |
+| M11.2 | Audit integration | **done** — 60 NIST ACVP vectors, both FO paths, hermetic fixture |
+| M11.3 | Systematic analysis | **done** — dynamic for both targets; symbolic reaches the target and settles nothing |
+| M11.4 | Candidate triage | **done** — every finding classified; none reaches stage 2 |
+| M11.5 | Independent confirmation | **done** — the second target reproduces finding A's classification and localizes its cause |
+| M11.6 | Controls | **done** — `rsa` detected; the `ml-dsa` control recorded **unavailable** on its premise |
+| M11.7 | Disclosure | **done, vacuously** — nothing reached stage 2, so there was nothing to disclose |
+| M11.8 | Audit report | **done** — [`audits/adoption.md`](audits/adoption.md) |
+
+Two packages did not go as planned, and both are recorded rather than
+reshaped. The symbolic scope in M11.3 turned out to be empty because `ml-kem`
+exposes no leaf operation at all, and M11.6's negative control failed its own
+premise because the compiler removed the defect it was built around.
 
 M11.1 is a gate in M9's sense: the remaining packages do not start until it
 passes. Its abort criteria are explicit, because the cost risk here is real in a
@@ -404,55 +409,63 @@ properly.
 
 ## 8. Definition of done
 
-- [ ] Every target resolved to an exact crates.io version, a recorded source
-      checksum, a committed lockfile and a license check.
-- [ ] No target cited that was not resolved this way.
-- [ ] M11.1 gate passed, or its failure recorded with the retarget it forced.
-- [ ] The library's operation confirmed present and executed in the analyzed
-      artifact, by disassembly.
-- [ ] Secret inputs drawn from a domain the library's own key generation
-      produces, with the encoding justified in the threat model.
-- [ ] A declassification boundary chosen and recorded, separating the
-      decapsulation key's secret components from the encapsulation key and its
-      hash, with both §3.1 controls passing: a planted leak on a genuinely
-      secret component still detected, and a planted branch on `ek` detected
-      under encoding A but not under the chosen boundary.
-- [ ] Every finding that disappears under declassification reported as a
-      taint-model artifact, with both runs shown, and never disclosed as a
-      defect.
-- [ ] Valid key/ciphertext pairs constructed deterministically and checked
-      against FIPS 203 vectors by the independent oracle; invalid ciphertexts
-      include targeted corruptions of valid ones; both successful decapsulation
-      and implicit rejection asserted to have executed, per contract.
-- [ ] The public ciphertext arrives at the analyzed call untainted even when
-      the fixture derived it from the case's own seed, and the report says so.
-- [ ] Coverage-varying of public inputs never presented as a relational
-      result; each noninterference claim is within a case, public input fixed.
-- [ ] Adapters invoke upstream implementations without modifying them; clean
-      integration requires zero upstream changes.
-- [ ] Functional oracles independent of the adapter — FIPS 203 KATs — passing at
-      full output width.
-- [ ] Planted controls detected, each with an optimization barrier, covering a
-      branch and an address, and at least one on data derived through key
-      generation.
-- [ ] A negative control reports no finding.
-- [ ] Every analysis finding classified in M11.4; none left unclassified.
-- [ ] `rsa` RUSTSEC-2023-0071 detected on current unpatched source.
-- [ ] `ml-dsa` RUSTSEC-2025-0144 **not** detected on the affected version, with
-      the out-of-model reason stated, and recorded in `docs/limitations.md` as
-      the demonstrated instance of the latency gap — preceded by disassembly
-      evidence that a secret-derived operand reaches a hardware `div` in the
-      analyzed artifact, and with no finding from any other channel confusing
-      the result. If the compiler strength-reduces the division, the control is
-      recorded as unavailable rather than as a demonstration.
-- [ ] Symbolic results reported for the leaf operations, with `INCONCLUSIVE` on
-      anything that did not settle — never promoted.
-- [ ] Any stage-2 candidate privately disclosed before any public mention.
-- [ ] Cost measured: integration effort, wall time and peak RSS per contract.
-- [ ] The audit report documents coverage and limits without claiming either
+- [x] Every target resolved to an exact crates.io version, a committed lockfile
+      and a license check — `ml-kem` `=0.3.4`, `kyberlib` `=0.0.11`, `rsa`
+      `=0.9.10`, `ml-dsa` `=0.1.0-rc.2` and `=0.1.2`.
+- [x] No target cited that was not resolved this way — which is how
+      `crypto-pq-ml-kem` was found not to exist.
+- [x] M11.1 gate passed.
+- [x] The library's operation confirmed present in the analyzed artifact by
+      disassembly — `decapsulate` as 743 instructions, 7 `cmov`, 0 `div`.
+- [x] Secret inputs drawn from a domain the library's own key generation
+      produces: a 64-byte seed, with the reasoning in the threat model.
+- [x] A declassification boundary chosen and recorded, with the
+      over-declassification controls passing. **Partially as specified:** the
+      planted branch on `ek` is clean under the key-level boundary and
+      `INCONCLUSIVE` rather than `LEAK_DETECTED` under the seed-level one, for
+      the provenance reason finding A records. The pair still distinguishes the
+      two encodings — zero diagnostics against ten — and `kyberlib`'s
+      seed-level contract supplies the attributed half.
+- [x] Every finding that disappears under declassification reported as a
+      taint-model artifact, with both runs shown, and never disclosed.
+- [x] Valid key/ciphertext pairs constructed deterministically and checked
+      against FIPS 203 vectors; invalid ciphertexts include targeted
+      corruptions; both FO paths asserted to have executed — by NIST's own
+      classification of five modified and five unmodified ciphertexts.
+- [x] The public ciphertext arrives untainted at the analyzed call, by
+      construction rather than by declassification, and the report says so.
+- [x] Coverage-varying of public inputs never presented as a relational result.
+- [x] Adapters invoke upstream implementations without modifying them; zero
+      upstream changes in both audits.
+- [x] Functional oracles independent of the adapter, at full output width — 60
+      ACVP vectors, passing for both targets.
+- [x] Planted controls detected, each with an optimization barrier, covering a
+      branch and an address, including one on data derived through the whole FO
+      transform.
+- [x] A negative control reports no finding — `no_planted_leak`, both targets.
+- [x] Every analysis finding classified; none left unclassified.
+- [x] `rsa` RUSTSEC-2023-0071 detected on current unpatched source, in
+      `monty_modpow`.
+- [ ] `ml-dsa` RUSTSEC-2025-0144 demonstrated as out of model. **Not done, and
+      recorded as unavailable rather than reshaped:** condition 1 fails because
+      rustc strength-reduces the division, so neither half's artifact contains
+      it and no clean result can demonstrate the gap. `docs/limitations.md` now
+      says the latency exclusion is a scope statement with no measurement behind
+      it, and `ci/verify-m11-controls.py` fails if a future toolchain emits the
+      division.
+- [x] Symbolic results reported, with `INCONCLUSIVE` where nothing settled,
+      never promoted. The scope changed: there is no reachable leaf operation,
+      so the attempt was made against a whole decapsulation.
+- [x] Any stage-2 candidate disclosed before public mention — vacuous: none.
+- [x] Cost measured: wall time and peak RSS per audit, adapter and control line
+      counts, in [`audits/adoption.md`](audits/adoption.md).
+- [x] The audit report documents coverage and limits without claiming either
       library is secure.
-- [ ] CI validates the audit's own claims and both external controls.
-- [ ] M1–M10 tests remain green.
+- [x] CI validates both audits' own claims, the positive control, and the
+      negative control's premise.
+- [x] M1–M10 tests remain green, including every symbolic expectation after the
+      `memcpy` harness fix: crypto-library 6/4, external-library 2/1,
+      crypto-bigint-audit 7/11, zero `INCONCLUSIVE`.
 
 ---
 
@@ -463,3 +476,38 @@ speculation. No hardware timing measurement. No generic, method or struct
 support in `#[constant_time]`. No whole-library verification. No SIMD code
 paths. No cross-architecture or compiler-matrix work. No claim that any audited
 library is secure. And no application-misuse workstream — deferred, per §7.
+
+---
+
+## 10. The outcome against §7's levels
+
+**Baseline success, met in full.** Two externally maintained implementations
+evaluated, four substantial secret-bearing operations analyzed in depth
+(decapsulation on three ciphertext paths, plus key generation at the seed
+level), functional and leakage-positive controls validated, and every result or
+limitation documented.
+
+**Strong success, not met.** No genuine leakage defect was confirmed in upstream
+code. The one upstream finding — rejection sampling on `ρ` — is a taint-model
+artifact, classified as such and reproduced independently in both targets, and
+the libraries document the behaviour themselves.
+
+**Stretch goal, not met.** No previously unknown vulnerability.
+
+The budget held: four candidate crates in reconnaissance, two integrations, and
+two advisories. The milestone did not become an open-ended search.
+
+What M11 produced instead of a vulnerability is a better answer to *why not*,
+and three things that outlast it:
+
+* a reusable method for auditing a structured cryptographic key, where the
+  classification boundary is drawn on a standard's own serialization and kept
+  checkable by a control pair;
+* **two tool defects nothing in this repository could have surfaced** — the
+  `memcpy` link failure, now fixed, which had made bounded verification
+  unavailable to any library that moves large values; and the provenance loss on
+  the `shake` XOF path, which currently makes ML-DSA signing unanalyzable and is
+  ranked first in [`audits/adoption.md`](audits/adoption.md);
+* a demonstration that a *negative* control can fail on its premise, and that
+  the discipline of checking the premise first is what stops an audit from
+  claiming a demonstration it does not have.

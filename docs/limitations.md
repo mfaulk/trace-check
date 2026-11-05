@@ -245,6 +245,63 @@ Every security conclusion still comes from the uninstrumented Memcheck artifact
 under the same two positive controls, and a completed run is still
 `NO_LEAK_OBSERVED` over the inputs selected — better chosen, not exhaustive.
 
+## Marked-secret provenance does not survive every derivation
+
+Milestone 11 found a limit that nothing in this repository could have surfaced,
+because it needs a cryptographic library's own hash stack to appear.
+
+The dynamic backend calls something a secret dependency only when Memcheck
+traces the undefined value driving a branch or an address back to the client
+request that marked it. Through ordinary arithmetic that works, and it works
+through a whole ML-KEM decapsulation: a branch on a byte of the shared key --
+derived from marked key material through K-PKE decryption, two hashes, a full
+re-encryption and a constant-time selection -- is reported and attributed.
+
+Through `shake`'s `ShakeReader` it does not. Marking an ML-KEM key-generation
+seed and letting the library sample its matrix produces
+`Conditional jump ... depends on uninitialised value(s)` reports whose **origin
+Memcheck attributes to a stack allocation**, so the classifier files them as
+unrelated and the contract comes back `INCONCLUSIVE` -- neither a leak nor a
+clean result. For `ml-dsa` signing, which shares that stack, *every* diagnostic
+is unattributable: 147 of them, zero findings, so the operation cannot be
+analyzed to a verdict at all.
+
+`kyberlib`, which has its own Keccak, reports the same algorithmic step as
+attributed findings, so this is specific to that XOF path rather than to sponge
+constructions or to rejection sampling.
+
+Two consequences for reading a report:
+
+* an `INCONCLUSIVE` of this kind is **not** evidence of a leak and **not**
+  evidence of its absence. The direction is fail-closed, which is correct, and
+  it is also useless for the operation in question.
+* a library on that XOF stack can currently be audited only along a path whose
+  hashing runs on declassified data, which is what
+  `examples/ml-kem-audit` does deliberately.
+
+`docs/audits/ml-kem/findings.md` records the evidence and the one experiment
+that would settle the cause.
+
+## Instruction latency: documented, not demonstrated
+
+M11 set out to demonstrate the latency gap rather than assert it, using
+RUSTSEC-2025-0144 -- a secret-dependent division in `ml-dsa`'s `decompose`. It
+could not.
+
+On Linux x86-64 under the pinned toolchain at `opt-level = 3`, the division is
+not in the compiled code: its divisor is a compile-time constant, so rustc
+strength-reduces it to a multiply and a shift. Neither the affected version nor
+the patched one contains a division anywhere in its signing path, so a clean
+result on the affected version demonstrates nothing about latency. The
+advisory's own text names `UDIV`, an AArch64 instruction, and this project is
+x86-64 only.
+
+So the exclusion of operand latency from the observation model remains a scope
+statement with no measurement behind it. `docs/audits/controls.md` records the
+disassembly, and `ci/verify-m11-controls.py` fails if a future toolchain emits
+the division -- at which point the demonstration becomes possible and that
+document has to be rewritten.
+
 ## A complete contract inventory is not a security claim
 
 Milestone 8 added contract discovery, and "complete coverage" is a phrase worth

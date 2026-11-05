@@ -33,7 +33,10 @@ pub fn pre_keygen_seed_byte(seed: &[u8; 64], m: &[u8; 32]) -> u8 {
     let (decap, encap) = fixture::public_keygen(seed);
     let (ciphertext, _) = fixture::valid_ciphertext(&encap, m);
     let shared = fixture::with_key_level_secret(&decap, |key, _| {
-        consume_all_bytes(key.decapsulate(&fixture::ciphertext(&ciphertext)).as_bytes())
+        consume_all_bytes(
+            key.decapsulate(&fixture::ciphertext(&ciphertext))
+                .as_bytes(),
+        )
     });
     shared ^ 0x01
 }
@@ -48,7 +51,10 @@ pub fn secret_component_branch(seed: &[u8; 64], m: &[u8; 32]) -> u8 {
         if marked[0] & 1 == 1 {
             record(2);
         }
-        consume_all_bytes(key.decapsulate(&fixture::ciphertext(&ciphertext)).as_bytes())
+        consume_all_bytes(
+            key.decapsulate(&fixture::ciphertext(&ciphertext))
+                .as_bytes(),
+        )
     });
     shared ^ 0x02
 }
@@ -61,8 +67,10 @@ pub fn secret_component_address(seed: &[u8; 64], m: &[u8; 32]) -> u8 {
     let shared = fixture::with_key_level_secret(&decap, |key, marked| {
         let substituted = SBOX[usize::from(marked[7] & 0x1f)];
         record(substituted);
-        consume_all_bytes(key.decapsulate(&fixture::ciphertext(&ciphertext)).as_bytes())
-            ^ substituted
+        consume_all_bytes(
+            key.decapsulate(&fixture::ciphertext(&ciphertext))
+                .as_bytes(),
+        ) ^ substituted
     });
     shared ^ 0x03
 }
@@ -77,7 +85,10 @@ pub fn public_component_branch(seed: &[u8; 64], m: &[u8; 32]) -> u8 {
         if marked[PK_OFFSET] & 1 == 1 {
             record(4);
         }
-        consume_all_bytes(key.decapsulate(&fixture::ciphertext(&ciphertext)).as_bytes())
+        consume_all_bytes(
+            key.decapsulate(&fixture::ciphertext(&ciphertext))
+                .as_bytes(),
+        )
     });
     shared ^ 0x04
 }
@@ -105,7 +116,10 @@ pub fn no_planted_leak(seed: &[u8; 64], m: &[u8; 32]) -> u8 {
     let (decap, encap) = fixture::public_keygen(seed);
     let (ciphertext, _) = fixture::valid_ciphertext(&encap, m);
     let shared = fixture::with_key_level_secret(&decap, |key, _| {
-        consume_all_bytes(key.decapsulate(&fixture::ciphertext(&ciphertext)).as_bytes())
+        consume_all_bytes(
+            key.decapsulate(&fixture::ciphertext(&ciphertext))
+                .as_bytes(),
+        )
     });
     shared ^ 0x06
 }

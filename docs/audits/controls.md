@@ -103,6 +103,12 @@ The divisor `TwoGamma2::U32` is a compile-time constant, so at `opt-level = 3`
 rustc 1.97 strength-reduces `r1.0 /= TwoGamma2::U32` to a multiply and shift.
 The advisory's defect is **not present** in the analyzed machine code.
 
+Two artifacts were examined and agree: the analyzed executable `check` built
+(`raw_sign_deterministic` 6444 instructions, no division) and the control
+crate's own release `rlib`, which is what `ci/verify-m11-controls.py` reads in
+CI (737 instructions, no division — fewer because it has not yet been inlined
+into a binary).
+
 The two `div` instructions that *are* in rc.2's `ml_dsa` code are not it. Both
 are `256 / stride` in the NTT's loop structure:
 

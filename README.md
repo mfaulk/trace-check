@@ -24,7 +24,7 @@ the formal noninterference property, and the roadmap.
 | M8 | Complete contract coverage and enforcement | complete, experimental |
 | M9 | Real-world cryptography integration — auditing `crypto-bigint` | complete, experimental |
 | M10 | Unified multi-backend verification and CI enforcement | complete, experimental |
-| M11 | Independent cryptographic audit — vulnerability discovery in upstream code | planned |
+| M11 | Independent cryptographic audit — two post-quantum KEMs and two advisories | complete, experimental |
 | M12 | Hardware-oriented validation — statistical timing | future |
 
 `trace-check` turns that idea into reproducible analysis, from five directions:
@@ -891,6 +891,78 @@ the analysis boundary. **None of it is a claim that `crypto-bigint` is
 secure:** it is three operations, under two modeled observations, on one
 artifact.
 
+### Auditing two post-quantum KEMs, and calibrating against real advisories (M11)
+
+M9 analyzed a library nobody here wrote. Every leak it detected in one,
+however, was planted here. M11 points the tool at two independently maintained
+FIPS 203 implementations with nothing planted in the libraries at all:
+
+```sh
+cargo trace-check check --all-configured --ci --jobs 12 \
+  --manifest-path examples/ml-kem-audit/Cargo.toml       # ml-kem 0.3.4
+cargo trace-check check --all-configured --ci --jobs 12 \
+  --manifest-path examples/kyberlib-audit/Cargo.toml     # kyberlib 0.0.11
+```
+
+ML-KEM-768 decapsulation is `NO_LEAK_OBSERVED` for both, over 192 generated
+cases each, and `decapsulate` is confirmed present in the artifact as 743
+instructions with seven `cmov` where `ct_eq` and `ct_select` are and no
+division — a constant-time shape that survived `opt-level = 3`, which no source
+review establishes.
+
+**The hard part was deciding what "secret" means.** A decapsulation key packs
+`dk_pke ‖ ek ‖ H(ek) ‖ z`, and the middle two are public — the attacker holds
+the encapsulation key. Marking a key-generation seed taints them too, and then
+the rejection sampling that builds `Â` from the *public* `ρ` reads as a leak.
+So the adapters run key generation on a declassified copy of the seed and
+re-mark only the genuinely secret components, with a control pair that proves
+the line moved where it claims to and no further.
+[docs/audits/ml-kem/threat-model.md](docs/audits/ml-kem/threat-model.md) is the
+reasoning; the secret is a 64-byte seed rather than a 2400-byte key because
+being a key includes `H(ek)` matching `ek`, which no input constraint expresses.
+
+A clean result is worth reading only because of the controls, and the one that
+matters most is a planted branch on a byte of the **shared secret** — derived
+through K-PKE decryption, two hashes, a full re-encryption and a constant-time
+selection. It is detected, so a leak late in the transform would be attributed
+rather than silently missed.
+
+Two things M11 turned up that neither audit alone could have:
+
+* **Provenance does not survive every hash stack.** Under a seed-level marking,
+  `ml-kem`'s sampler produces undefined-value uses whose origin Memcheck
+  attributes to a stack allocation, so trace-check cannot tie them to the
+  declared secret and fails closed. `kyberlib`, with its own Keccak, reports the
+  same algorithmic step as *attributed* findings — which localizes the gap to
+  one XOF path rather than to sponges in general. For `ml-dsa`, which shares
+  that path, **signing is not analyzable to a verdict at all**: 147 diagnostics,
+  zero findings.
+* **A negative control can fail on its premise.** M11.6 set out to demonstrate
+  the latency blind spot with RUSTSEC-2025-0144's secret-dependent division, and
+  found that rustc strength-reduces it away: no division in either the affected
+  or the patched version's signing path. Recorded as *unavailable* rather than
+  dressed up as a demonstration, with the disassembly in CI.
+
+The positive control works: `rsa` 0.9.10, which RUSTSEC-2023-0071 still affects
+with no patched version, is detected in `monty_modpow`'s Montgomery
+exponentiation without the tool being told where to look.
+
+Functional correctness comes from NIST ACVP vectors — 60 of them, including a
+decapsulation group of five valid and five modified ciphertexts, which is
+independent evidence that both paths through the Fujisaki–Okamoto transform
+executed rather than a corpus that happened to reach one.
+
+See [docs/MILESTONE-11.md](docs/MILESTONE-11.md) for the milestone,
+[docs/audits/ml-kem/findings.md](docs/audits/ml-kem/findings.md) and
+[docs/audits/kyberlib/findings.md](docs/audits/kyberlib/findings.md) for every
+finding with its classification,
+[docs/audits/controls.md](docs/audits/controls.md) for the two advisories, and
+[docs/audits/adoption.md](docs/audits/adoption.md) for what it cost and the five
+tool changes it points to. **No previously unknown vulnerability was found, and
+nothing here is a claim that either library is secure:** it is one operation per
+library, under two modeled observations, on one artifact each, with no symbolic
+result at all.
+
 ### `native` — secret-dependency analysis of native code
 
 ```sh
@@ -1273,11 +1345,32 @@ examples/crypto-bigint-audit/    audit adapters over RustCrypto crypto-bigint
                                  0.7.10, consumed unmodified as a pinned
                                  dependency, with the propagation controls and
                                  1012 independently computed vectors (M9)
+examples/ml-kem-audit/           audit adapters over RustCrypto ml-kem 0.3.4,
+                                 with the classification boundary, eight
+                                 controls and 60 NIST ACVP vectors (M11)
+examples/ml-kem-symbolic/        a no_std ml-kem contract, for the symbolic
+                                 feasibility record (M11)
+examples/kyberlib-audit/         the same audit against kyberlib 0.0.11, the
+                                 second target (M11)
+examples/rsa-control/            M11.6 positive control: the exponentiation
+                                 RUSTSEC-2023-0071 concerns
+examples/ml-dsa-control-vulnerable/  M11.6 negative control, affected half
+examples/ml-dsa-control-patched/     the same contracts against the patched
+                                 version, included rather than copied
 examples/legacy-branch-demo/     original proof of concept, kept for context
 docs/                            milestone plan, methodology, limitations
 docs/audits/crypto-bigint/       the M9 target selection, threat model,
                                  integration report, findings and the
                                  symbolic feasibility matrix
+docs/audits/ml-kem/              the M11 target selection, threat model,
+                                 integration report, findings and the
+                                 symbolic feasibility record
+docs/audits/kyberlib/            the second target's results and the
+                                 cross-target conclusion
+docs/audits/controls.md          the two external advisories, including one
+                                 control recorded as unavailable
+docs/audits/adoption.md          what M11 cost, what it could not do, and the
+                                 tool changes that friction justifies
 docs/spikes/m6-generated-harness/ the recorded M6.1 feasibility spike
 docs/spikes/m7-coverage-feedback/ the recorded M7.1 feasibility spike
 docs/spikes/m8-contract-inventory/ the recorded M8.1 feasibility spike
@@ -1296,6 +1389,12 @@ ci/benchmark-m9.py               M6 against M7 on the external integration
 ci/mutate-m9.py                  one upstream-mutation experiment, with the
                                  validity checks that make its outcome earned
 ci/verify-m9-integration.py      asserts the M9 audit report, not its exit code
+ci/gen-m11-vectors.py            extracts the M11 adapters' ACVP vectors from
+                                 NIST's files; --check guards fixture drift
+ci/verify-m11-audit.py           asserts each M11 audit's own claims, including
+                                 that the two targets disagree where they must
+ci/verify-m11-controls.py        asserts the M11.6 negative control's premise:
+                                 no division in either half's signing path
 ci/verify-m10-feasibility.py     asserts that two backends discharged two
                                  obligations over two distinct artifacts, and
                                  that one Memcheck workflow served both the

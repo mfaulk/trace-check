@@ -60,7 +60,10 @@ pub fn pre_keygen_seed_byte(seed: &[u8; 64], m: &[u8; 32]) -> u8 {
     let expanded = fixture::public_keygen(seed);
     let (ciphertext, _) = fixture::valid_ciphertext(&expanded, m);
     let shared = fixture::with_key_level_secret(&expanded, |key, _| {
-        consume_all_bytes(key.decapsulate(&fixture::ciphertext(&ciphertext)).as_slice())
+        consume_all_bytes(
+            key.decapsulate(&fixture::ciphertext(&ciphertext))
+                .as_slice(),
+        )
     });
     shared ^ 0x01
 }
@@ -79,7 +82,10 @@ pub fn secret_component_branch(seed: &[u8; 64], m: &[u8; 32]) -> u8 {
         if marked[0] & 1 == 1 {
             record(2);
         }
-        consume_all_bytes(key.decapsulate(&fixture::ciphertext(&ciphertext)).as_slice())
+        consume_all_bytes(
+            key.decapsulate(&fixture::ciphertext(&ciphertext))
+                .as_slice(),
+        )
     });
     shared ^ 0x02
 }
@@ -97,8 +103,10 @@ pub fn secret_component_address(seed: &[u8; 64], m: &[u8; 32]) -> u8 {
     let shared = fixture::with_key_level_secret(&expanded, |key, marked| {
         let substituted = SBOX[usize::from(marked[7] & 0x1f)];
         record(substituted);
-        consume_all_bytes(key.decapsulate(&fixture::ciphertext(&ciphertext)).as_slice())
-            ^ substituted
+        consume_all_bytes(
+            key.decapsulate(&fixture::ciphertext(&ciphertext))
+                .as_slice(),
+        ) ^ substituted
     });
     shared ^ 0x03
 }
@@ -119,7 +127,10 @@ pub fn public_component_branch(seed: &[u8; 64], m: &[u8; 32]) -> u8 {
         if marked[EK_OFFSET] & 1 == 1 {
             record(4);
         }
-        consume_all_bytes(key.decapsulate(&fixture::ciphertext(&ciphertext)).as_slice())
+        consume_all_bytes(
+            key.decapsulate(&fixture::ciphertext(&ciphertext))
+                .as_slice(),
+        )
     });
     shared ^ 0x04
 }
@@ -163,7 +174,10 @@ pub fn derived_arithmetic_branch(seed: &[u8; 64], m: &[u8; 32]) -> u8 {
         if accumulated & 1 == 1 {
             record(7);
         }
-        consume_all_bytes(key.decapsulate(&fixture::ciphertext(&ciphertext)).as_slice())
+        consume_all_bytes(
+            key.decapsulate(&fixture::ciphertext(&ciphertext))
+                .as_slice(),
+        )
     });
     shared ^ 0x07
 }
@@ -200,7 +214,10 @@ pub fn no_planted_leak(seed: &[u8; 64], m: &[u8; 32]) -> u8 {
     let expanded = fixture::public_keygen(seed);
     let (ciphertext, _) = fixture::valid_ciphertext(&expanded, m);
     let shared = fixture::with_key_level_secret(&expanded, |key, _| {
-        consume_all_bytes(key.decapsulate(&fixture::ciphertext(&ciphertext)).as_slice())
+        consume_all_bytes(
+            key.decapsulate(&fixture::ciphertext(&ciphertext))
+                .as_slice(),
+        )
     });
     shared ^ 0x06
 }

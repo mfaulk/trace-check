@@ -127,7 +127,11 @@ mod tests {
     fn the_modulus_is_a_1024_bit_odd_number() {
         assert_eq!(MODULUS.len(), 128);
         assert_eq!(MODULUS[127] & 1, 1, "an RSA modulus is odd");
-        assert_ne!(MODULUS[0] & 0x80, 0, "the top bit is set, so it is 1024 bits");
+        assert_ne!(
+            MODULUS[0] & 0x80,
+            0,
+            "the top bit is set, so it is 1024 bits"
+        );
     }
 
     /// The two contracts compute the same function and differ only by the
