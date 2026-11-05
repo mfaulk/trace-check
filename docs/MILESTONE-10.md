@@ -828,9 +828,10 @@ job now decides which results get a status, never which get kept. The
 unresolved-target diagnostic had already been fixed for exactly this reason
 during M10.5; the lesson did not generalise the first time.
 
-### Provenance that described the wrong compiler, twice more
+### Provenance that described the wrong compiler, four times more
 
-M10.2 fixed the generated and symbolic harnesses. It missed two others.
+M10.2 fixed the generated and symbolic harnesses. It missed four others — two
+found by review, two by CI.
 
 **M3 test binaries** were built with the ambient toolchain while their evidence
 recorded `library.toolchain` — so pointed at a library elsewhere with
@@ -842,6 +843,43 @@ passes `None`, because it runs in the project it is testing.
 **The symbolic report's `compilation.rustc`** came from `AnalyzerIdentity`,
 measured in trace-check's own environment. The artifact was built correctly and
 the document disagreed with itself. It now comes from the library's toolchain.
+
+### And twice more, in CI
+
+Both of the following passed locally and failed on a runner, for one reason:
+this machine's default toolchain equals the pin and the runner's does not.
+
+**`LlvmTools::locate`** resolved `llvm-profdata` and `llvm-cov` by running
+`rustc --print sysroot` in trace-check's own environment, while the harness it
+reads profiles from was built by the library's toolchain. Unlike the reporting
+cases this one cannot fail quietly — the raw profile format is a hard
+compatibility boundary:
+
+```
+Profile uses raw profile format version = 11; expected version = 10
+```
+
+`locate` takes the toolchain. A library pinning a toolchain without
+`llvm-tools` now fails early, naming that sysroot.
+
+**Three staging sites** copied a library outside the repository and left its
+`rust-toolchain.toml` behind — the M10.4 acceptance fixture, the mutation
+experiments' staged adapter, and the two `stage_library` test helpers. `rustup`
+answers by walking up from the directory, so each was analyzed with whatever
+the machine defaulted to. The mutation experiments are the case that mattered:
+`--unified` requires exploration, so on a runner with no `llvm-tools` in its
+default toolchain there was no report at all — and the earlier, non-unified
+experiments had been measuring the mutation against a different compiler from
+the one it was written against, with nothing to say so.
+
+Each site now stages the pin, and `mutate-m9.py` asserts it took effect rather
+than assuming it: dropping the copy fails on any machine, not only on one whose
+default disagrees.
+
+The generalisation this family keeps demanding: **a toolchain is a property of
+the code being analyzed, never of the process doing the analysis.** Every place
+that reads the ambient environment for one is wrong, and most of them are wrong
+silently.
 
 ### The remaining five
 

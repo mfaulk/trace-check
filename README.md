@@ -844,7 +844,9 @@ python3 ci/mutate-m9.py --mutation mutation-c-indexed-reduction \
 
 The driver stages the pinned source into an isolated copy, applies an explicit
 patch, requires the adapter's own functional tests to still pass, and runs the
-unchanged contract. For the one above, the finding's leaf frame is
+unchanged contract. The copy carries this workspace's `rust-toolchain.toml` and
+the driver asserts it took effect, so the experiment measures the compiler the
+mutation was written against rather than whatever the machine defaults to. For the one above, the finding's leaf frame is
 `montgomery_multiply_inner (src/modular/mul.rs:106)` — upstream source, at the
 patched line — classified as a secret-dependent **address**, with its
 reproducer replayed against the same artifact. A branch in `Uint::carrying_add`
