@@ -1,0 +1,15 @@
+# The symbolic feasibility record for M11.
+#
+# One contract, one entry, and an expected outcome that is a measurement rather
+# than a prediction. ml-kem exposes no leaf operation -- every arithmetic module
+# is private -- so the smallest thing the symbolic backend can be pointed at
+# through the library's public API is a whole key generation plus decapsulation.
+schema_version = 1
+description = "A no_std ml-kem decapsulation contract, for the M11 symbolic feasibility record."
+
+[verify."mlkemsym::keygen_and_decaps"]
+description = "bounded symbolic verification of ML-KEM-768 key generation and decapsulation"
+rationale = "512 symbolic secret bits entering SHAKE, rejection sampling, two NTTs and a full re-encryption. The entry exists so the attempt is on the record with what it actually produced; docs/audits/ml-kem/symbolic-feasibility.md has the numbers"
+max_depth = 2000000
+checks = ["control-flow", "memory-access"]
+expected_outcome = "INCONCLUSIVE"

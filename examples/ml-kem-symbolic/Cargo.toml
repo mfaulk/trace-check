@@ -1,0 +1,17 @@
+[package]
+name = "ml-kem-symbolic"
+description = "A no_std ml-kem decapsulation contract, for the M11 symbolic feasibility record"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "mlkemsym"
+path = "src/lib.rs"
+
+[workspace]
+
+[dependencies]
+ml-kem = { version = "=0.3.4", default-features = false }
+trace-check-macros = { path = "../../crates/trace-check-macros" }
