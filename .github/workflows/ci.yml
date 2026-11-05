@@ -860,6 +860,26 @@ jobs:
           python3 ci/verify-m8-contracts.py m10-unified.json --expect-declared 18
           python3 ci/verify-m10-feasibility.py m10-unified.json
 
+      # M10.6: the same run at two workers must produce the same security
+      # outcomes. `--jobs` trades machine time and nothing else -- results are
+      # folded in plan order, never completion order -- so the two reports are
+      # compared field by field, skipping only the provenance that legitimately
+      # varies between runs (paths, timings).
+      - name: Two workers agree with one
+        env:
+          TRACE_CHECK_REQUIRE_SYMBOLIC: "1"
+          TRACE_CHECK_REQUIRE_BACKEND: "1"
+          EXPECTED_CONTAINER_RUNTIME: docker
+        run: |
+          set -euo pipefail
+          cargo run --locked --release -p cargo-trace-check -- check \
+            --all-contracts --ci --format json --jobs 2 \
+            --manifest-path examples/crypto-bigint-audit/Cargo.toml \
+            --config m10-unified.toml \
+            > m10-unified-jobs2.json
+          python3 ci/verify-m10-feasibility.py m10-unified-jobs2.json
+          python3 ci/compare-m10-runs.py m10-unified.json m10-unified-jobs2.json
+
       # M10.4: `dynamic`, `generated` and `symbolic` evidence from one
       # invocation, against the one contract here that all three can be
       # configured for. The load-bearing case rewrites the `#[ct_test]` so it

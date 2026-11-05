@@ -23,7 +23,7 @@ the formal noninterference property, and the roadmap.
 | M7 | Coverage-guided leakage discovery | complete, experimental |
 | M8 | Complete contract coverage and enforcement | complete, experimental |
 | M9 | Real-world cryptography integration — auditing `crypto-bigint` | complete, experimental |
-| M10 | Unified multi-backend verification and CI enforcement | in progress — M10.0–M10.2, M10.4–M10.5 complete |
+| M10 | Unified multi-backend verification and CI enforcement | in progress — M10.0–M10.2, M10.4–M10.6 complete |
 | M11 | Hardware-oriented validation — statistical timing | future |
 
 `trace-check` turns that idea into reproducible analysis, from five directions:
@@ -668,6 +668,22 @@ artifact an explored run already covers the baseline corpus with. So requiring
 obligations, and each evidence record names the other in `shared_with` — two
 requirements met, one observation, never counted twice.
 
+```sh
+cargo trace-check check --all-contracts --ci --jobs 2
+```
+
+`--jobs` runs that many analysis jobs of each backend at once; one by default.
+It trades nothing but machine time: results are folded in plan order rather
+than completion order, so the statuses, outcomes, artifact hashes and exit code
+are identical whatever it is set to — `ci/compare-m10-runs.py` holds CI to
+that. What it buys is overlap between phases, one contract's Memcheck run while
+another's harness compiles, rather than parallel compilation: builds within a
+backend serialise on Cargo's target-directory lock, because per-job target
+directories would rebuild the library and every dependency per job.
+
+Measured over the eighteen `crypto-bigint` audit contracts, `--jobs 2` takes
+2:25 against 3:58 sequentially for 2 MB more memory.
+
 `--ci` requires `mode = "strict"` and refuses an advisory policy. Advisory mode
 reports gaps without failing, which is what it is for during adoption and
 exactly why it must not be the reason a CI job is green.
@@ -1244,7 +1260,11 @@ ci/mutate-m9.py                  one upstream-mutation experiment, with the
                                  validity checks that make its outcome earned
 ci/verify-m9-integration.py      asserts the M9 audit report, not its exit code
 ci/verify-m10-feasibility.py     asserts that two backends discharged two
-                                 obligations over two distinct artifacts
+                                 obligations over two distinct artifacts, and
+                                 that one Memcheck workflow served both the
+                                 generated and explore obligations
+ci/compare-m10-runs.py           requires `--jobs 2` to reach the same security
+                                 outcomes as `--jobs 1`
 docs/MILESTONE-10.md             the M10 record: what each package changed,
                                  its measured evidence, and what is not done
 docs/spikes/m10-unified-verification/

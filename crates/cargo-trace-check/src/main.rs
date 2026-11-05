@@ -199,6 +199,21 @@ enum Command {
         /// cannot report success for a subset it happened to select.
         #[arg(long)]
         ci: bool,
+        /// Run this many analysis jobs of each backend at once.
+        ///
+        /// One by default: deterministic, readable, and what a developer
+        /// reading a finding wants. The report is identical whatever this is
+        /// set to -- results are folded in plan order, never completion order
+        /// -- so it trades nothing but machine time.
+        ///
+        /// The win is overlap between phases, not parallel compilation: builds
+        /// within a backend still serialise on Cargo's target-directory lock,
+        /// which is deliberate because per-job target directories would
+        /// rebuild the library and every dependency per job.
+        ///
+        /// Only affects `--all-contracts`.
+        #[arg(long, default_value_t = 1)]
+        jobs: usize,
         /// Keep the generated harnesses and analyzed executables under this
         /// directory instead of a private one removed after the run.
         #[arg(long)]
@@ -334,6 +349,7 @@ fn execute(cli: Cli) -> Result<u8, String> {
             reproducer_dir,
             replay,
             ci,
+            jobs,
             artifact_dir,
             format,
         } => check(CheckRequest {
@@ -364,6 +380,7 @@ fn execute(cli: Cli) -> Result<u8, String> {
             reproducer_dir,
             replay,
             ci,
+            jobs,
             artifact_dir,
             format,
         }),
@@ -432,6 +449,9 @@ struct CheckRequest {
     reproducer_dir: Option<PathBuf>,
     replay: Option<PathBuf>,
     ci: bool,
+    /// Analysis jobs of each backend to run at once. See the flag's own
+    /// documentation; only `--all-contracts` schedules anything.
+    jobs: usize,
     artifact_dir: Option<PathBuf>,
     format: Format,
 }
@@ -449,6 +469,7 @@ fn check(request: CheckRequest) -> Result<u8, String> {
         reproducer_dir,
         replay,
         ci,
+        jobs,
         artifact_dir,
         format,
     } = request;
@@ -558,17 +579,18 @@ fn check(request: CheckRequest) -> Result<u8, String> {
         } else {
             None
         };
-        let report = trace_check::run_contract_coverage(
-            &library,
-            &config,
-            &workspace,
-            &overrides,
-            &trace_check::Selection::AllContracts,
-            reproducer_dir.as_deref(),
-            &today(),
-            None,
-            dynamic_runs.as_ref(),
-        )
+        let report = trace_check::run_contract_coverage(trace_check::CoverageRequest {
+            library: &library,
+            config: &config,
+            workspace: &workspace,
+            overrides: &overrides,
+            selection: &trace_check::Selection::AllContracts,
+            reproducer_dir: reproducer_dir.as_deref(),
+            today: &today(),
+            runtime: None,
+            dynamic_runs: dynamic_runs.as_ref(),
+            limits: trace_check::schedule::Limits::uniform(jobs),
+        })
         .map_err(|e| e.to_string())?;
         match format {
             Format::Text => print!("{}", report.to_text()),

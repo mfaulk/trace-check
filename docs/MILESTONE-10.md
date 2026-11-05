@@ -39,7 +39,7 @@ are two results about two binaries, not one result about the function.
 | M10.3 | Refactor and integrate the M5 symbolic runner | partial — see §5 |
 | M10.4 | Integrate M3 developer-written dynamic tests | complete |
 | M10.5 | Unified execution planner and backend deduplication | complete |
-| M10.6 | Bounded scheduling, isolation and failure handling | not started |
+| M10.6 | Bounded scheduling, isolation and failure handling | complete |
 | M10.7 | Unified CLI, reporting and schema migration | partial — see §5 |
 | M10.8 | Acceptance, mutation tests, benchmarks, CI and documentation | not started |
 
@@ -527,7 +527,83 @@ a claim.
 
 ---
 
-## 8. What is not done
+## 8. M10.6 — bounded scheduling that cannot reach the answer
+
+### Concurrency, with the result held fixed
+
+`--jobs n` runs that many analysis jobs of each backend at once. The default is
+**one**: deterministic, readable, and what a developer reading a finding wants.
+
+The property that makes the flag offerable at all is that it changes nothing but
+machine time. Each job writes into a fixed slot indexed by its position in the
+execution plan, and the slots are drained **in plan order** once the scope ends
+— so the statuses, the outcomes, the artifact hashes and the blocking reasons
+are identical whatever the worker count and whatever order the backends
+finished in. `schedule::in_order` is the same pattern M7's coverage decoder
+already used, for the same reason.
+
+`one_worker_and_two_workers_agree` is the acceptance test: three contracts and
+two backends, run at one worker and at two, compared field by field — plan,
+contract order, per-analysis statuses, per-evidence outcomes and artifact
+hashes, blocking reasons and exit code. Field by field rather than as rendered
+text, because the text carries paths and timings that legitimately differ.
+
+### What concurrency actually buys
+
+Not parallel compilation. Builds within a backend serialise on Cargo's
+target-directory lock, and that is deliberate: per-job target directories would
+rebuild `core`, the library and every dependency per job and leave hundreds of
+megabytes behind, which is the trade M5 settled and this package does not
+reopen.
+
+What it buys is **overlap between phases** — one contract's Memcheck run
+proceeding while another's harness compiles. The limits are per backend rather
+than one global number for the same reason: a single `--jobs 8` would either
+starve the build or oversubscribe the analyzer containers.
+
+I expected that to be worth little, and wrote as much before measuring. It is
+not: over the eighteen audit contracts and the twenty-one jobs the policy
+overlay plans, on one machine,
+
+| Workers | Wall clock | Peak RSS |
+| --- | --- | --- |
+| `--jobs 1` | 3:58 | 169 MB |
+| `--jobs 2` | 2:25 | 171 MB |
+
+1.6x for 2 MB, with both runs compared field by field and found identical. The
+Cargo lock bounds build parallelism but most of the wall clock is Memcheck, and
+that overlaps freely. A fuller sweep across worker counts belongs to M10.8;
+what this records is that the conservative default is leaving real time on the
+table for anyone who asks for more.
+
+### Isolation
+
+Each backend already owns a separate work directory and target directory per
+contract (M10.0), so two backends analyzing one contract cannot collide and a
+failed build cannot pick up another analysis's executable. The per-contract
+collision check still fires within a backend.
+
+`one_contract_failing_does_not_stop_the_others` covers the failure path at both
+worker counts: one contract is given a corpus budget too small to cover its
+boundary values — a failure *during* the job rather than one settled before it
+— and the contracts either side of it in the plan still produce evidence, while
+the refused one gets an `UNSUPPORTED` status naming the cause and the run does
+not pass.
+
+Failures that are not about one contract still abort, as they did before: they
+would recur identically for every contract, and reporting them eighteen times
+is not more useful than once.
+
+### An API change
+
+`run_contract_coverage` had grown to ten positional parameters, three of them
+`Option`, and M10.7 would have added more. It now takes a `CoverageRequest`,
+which is the convention the CLI's own `CheckRequest` already followed. Ten
+positional arguments is a signature callers get subtly wrong.
+
+---
+
+## 9. What is not done
 
 * **M10.3** — the per-contract symbolic seam exists (`stage_symbolic` /
   `verify_staged`) and the standalone command uses it. Observation-model policy
@@ -537,7 +613,6 @@ a claim.
   reported as a configuration gap rather than guessed at. A `dynamic`
   requirement is still reported as produced elsewhere when no policy asks for
   it, which is what keeps `coverage` and a generated-only run honest.
-* **M10.6** — backends run sequentially, in inventory order. No `--jobs`.
 * **M10.7** — `--ci` is now honoured on the `--all-contracts` path and refuses
   an advisory policy. No schema migration, and no leaking-instruction/folded-
   symbol diagnostics.

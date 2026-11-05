@@ -53,6 +53,7 @@ pub mod parser;
 pub mod report;
 pub mod reproducer;
 pub mod runner;
+pub mod schedule;
 pub mod screen;
 pub mod security;
 pub mod symbolic;
@@ -864,18 +865,46 @@ impl From<InventoryError> for CheckRunError {
 /// Valgrind is located lazily, after the inventory and the plan, for the same
 /// reason M5 and M6 settled on: a developer whose contract cannot be analyzed
 /// should be told about the contract, not about a missing analyzer.
-#[allow(clippy::too_many_arguments)]
+/// Everything a unified enforcement run was asked for.
+///
+/// Grouped rather than passed positionally. Ten parameters, three of them
+/// `Option`, is a signature a caller gets subtly wrong -- and the next
+/// milestone package adds more. The CLI's own `CheckRequest` groups its options
+/// for the same reason.
+pub struct CoverageRequest<'a> {
+    pub library: &'a Library,
+    pub config: &'a VerifyConfig,
+    pub workspace: &'a Workspace,
+    pub overrides: &'a CheckOverrides,
+    pub selection: &'a Selection,
+    pub reproducer_dir: Option<&'a Path>,
+    /// Today, for expiring waivers. Passed in so a run is reproducible and a
+    /// test can describe any date.
+    pub today: &'a str,
+    /// Container runtime for the analyzer. `None` selects whichever holds the
+    /// pinned image.
+    pub runtime: Option<&'a str>,
+    /// Developer-written `#[ct_test]` results, when the caller collected them.
+    pub dynamic_runs: Option<&'a DynamicRuns>,
+    /// How many jobs of each backend may run at once.
+    pub limits: schedule::Limits,
+}
+
 pub fn run_contract_coverage(
-    library: &Library,
-    config: &VerifyConfig,
-    workspace: &Workspace,
-    overrides: &CheckOverrides,
-    selection: &Selection,
-    reproducer_dir: Option<&Path>,
-    today: &str,
-    runtime: Option<&str>,
-    dynamic_runs: Option<&DynamicRuns>,
+    request: CoverageRequest<'_>,
 ) -> Result<CoverageReport, CheckRunError> {
+    let CoverageRequest {
+        library,
+        config,
+        workspace,
+        overrides,
+        selection,
+        reproducer_dir,
+        today,
+        runtime,
+        dynamic_runs,
+        limits,
+    } = request;
     let policy = &config.policy;
     let inventory_dir = workspace.inventory_target_dir()?;
     let found = inventory::build_and_read(library, &inventory_dir)?;
@@ -968,12 +997,20 @@ pub fn run_contract_coverage(
     // evidence is a developer-written `#[ct_test]` that
     // `cargo trace-check test` produces, and a requirement for it is reported
     // as outstanding rather than silently satisfied.
-    for job in &execution.jobs {
+    let generated_jobs: Vec<&orchestration::Job> = execution
+        .jobs
+        .iter()
+        .filter(|job| matches!(job.work, orchestration::Work::Generated { .. }))
+        .collect();
+    // Run concurrently, fold sequentially. Each job writes into a fixed slot
+    // and the slots are drained in plan order, so the report is identical
+    // whatever the worker count and whatever order the backends finished in.
+    let analysed_jobs = schedule::in_order(&generated_jobs, limits.generated, |_, job| {
         let orchestration::Work::Generated { explore } = job.work else {
-            continue;
+            unreachable!("filtered to the generated family above");
         };
         let Some((valgrind_path, valgrind_version)) = &valgrind else {
-            continue;
+            return None;
         };
         let declaration = found
             .contract(&job.contract)
@@ -985,9 +1022,9 @@ pub fn run_contract_coverage(
         // configuration together. Taking it from the plan rather than
         // re-deriving it here is the point: one place decides what runs.
         settings.explore.enabled = explore;
-        settings
-            .validate(&job.contract)
-            .map_err(HarnessError::Contract)?;
+        if let Err(error) = settings.validate(&job.contract) {
+            return Some(Err(CheckRunError::Harness(HarnessError::Contract(error))));
+        }
 
         // A failure analysing one contract becomes that contract's status, not
         // the end of the run. An earlier revision propagated it, so a single
@@ -1002,7 +1039,7 @@ pub fn run_contract_coverage(
         // broken inventory -- are still propagated, because they would recur
         // identically for every contract and reporting them 18 times is not
         // more useful than reporting them once.
-        let analysed = match analyse_one(
+        Some(analyse_one(
             library,
             workspace,
             declaration,
@@ -1011,7 +1048,16 @@ pub fn run_contract_coverage(
             valgrind_version,
             tools.as_ref(),
             reproducer_dir,
-        ) {
+        ))
+    });
+
+    for (job, outcome) in generated_jobs.iter().zip(analysed_jobs) {
+        let Some(outcome) = outcome else {
+            // No Valgrind: the plan's requirements were already settled as
+            // BACKEND_UNAVAILABLE, and nothing ran.
+            continue;
+        };
+        let analysed = match outcome {
             Ok(analysed) => analysed,
             Err(error) if per_contract(&error) => {
                 for analysis in &job.discharges {
@@ -1046,18 +1092,21 @@ pub fn run_contract_coverage(
     // result.
     if let Some(Ok(verifier)) = &symbolic_backend {
         let identity = verifier.identity();
-        for job in &execution.jobs {
-            if job.work != orchestration::Work::Symbolic {
-                continue;
-            }
-            let entry = plan
-                .entry(&job.contract)
-                .expect("planned from the resolved policy");
+        let symbolic_jobs: Vec<&orchestration::Job> = execution
+            .jobs
+            .iter()
+            .filter(|job| job.work == orchestration::Work::Symbolic)
+            .collect();
+        // Concurrent, then folded in plan order, for the same reason stage two
+        // is. The analyzer is prepared once and shared: it is immutable after
+        // preparation, and its identity describes the analyzer rather than any
+        // one artifact.
+        let verified_jobs = schedule::in_order(&symbolic_jobs, limits.symbolic, |_, job| {
             // Outstanding implies configured: `settle` reports a symbolic
             // requirement with no `[verify]` entry as a configuration gap,
             // which is settled and so never reaches here.
             let settings = config
-                .settings(&entry.id)
+                .settings(&job.contract)
                 .expect("an outstanding symbolic requirement implies a [verify] entry");
 
             // Staging is per contract and touches no analyzer, so most of its
@@ -1072,29 +1121,32 @@ pub fn run_contract_coverage(
             // yet; by here the generated evidence is already in hand, and
             // throwing it away to report an error that is also in the report
             // would lose more than it tells anyone. Neither status can pass.
-            let staged =
-                match stage_symbolic(library, &entry.id, settings, workspace, Backend::Symbolic) {
-                    Ok(staged) => staged,
-                    Err(error) => {
-                        let reason = format!(
-                            "the symbolic verification artifact for `{}` could not be prepared: \
-                             {error}",
-                            entry.id
-                        );
-                        let status = if per_contract(&CheckRunError::Harness(error)) {
-                            Status::Unsupported { reason }
-                        } else {
-                            Status::Inconclusive { detail: reason }
-                        };
-                        coverage.note(&entry.id, Analysis::Symbolic, status);
-                        continue;
-                    }
-                };
+            let staged = match stage_symbolic(
+                library,
+                &job.contract,
+                settings,
+                workspace,
+                Backend::Symbolic,
+            ) {
+                Ok(staged) => staged,
+                Err(error) => {
+                    let reason = format!(
+                        "the symbolic verification artifact for `{}` could not be prepared: \
+                         {error}",
+                        job.contract
+                    );
+                    return Err(if per_contract(&CheckRunError::Harness(error)) {
+                        Status::Unsupported { reason }
+                    } else {
+                        Status::Inconclusive { detail: reason }
+                    });
+                }
+            };
             // Recorded before the analyzer runs. The obligation is about the
             // executable this run built, and the evidence is checked against
             // that rather than against whatever the result claims.
             let built = evidence::ArtifactIdentity::symbolic(
-                &entry.id,
+                &job.contract,
                 &staged.contract.descriptor_json,
                 library,
                 &staged.artifact,
@@ -1104,21 +1156,25 @@ pub fn run_contract_coverage(
             match verify_staged(staged, verifier, library) {
                 Ok(verified) => {
                     let report = library_report::contract_report(verified, workspace.is_kept());
-                    coverage.fold(
-                        &entry.id,
-                        AnalysisEvidence::from_symbolic(&settings.checks, built, Box::new(report)),
-                    );
+                    Ok(AnalysisEvidence::from_symbolic(
+                        &settings.checks,
+                        built,
+                        Box::new(report),
+                    ))
                 }
-                Err(error) => coverage.note(
-                    &entry.id,
-                    Analysis::Symbolic,
-                    Status::Inconclusive {
-                        detail: format!(
-                            "the analyzer did not produce a usable result for `{}`: {error}",
-                            entry.id
-                        ),
-                    },
-                ),
+                Err(error) => Err(Status::Inconclusive {
+                    detail: format!(
+                        "the analyzer did not produce a usable result for `{}`: {error}",
+                        job.contract
+                    ),
+                }),
+            }
+        });
+
+        for (job, outcome) in symbolic_jobs.iter().zip(verified_jobs) {
+            match outcome {
+                Ok(evidence) => coverage.fold(&job.contract, evidence),
+                Err(status) => coverage.note(&job.contract, Analysis::Symbolic, status),
             }
         }
     }
