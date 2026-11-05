@@ -707,6 +707,16 @@ fn stage_library(root: &Path) -> PathBuf {
         );
     std::fs::write(copy.join("Cargo.toml"), format!("{staged}\n[workspace]\n"))
         .expect("write manifest");
+    // The copy lives outside the repository, so `rustup` would resolve the
+    // machine default for it. Stage the pin so these tests analyze the compiler
+    // the workspace builds with rather than whatever is installed.
+    // `the_artifact_is_built_by_the_library_s_pinned_toolchain` overwrites this
+    // deliberately; everything else wants the pin.
+    std::fs::copy(
+        workspace_root().join("rust-toolchain.toml"),
+        copy.join("rust-toolchain.toml"),
+    )
+    .expect("stage the workspace toolchain pin");
     copy
 }
 

@@ -816,6 +816,13 @@ fn stage_library(root: &Path) -> PathBuf {
         );
     std::fs::write(copy.join("Cargo.toml"), format!("{staged}\n[workspace]\n"))
         .expect("write manifest");
+    // Outside the repository, so `rustup` would otherwise resolve the machine
+    // default for the copy instead of the compiler the workspace builds with.
+    std::fs::copy(
+        workspace_root().join("rust-toolchain.toml"),
+        copy.join("rust-toolchain.toml"),
+    )
+    .expect("stage the workspace toolchain pin");
     copy
 }
 

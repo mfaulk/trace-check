@@ -58,6 +58,7 @@ report one backend and leave the other un-analyzed.
 import argparse
 import hashlib
 import json
+import os
 import pathlib
 import shutil
 import subprocess
@@ -199,12 +200,20 @@ def stage_adapter(work, dependency):
     unit tests and the 1012 independent-oracle vectors never execute, which
     would make "the arithmetic survived the mutation" a much weaker claim than
     the one this script prints.
+
+    `rust-toolchain.toml` comes too, and `require_pinned_toolchain` then insists
+    it took effect. The staged copy lives outside the repository, so without it
+    the experiment is analyzed with whatever toolchain the machine happens to
+    default to -- a different compiler than the one the mutation was designed
+    against, and on a runner whose default lacks `llvm-tools`, no coverage
+    feedback at all.
     """
     staged = work / "adapter"
     staged.mkdir()
     shutil.copytree(ADAPTER / "src", staged / "src")
     shutil.copytree(ADAPTER / "tests", staged / "tests")
     shutil.copy(ADAPTER / "trace-check.toml", staged / "trace-check.toml")
+    shutil.copy(REPO / "rust-toolchain.toml", staged / "rust-toolchain.toml")
     (staged / "Cargo.lock").write_text(staged_lockfile())
 
     manifest = (ADAPTER / "Cargo.toml").read_text()
@@ -225,7 +234,43 @@ def stage_adapter(work, dependency):
         f'path = "{REPO / "crates" / "trace-check-macros"}"',
     )
     (staged / "Cargo.toml").write_text(manifest)
+    require_pinned_toolchain(staged)
     return staged
+
+
+def active_toolchain(directory):
+    """What `rustup` selects for a build rooted at `directory`.
+
+    `RUSTUP_TOOLCHAIN` is cleared because it would answer for the ambient
+    environment rather than for the directory, which is the thing in question.
+    """
+    environment = {k: v for k, v in os.environ.items() if k != "RUSTUP_TOOLCHAIN"}
+    result = run(
+        ["rustup", "show", "active-toolchain"],
+        cwd=directory,
+        env=environment,
+    )
+    if result.returncode != 0:
+        fail(f"rustup could not resolve a toolchain for {directory}:\n{result.stderr}")
+    return result.stdout.split()[0]
+
+
+def require_pinned_toolchain(staged):
+    """The staged tree must resolve to the same toolchain as the repository.
+
+    Asserted rather than assumed, so dropping the `rust-toolchain.toml` copy
+    fails here on any machine -- including one whose default happens to equal
+    the pin, where the omission is otherwise invisible until some other runner
+    disagrees.
+    """
+    wanted = active_toolchain(REPO)
+    found = active_toolchain(staged)
+    if found != wanted:
+        fail(
+            f"the staged adapter resolves to {found} but the repository pins {wanted}: the "
+            "experiment would measure a different compiler than the mutation was written "
+            "against. `rust-toolchain.toml` must be staged with it"
+        )
 
 
 # The oracle tests, by name. Named rather than counted so a suite that silently
