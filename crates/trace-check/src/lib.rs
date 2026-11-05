@@ -1135,9 +1135,19 @@ pub fn run_contract_coverage(
         // any one obligation -- gating it on an outstanding requirement hid it
         // whenever the only contract asking for `dynamic` was already settled.
         report_unresolved_targets(&mut coverage, &binding);
-        if let Some(job) = &execution.dynamic {
-            fold_dynamic(&mut coverage, job, &found, library, runs, &binding);
-        }
+        // Folded whenever runs were supplied, for the same reason: the tests
+        // have already executed, and whether some contract still *owes* a
+        // dynamic answer decides which results get a status -- never which
+        // get kept. Gating this on the job existing discarded a leak found by
+        // a test whose own contract required nothing dynamic.
+        fold_dynamic(
+            &mut coverage,
+            execution.dynamic.as_ref(),
+            &found,
+            library,
+            runs,
+            &binding,
+        );
     }
 
     let provenance = coverage_report::Provenance {
@@ -1202,8 +1212,9 @@ fn report_unresolved_targets(coverage: &mut Coverage, binding: &dynamic::Binding
 
 /// Folds one aggregate per contract that has a bound test.
 ///
-/// `job.contracts` names the contracts that *owe* a dynamic answer. That is
-/// not the same set as the contracts that have one: `dynamic` is a whole test
+/// `job` names the contracts that *owe* a dynamic answer, and is `None` when
+/// none does. Either way that is not the same set as the contracts which
+/// *have* an answer: `dynamic` is a whole test
 /// suite rather than a per-contract job, so a policy requiring it of one
 /// contract makes the run execute every targeted `#[ct_test]`, including tests
 /// bound to contracts that require nothing dynamic.
@@ -1213,14 +1224,17 @@ fn report_unresolved_targets(coverage: &mut Coverage, binding: &dynamic::Binding
 /// no arrangement of obligations may do that.
 fn fold_dynamic(
     coverage: &mut Coverage,
-    job: &orchestration::DynamicJob,
+    job: Option<&orchestration::DynamicJob>,
     found: &ContractInventory,
     library: &Library,
     runs: &DynamicRuns,
     binding: &dynamic::Binding,
 ) {
-    let required: std::collections::BTreeSet<&str> =
-        job.contracts.iter().map(String::as_str).collect();
+    // Empty when no contract owes a dynamic answer, which is a reason for
+    // every result to be supplemental -- not a reason to drop them.
+    let required: std::collections::BTreeSet<&str> = job
+        .map(|job| job.contracts.iter().map(String::as_str).collect())
+        .unwrap_or_default();
     for (contract, tests) in &binding.per_contract {
         let Some(declaration) = found.contract(contract) else {
             continue;
