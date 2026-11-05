@@ -37,7 +37,7 @@ are two results about two binaries, not one result about the function.
 | M10.1 | Per-analysis expectations and security-policy semantics | complete |
 | M10.2 | Typed artifact-bound evidence model | complete |
 | M10.3 | Refactor and integrate the M5 symbolic runner | partial — see §5 |
-| M10.4 | Integrate M3 developer-written dynamic tests | not started |
+| M10.4 | Integrate M3 developer-written dynamic tests | complete |
 | M10.5 | Unified execution planner and backend deduplication | not started |
 | M10.6 | Bounded scheduling, isolation and failure handling | not started |
 | M10.7 | Unified CLI, reporting and schema migration | partial — see §5 |
@@ -314,13 +314,136 @@ a reason to design it deliberately rather than a reason to add it here.
 
 ---
 
-## 6. What is not done
+## 6. M10.4 — developer-written `#[ct_test]`s as enforcement evidence
+
+M3 already ran these tests under Memcheck and already proved, per test, that
+the declared contract's function was invoked through the instrumented adapter.
+What it did not do was bind them to the compiler-derived inventory and
+aggregate them into one answer per contract, which is what a `dynamic` policy
+requirement needs.
+
+### Where the split falls
+
+Discovery and execution stay in the CLI (`dynamic_adapter`), where the Cargo
+test binaries and the Valgrind processes already live; binding, validation and
+aggregation are in the library (`trace_check::dynamic`), because those are the
+security decisions. Nothing is reimplemented — `build_test_binaries`,
+`discover`, `resolve_targets` and `run_test` are the same functions
+`cargo trace-check test` uses, so a unified run and a standalone one cannot
+disagree about what a test established.
+
+Test binaries are built **only** when some policy asks for `dynamic`. A project
+requiring nothing dynamic must not pay for a `cargo test --no-run`, nor have a
+missing test suite reported against an obligation it does not have. Tests that
+declare no `target` are not run at all: they cannot discharge a
+contract-specific obligation, so spending a Valgrind process on them would
+produce evidence nothing can use. `cargo trace-check test` still runs them.
+
+### Binding
+
+A `#[ct_test(target = "...")]` is written module-relative — `tag::verify_tag`
+for `crypto::tag::verify_tag` — so matching is by **path-boundary suffix**:
+`verify_tag` and `tag::verify_tag` both match, `ify_tag` does not, and `verify`
+does not match `verify_tag`. A target matching more than one contract is
+ambiguous and binds to **nothing** rather than being guessed at.
+
+That is M3's existing rule, and there is now one implementation of it:
+`report::targets` delegates to `dynamic::matches_target`. A rule that decided
+coverage one way for `test` and another for `check --all-contracts` would make
+the two commands disagree about the same test.
+
+Binding resolves against the **inventory**, not the test binaries' own contract
+metadata. The two are built differently — one from the library's rlib, one from
+the test executables — and a target that resolves in one and not the other must
+not quietly bind.
+
+### Aggregation
+
+Deterministic and fail-closed, in order:
+
+1. a detected leak is preserved, whatever else passed, and the finding is kept
+   in the detail;
+2. a test that did not complete, whose controls did not fire, or that never
+   reached its target prevents a clean aggregate;
+3. a clean aggregate requires **every** bound test to have completed with valid
+   controls and a confirmed invocation;
+4. the same test executed twice counts once — keyed on the test *and* its
+   executable, so one harness path in two executables is two tests while one
+   test run twice is one;
+5. a contract with no bound test is `NOT_ANALYZED`, never clean.
+
+### Artifact identity
+
+`Backend::DeveloperTest` is a third backend name: the same Valgrind Memcheck as
+the generated family over a different *source of inputs*. A developer choosing
+the inputs and a generator choosing them are different evidence about the same
+property, and a reader comparing two results needs to know which they have.
+
+For a developer-written test there is no separate generated harness to
+fingerprint — the test code **is** the harness — so `harness_sha256` names the
+same executable as `artifact_sha256`. When two test targets both cover a
+contract, `artifact_sha256` is a digest over their sorted hashes with each named
+in the evidence, because a result drawn from two executables is about both and
+naming one would be a claim about an artifact that produced half the evidence.
+
+### A defect in the adapter, found by the acceptance test
+
+The first version of the adapter set `completed: true` unconditionally,
+reasoning that `run_test` returns an error rather than an outcome when a process
+cannot be run. That was wrong: M3 uses `Calibration::NotRun` to mark a test that
+did not get as far as its constant-time check — it failed, timed out, was
+killed, or produced unparseable output.
+
+The acceptance test exposed it. Breaking the subject test's invocation produced
+"produced no positive control", naming the wrong cause: M3's own `#[ct_test]`
+harness asserts the invocation and *fails* the test, so the run had not
+completed at all. `completed` is now derived from the calibration marker, and
+the not-completed diagnostic carries M3's own message, which names the real
+reason.
+
+That also corrected the record on where the invocation guarantee comes from:
+M3 enforces it, and `invoked_target` is re-checked at this boundary for the same
+reason the other backends' completion evidence is — the policy layer reads an
+outcome, and a run whose own record says it never reached the contract must not
+discharge an obligation about it however that came to be.
+
+### Measured evidence
+
+`examples/crypto-library`'s `crypto::tag::verify_tag` is the acceptance subject:
+the one contract here that all three analyses can be configured for. One
+`check --all-contracts --ci` invocation with
+`required = ["generated", "symbolic", "dynamic"]`:
+
+| Obligation | Backend | Outcome |
+| --- | --- | --- |
+| `generated` | `valgrind-memcheck` | `NO_LEAK_OBSERVED` |
+| `symbolic` | `binsec-relational` | `VERIFIED_BOUNDED` |
+| `dynamic` | `valgrind-ct-test` | `NO_LEAK_OBSERVED` |
+
+Three analyses, three distinct artifact hashes, all three `CHECKED`.
+
+`breaking_the_dynamic_test_fails_only_the_dynamic_requirement` is the
+load-bearing one. It rewrites the test body to mark a secret and exercise a
+*different* contract's adapter — so the test still compiles, still passes, and
+still declares its target. The `dynamic` requirement fails with a diagnostic
+naming the missing invocation, and the generated and symbolic results are
+unchanged **down to their artifact hashes**, because the library's own code did
+not change. Calling the real function directly instead would also fail, but on
+calibration rather than invocation: a correct refusal for the wrong reason, and
+it would leave the invocation check untested.
+
+---
+
+## 7. What is not done
 
 * **M10.3** — the per-contract symbolic seam exists (`stage_symbolic` /
   `verify_staged`) and the standalone command uses it. Observation-model policy
   is validated against the `[verify]` configuration, not declarable in policy.
-* **M10.4** — no M3 integration. A `dynamic` requirement is reported as
-  evidence this command does not produce, pointing at `cargo trace-check test`.
+* **M10.4** — M3 expectations are not modelled, so an analyzer-regression
+  fixture cannot declare an outcome for `dynamic`; such a requirement is
+  reported as a configuration gap rather than guessed at. A `dynamic`
+  requirement is still reported as produced elsewhere when no policy asks for
+  it, which is what keeps `coverage` and a generated-only run honest.
 * **M10.5** — no execution plan representation and no deduplication of
   `generated` against `explore`. Requiring both still goes through the existing
   single Memcheck workflow, but nothing yet *proves* there is only one run.
