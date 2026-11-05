@@ -598,6 +598,7 @@ jobs:
       - name: Coverage guidance finds more vulnerable paths in the real library
         run: python3 ci/benchmark-m9.py --quick
 
+
       # Two ways the experiment above could report an outcome it did not earn.
       # Both must fail, and a `python3` exit of 1 is the pass condition here.
       - name: A stale patch fails rather than reporting a clean result
@@ -859,6 +860,39 @@ jobs:
             > m10-unified.json
           python3 ci/verify-m8-contracts.py m10-unified.json --expect-declared 18
           python3 ci/verify-m10-feasibility.py m10-unified.json
+
+      # M10.8 acceptance experiment C: an upstream mutation through the
+      # *unified* command. One invocation must exit 1 when either backend
+      # establishes a leak, and both analyses must survive in the report -- a
+      # run that stopped at the first failure would report one backend and
+      # leave the other un-analyzed, which is the behaviour M10 forbids.
+      #
+      # In this job rather than with the other mutation experiments because it
+      # needs both backends: this is the job that pulls the analyzer image, and
+      # it installs Valgrind for the same reason.
+      - name: A mutation fails the unified command with both analyses intact
+        env:
+          EXPECTED_CONTAINER_RUNTIME: docker
+        run: |
+          python3 ci/mutate-m9.py --mutation mutation-a-carry-branch \
+            --contract cbaudit::add::wrapping_add_secret_left \
+            --expect-outcome LEAK_DETECTED \
+            --unified --expect-exit 1
+
+      # M10.8: the orchestration benchmark. Warm only in CI -- a cold row is
+      # dominated by compiling the dependency graph, which is not what this
+      # measures -- and it asserts the deduplication invariant rather than a
+      # wall-clock threshold, because a shared runner's timings are not a
+      # regression signal.
+      - name: Measure the unified orchestration
+        env:
+          EXPECTED_CONTAINER_RUNTIME: docker
+        run: python3 ci/benchmark-m10.py --warm-only --json m10-benchmark.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: m10-benchmark
+          path: m10-benchmark.json
 
       # M10.6: the same run at two workers must produce the same security
       # outcomes. `--jobs` trades machine time and nothing else -- results are

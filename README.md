@@ -23,7 +23,7 @@ the formal noninterference property, and the roadmap.
 | M7 | Coverage-guided leakage discovery | complete, experimental |
 | M8 | Complete contract coverage and enforcement | complete, experimental |
 | M9 | Real-world cryptography integration — auditing `crypto-bigint` | complete, experimental |
-| M10 | Unified multi-backend verification and CI enforcement | in progress — M10.0–M10.7 complete |
+| M10 | Unified multi-backend verification and CI enforcement | complete, experimental |
 | M11 | Hardware-oriented validation — statistical timing | future |
 
 `trace-check` turns that idea into reproducible analysis, from five directions:
@@ -844,7 +844,9 @@ python3 ci/mutate-m9.py --mutation mutation-c-indexed-reduction \
 
 The driver stages the pinned source into an isolated copy, applies an explicit
 patch, requires the adapter's own functional tests to still pass, and runs the
-unchanged contract. For the one above, the finding's leaf frame is
+unchanged contract. The copy carries this workspace's `rust-toolchain.toml` and
+the driver asserts it took effect, so the experiment measures the compiler the
+mutation was written against rather than whatever the machine defaults to. For the one above, the finding's leaf frame is
 `montgomery_multiply_inner (src/modular/mul.rs:106)` — upstream source, at the
 patched line — classified as a secret-dependent **address**, with its
 reproducer replayed against the same artifact. A branch in `Uint::carrying_add`
@@ -1299,8 +1301,12 @@ ci/verify-m10-feasibility.py     asserts that two backends discharged two
                                  generated and explore obligations
 ci/compare-m10-runs.py           requires `--jobs 2` to reach the same security
                                  outcomes as `--jobs 1`
+ci/benchmark-m10.py              orchestration overhead, two-worker speedup, and
+                                 the one-Memcheck-workflow-per-contract invariant
 docs/MILESTONE-10.md             the M10 record: what each package changed,
                                  its measured evidence, and what is not done
+ci/mutate-m9.py --unified        the same upstream mutation through the unified
+                                 command, requiring exit 1 and both analyses
 docs/spikes/m10-unified-verification/
                                  the recorded M10.0 feasibility gate, its
                                  policy overlay, and the three defects it found
