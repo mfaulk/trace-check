@@ -349,10 +349,10 @@ backend, in opposite directions:
 | Fixture | `generated` | `symbolic` | Why |
 | --- | --- | --- | --- |
 | `cbaudit::hidden::magic_gate` | `NO_LEAK_OBSERVED` | `LEAK_DETECTED` | the leak sits behind an exact public-input equality: generated inputs never guess it, a solver solves for it |
-| `crypto::tag::verify_tag_early_exit` | `LEAK_DETECTED` | `VERIFIED_BOUNDED` | the dynamic backend's artifact keeps the per-byte branch; the symbolic backend's vectorizes it away |
+| `crypto::lookup::substitute_mode` (test-only restricted symbolic domain) | `LEAK_DETECTED` | `VERIFIED_BOUNDED` | generated inputs reach the leaking mode; symbolic verification explicitly assumes `TC_PUBLIC_MODE = 0`, the clean mode |
 
-Both are two honest answers about two compilations — which is why each result
-carries the hash of the executable it analyzed. A leak from a backend the
+These are answers about each backend's artifact and input domain — which is
+why reports retain both artifact hashes and symbolic domain restrictions. A leak from a backend the
 fixture declared *clean* is a real surprise and still fails: the declaration
 excuses only the finding it predicted. A fixture that declares nothing for a
 required analysis cannot pass it either, since there is no claim to reproduce.

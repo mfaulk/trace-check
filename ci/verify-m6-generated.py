@@ -1,15 +1,5 @@
 #!/usr/bin/env python3
-"""Checks the M6 generated-testing report, not the exit code.
-
-A run can exit 0 for reasons that have nothing to do with the analysis having
-happened, so CI validates the report's own claims: that every configured
-contract was checked, that both positive controls confirmed for each one, that
-the clean contracts are security contracts which passed, and that the
-deliberately vulnerable ones are analyzer-regression fixtures whose planted
-leaks were found and attributed to an input.
-
-Usage: verify-m6-generated.py <report.json>
-"""
+"""A zero exit code is insufficient: validate analysis evidence and both controls."""
 
 import json
 import pathlib
@@ -44,7 +34,6 @@ CLEAN = {
 # validator therefore describes a run made with the library's own
 # configuration, which is what CI produces.
 VULNERABLE = {
-    "crypto::tag::verify_tag_early_exit",
     "crypto::tag::verify_tag_volatile_early_exit",
     "crypto::lookup::substitute_indexed",
     "crypto::lookup::substitute_mode",
@@ -55,6 +44,10 @@ VULNERABLE = {
     "crypto::hidden::secret_gated",
     "crypto::shadow::right::probe",
 }
+
+# A compiler-shape regression: the source branches, but the current artifact
+# vectorizes the comparison and must report no observed leak.
+CLEAN_REGRESSION = {"crypto::tag::verify_tag_early_exit"}
 
 # Contracts that are vulnerable but that this toolchain's analysis is **not
 # expected to reach**, declared so the gap is asserted rather than left
@@ -86,10 +79,11 @@ def main():
         fail(f"unexpected backend {report.get('backend')!r}")
 
     entries = {entry["contract"]: entry for entry in report["contracts"]}
-    overlap = (CLEAN & VULNERABLE) | (CLEAN & RECORDED_GAP) | (VULNERABLE & RECORDED_GAP)
+    overlap = ((CLEAN & VULNERABLE) | (CLEAN & RECORDED_GAP) | (VULNERABLE & RECORDED_GAP)
+               | (CLEAN_REGRESSION & (CLEAN | VULNERABLE | RECORDED_GAP)))
     if overlap:
         fail(f"these contracts are classified twice by this validator: {sorted(overlap)}")
-    expected = CLEAN | VULNERABLE | RECORDED_GAP
+    expected = CLEAN | VULNERABLE | RECORDED_GAP | CLEAN_REGRESSION
     missing = expected - entries.keys()
     if missing:
         fail(f"these contracts were not checked: {sorted(missing)}")
@@ -178,6 +172,15 @@ def main():
                 fail(f"{name}: expected NO_LEAK_OBSERVED, got {check['outcome']}")
             if entry["policy"] != "satisfied":
                 fail(f"{name}: {entry['policy']} -- {entry['policy_detail']}")
+        elif name in CLEAN_REGRESSION:
+            if entry["expectation"] != "analyzer-regression":
+                fail(f"{name}: the compiler-shape control must remain an analyzer regression")
+            if entry.get("expected_outcome") != "NO_LEAK_OBSERVED":
+                fail(f"{name}: expected a declared NO_LEAK_OBSERVED outcome")
+            if check["outcome"] != "NO_LEAK_OBSERVED" or check["findings"]:
+                fail(f"{name}: expected no observed leak, got {check['outcome']}")
+            if entry["policy"] != "satisfied":
+                fail(f"{name}: {entry['policy']} -- {entry['policy_detail']}")
         elif name in CLEAN:
             if entry["expectation"] != "security-contract":
                 fail(
@@ -234,7 +237,8 @@ def main():
 
     print(
         f"verify-m6-generated: {len(entries)} contract(s) checked, "
-        f"{len(CLEAN)} clean, {len(VULNERABLE)} detected and "
+        f"{len(CLEAN)} clean, {len(CLEAN_REGRESSION)} compiler-shape control(s), "
+        f"{len(VULNERABLE)} detected and "
         f"{len(RECORDED_GAP)} recorded gap(s), all as declared"
     )
     return 0

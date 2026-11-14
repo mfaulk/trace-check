@@ -1,47 +1,6 @@
-//! Which analyses each declared contract owes, and whether it paid them.
-//!
-//! The inventory ([`crate::inventory`]) answers *which contracts exist*. This
-//! module answers *what is required of each one, and what actually happened* —
-//! and keeps those two questions apart, because collapsing them is how a tool
-//! ends up reporting a contract as covered when all that happened was that
-//! nobody asked about it.
-//!
-//! # Two dimensions, never one boolean
-//!
-//! Every contract carries both:
-//!
-//! * an **enforcement status** per required analysis — was it selected, could
-//!   it be run, was it waived, did it complete; and
-//! * **evidence** — what a backend actually observed.
-//!
-//! `NO_LEAK_OBSERVED` from generated testing and `VERIFIED_BOUNDED` from
-//! symbolic verification are different claims about different things, so they
-//! are separate evidence records and a requirement for one is never discharged
-//! by the other.
-//!
-//! # The inventory decides what exists; configuration decides how it is checked
-//!
-//! That inversion is the milestone. Before M8, `--all-configured` selected
-//! configuration keys, so a contract with no entry was not merely unchecked —
-//! it was invisible. Now a declaration is required by default, and a
-//! configuration entry can only change *how* it is analyzed.
-//!
-//! # Backend independence
-//!
-//! Nothing here names Valgrind or BINSEC. [`Analysis`] names requirements and
-//! [`AnalysisEvidence`] records results, so a future backend participates by
-//! producing evidence for an analysis rather than by another redesign of
-//! discovery and enforcement.
-//!
-//! The one thing this module does know about a backend is what would make its
-//! evidence inadmissible — see [`validate_identity`] and [`validate_coverage`].
-//! That is deliberately a
-//! different question from whether the analysis was sound, which is the
-//! backend's own to answer: enforcement asks only whether the record in hand is
-//! about *this* contract, *this* artifact and the observation classes the
-//! configuration declared. Without that check the only thing enforcement reads
-//! is an outcome, and a correct result about something else would discharge the
-//! obligation.
+//! Requirements and evidence are separate: one backend's result cannot discharge
+//! another backend's obligation. Evidence must identify the declared contract,
+//! artifact, and observation classes before it can satisfy an analysis.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -1043,15 +1002,10 @@ pub struct PlanEntry {
     /// that exists to hold trace-check to detecting a planted leak, finding it
     /// is the fixture passing.
     ///
-    /// Per analysis because one value per contract cannot describe the
-    /// fixtures this project already has. `cbaudit::hidden::magic_gate` hides a
-    /// leak behind an exact public-input equality: generated inputs never guess
-    /// the gate and observe none, a solver finds it. `crypto::tag::    /// verify_tag_early_exit` is the same disagreement inverted -- the dynamic
-    /// backend's build keeps the per-byte branch and finds it, the symbolic
-    /// backend's build vectorizes it away and verifies bounded. Both are two
-    /// honest answers about two compilations, and judging one backend's result
-    /// against the other's declaration reports a fixture that is behaving
-    /// exactly as declared as broken.
+    /// Outcomes are per analysis because artifacts and input domains may differ.
+    /// For example, generated inputs may miss a public gate that a solver finds,
+    /// or symbolic verification may explicitly restrict a domain to a clean mode.
+    /// Each result must reproduce its own declaration and retain its conditions.
     ///
     /// The *purpose* stays single -- see [`VerifyConfig::purpose`]. Only the
     /// declared outcome varies by backend.
