@@ -1,0 +1,43 @@
+name: Demos
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  first-check:
+    name: first-check on the installed CLI
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+
+      # Ubuntu's valgrind package ships the client-request headers that the
+      # trace-check-secret shim needs at build time, as well as the binary.
+      - name: Install Valgrind
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y valgrind binutils
+          valgrind --version
+          test -f /usr/include/valgrind/memcheck.h
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Installs cargo-trace-check from this checkout's release archives, then
+      # runs the demo from examples/first-check with no --workspace-root and no
+      # --manifest-path, asserting verdicts, exit codes, the leak site, and that
+      # the analyzed insecure function still branches on the compared byte.
+      # --self-test proves that disassembly guard fails without read_volatile.
+      - name: Run the first-check demo and assert its outcomes
+        run: |
+          start=$(date +%s)
+          python3 ci/verify-first-check.py --self-test
+          echo "first-check job step wall-clock: $(( $(date +%s) - start )) s"
