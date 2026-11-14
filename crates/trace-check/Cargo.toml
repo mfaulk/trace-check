@@ -1,10 +1,15 @@
 [package]
 name = "trace-check"
-description = "Differential execution-trace analysis for secret-dependent control flow in compiled WASM"
+description = "Constant-time contract analysis for compiled Rust and WebAssembly"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish = false
+rust-version.workspace = true
+repository.workspace = true
+readme = "README.md"
+publish = ["crates-io"]
+keywords = ["constant-time", "side-channel", "security", "testing"]
+categories = ["cryptography", "development-tools::testing"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -20,4 +25,4 @@ wasmparser = "0.240"
 # generated harness calls, so they take the constants from the crate that
 # defines them rather than restating the strings.
 [dev-dependencies]
-trace-check-test = { path = "../trace-check-test" }
+trace-check-test = { path = "../trace-check-test", version = "=0.1.0" }

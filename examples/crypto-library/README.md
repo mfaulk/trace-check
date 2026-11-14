@@ -202,3 +202,9 @@ its inputs are named globals, the build uses no LTO, and the target is called
 through a laundered function pointer so cross-crate inlining cannot dissolve it.
 Every report records all of it and states that no production binary was
 analyzed. See [../../docs/MILESTONE-05.md](../../docs/MILESTONE-05.md).
+
+The deliberately vulnerable `substitute_indexed` control uses `#[inline(never)]`
+to keep its symbol distinct from forwarding attribution probes. This preserves
+the fixture's diagnostic identity; the secret-indexed load remains optimized.
+The leaky arm of `substitute_mode` consumes its result through `black_box` so a
+tail call cannot remove the caller from the diagnostic stack.

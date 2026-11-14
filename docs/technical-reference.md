@@ -62,16 +62,32 @@ See [docs/limitations.md](limitations.md) for the full boundary, and
 
 ### Troubleshooting inconclusive native checks
 
-A successful build does not establish that the analysis will complete. During
-README validation with Rust 1.97.0 and Valgrind 3.28.0, the bundled tag comparison
-and the standalone README example returned `INCONCLUSIVE` (exit 2): generated
-checks reported unattributed findings in `core::fmt`, and the hand-written test
-reported a finding at its assertion. The deliberately vulnerable
-`crypto::lookup::substitute_indexed` example also returned `INCONCLUSIVE` because
-its secret-binding control failed. The causes have not been established.
-These runs establish neither a clean result nor a confirmed violation of the
-annotated functions. Inspect the findings and control results before interpreting
-the summary; `INCONCLUSIVE` must remain a failing CI result.
+Inspect the findings and control results before interpreting the summary.
+`INCONCLUSIVE` must remain a failing CI result. Missing instrumentation, failed
+calibration, failed secret-binding controls, or findings that cannot be attributed
+to the declared function prevent a clean result.
+
+The runtime reloads returned values after declassification and generated harnesses
+reload secrets after marking. These barriers prevent the optimizer from reusing
+register copies with stale shadow state; regression tests exercise both clean
+comparisons and deliberately vulnerable scalar lookups. Calls use opaque function
+pointers to retain a target symbol. Compiler-merged function aliases can still
+make attribution inconclusive; the analyzer does not guess from an alias name.
+
+### Installed CLI and support crates
+
+Registry installations resolve the exact matching `trace-check-test` version for
+generated security harnesses; they do not require the project's source tree.
+Source builds use the sibling support crate. `TRACE_CHECK_TEST_PATH` overrides
+that dependency with a local package directory and is validated before building.
+
+Repository demonstrations (`trace-check demo`, `screen`, `native`, and
+`cargo trace-check verify` without `--contract`) need the bundled examples in a
+source checkout. For an installed binary, pass `--workspace-root /path/to/trace-check`.
+User-library `test`, `check`, and `verify --contract` operate on the selected
+library's manifest and do not require these bundled examples.
+
+See [publishing.md](publishing.md) for archive validation and release instructions.
 
 ## Why four backends: the gap each one closes
 

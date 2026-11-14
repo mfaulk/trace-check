@@ -40,7 +40,8 @@ cargo trace-check check --contract crypto::tag::verify_tag \
 ```
 
 The example also includes intentionally vulnerable functions for testing the
-checker. Keep the checkout: generated checks currently use its support crates.
+checker. Keep the checkout when using this source installation; its support
+crates are used by generated checks.
 See the [technical reference](docs/technical-reference.md#prerequisites) for
 backend-specific setup, including WebAssembly and symbolic analysis.
 
@@ -103,7 +104,7 @@ checks as ignored, since they need the analysis runner.
 | `LEAK_DETECTED` | A modeled secret-dependent branch or memory access was detected. |
 | `NO_LEAK_OBSERVED` | No modeled leak was seen for the inputs and paths tested. |
 | `VERIFIED_BOUNDED` | Symbolic analysis found no leak within the declared domain and bounds. |
-| [`INCONCLUSIVE`](docs/technical-reference.md#troubleshooting-inconclusive-native-checks) | The analysis could not establish a trustworthy result. |
+| `INCONCLUSIVE` | The analysis could not establish a trustworthy result. |
 
 Detected violations and incomplete analyses exit nonzero. Results apply to a
 particular compiled artifact and modeled observations, not
@@ -124,3 +125,6 @@ See the [technical reference](docs/technical-reference.md) for commands and
 development instructions, and the [audit adapter guide](docs/adapter-guide.md)
 for integrating another library. Research notes and development history live
 in [docs/](docs/).
+
+Release validation and the publishing procedure are in [docs/publishing.md](docs/publishing.md).
+Licensed under [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE).

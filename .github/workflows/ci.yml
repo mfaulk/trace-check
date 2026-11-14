@@ -186,6 +186,14 @@ jobs:
           TRACE_CHECK_REQUIRE_BACKEND: "1"
         run: cargo test --workspace --all-features --tests
 
+      - name: Validate API documentation
+        run: |
+          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+          cargo test --workspace --doc
+
+      - name: Validate release archives and installed CLI without publishing
+        run: python3 ci/verify-release.py
+
       # Tier 0 + Tier 1. The baseline gate is active because the baseline file
       # is committed, so a toolchain change that alters the compiled shape of a
       # screened function fails here rather than passing unnoticed.

@@ -1,42 +1,7 @@
-//! Write constant-time assertions as ordinary Rust tests.
-//!
-//! ```no_run
-//! use trace_check_test::{assert_constant_time, ct_test};
-//!
-//! # fn verify_tag(_: &[u8; 32], _: &[u8; 32]) -> bool { false }
-//! #[ct_test]
-//! fn verify_tag_is_constant_time() {
-//!     let supplied = [0u8; 32];
-//!
-//!     // The secret is passed by value; the closure receives it back as a
-//!     // reference the compiler cannot see through. See `analyze1` for why.
-//!     let accepted = assert_constant_time!(
-//!         secret = [0x42u8; 32],
-//!         call = |expected| verify_tag(expected, &supplied),
-//!     );
-//!     assert!(!accepted, "these inputs must be rejected");
-//! }
-//! ```
-//!
-//! Run the checks with `cargo trace-check test`. Plain `cargo test` still works
-//! and still passes, but prints that the constant-time check did **not** run —
-//! the analysis needs Valgrind, and a skipped check must never read as success.
-//!
-//! # What a passing test means
-//!
-//! That no modeled secret-dependent behavior was observed **on the paths this
-//! test exercised**, in one optimized binary, on one platform. It is not a
-//! proof of constant-time behavior for all inputs. [`Outcome::NoLeakObserved`]
-//! keeps that name deliberately.
-//!
-//! [`Outcome::NoLeakObserved`]: https://docs.rs/trace-check
-//!
-//! # Only some representations can be marked
-//!
-//! See [`MarkSecret`]. Marking a `Vec<u8>` would mark its pointer, length and
-//! capacity and not one byte of its heap buffer, so `Vec` is deliberately not
-//! supported; pass `vec.as_slice()`. A generic "mark anything" API would
-//! compile, run, and silently report no leak for data it never marked.
+//! Security checks run as ignored libtests through `cargo trace-check test`.
+//! Secrets must be owned by the analysis boundary so optimizer constant folding
+//! cannot bypass marked storage. Heap-indirect representations are unsupported;
+//! use a slice to mark the contents of a `Vec`.
 
 pub use trace_check_macros::{constant_time, ct_test};
 pub use trace_check_secret::RunMode;
@@ -161,8 +126,11 @@ pub fn launder<T>(value: T) -> T {
 /// Only the value's own bytes are restored. A heap-indirect return value may
 /// still carry marked bytes; that is out of scope for M3 and documented rather
 /// than silently handled.
-pub fn finish<T>(value: T) -> T {
+pub fn finish<T>(mut value: T) -> T {
     trace_check_secret::declassify(&value);
+    // The client request changes shadow memory, not Rust memory. Force a reload
+    // so the caller cannot reuse a register that still carries secret taint.
+    std::hint::black_box(&mut value);
     value
 }
 

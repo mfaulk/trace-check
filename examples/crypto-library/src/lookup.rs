@@ -30,6 +30,9 @@ pub fn substitute(index: u8) -> u8 {
 ///
 /// Every secret value executes the same instructions, so comparing instruction
 /// paths cannot see this. Only an address-aware analysis can.
+// Preserve this control's symbol: otherwise forwarding attribution probes can
+// be merged with its body and Valgrind may name a different function alias.
+#[inline(never)]
 #[constant_time(secret = "index")]
 pub fn substitute_indexed(index: u8) -> u8 {
     // SAFETY: the mask keeps the index inside the 16-byte table. Volatile so
@@ -48,6 +51,7 @@ pub fn substitute_mode(index: u8, mode: u8) -> u8 {
     if mode == 0 {
         substitute(index)
     } else {
-        substitute_indexed(index)
+        // Keep the caller in the diagnostic stack as well as the leaking callee.
+        core::hint::black_box(substitute_indexed(index))
     }
 }

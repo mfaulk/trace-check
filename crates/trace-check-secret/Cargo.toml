@@ -4,7 +4,12 @@ description = "Mark Rust data as secret for Valgrind Memcheck secret-dependency 
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish = false
+rust-version.workspace = true
+repository.workspace = true
+readme = "README.md"
+publish = ["crates-io"]
+keywords = ["constant-time", "side-channel", "security", "testing"]
+categories = ["cryptography", "development-tools::testing"]
 
 [build-dependencies]
 cc = "1"

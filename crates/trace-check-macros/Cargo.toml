@@ -4,7 +4,12 @@ description = "Attribute macros for trace-check constant-time contracts and test
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish = false
+rust-version.workspace = true
+repository.workspace = true
+readme = "README.md"
+publish = ["crates-io"]
+keywords = ["constant-time", "side-channel", "security", "testing"]
+categories = ["cryptography", "development-tools::testing"]
 
 [lib]
 proc-macro = true
