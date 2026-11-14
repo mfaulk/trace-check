@@ -1,5 +1,12 @@
 # cargo-trace-check
 
+**trace-check — Automated side-channel security analysis for Rust**
+
+An open-source security testing framework that detects secret-dependent control
+flow and memory accesses in compiled cryptographic software. Integrates dynamic
+analysis, generated regression tests, and bounded symbolic verification into
+Cargo and CI workflows.
+
 Check security properties declared with `#[constant_time]` annotations in Rust.
 Generated inputs and targeted tests detect secret-dependent branches and memory
 accesses in compiled code under Valgrind Memcheck.

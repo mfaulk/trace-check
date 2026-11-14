@@ -1,4 +1,9 @@
-# trace-check
+# trace-check — Automated side-channel security analysis for Rust
+
+An open-source security testing framework that detects secret-dependent control
+flow and memory accesses in compiled cryptographic software. Integrates dynamic
+analysis, generated regression tests, and bounded symbolic verification into
+Cargo and CI workflows.
 
 Analysis engine for constant-time contracts in compiled Rust and WebAssembly.
 It supports generated Memcheck checks, bounded relational verification with

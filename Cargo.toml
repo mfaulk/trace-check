@@ -14,6 +14,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
+description = "trace-check — Automated side-channel security analysis for Rust. An open-source security testing framework that detects secret-dependent control flow and memory accesses in compiled cryptographic software. Integrates dynamic analysis, generated regression tests, and bounded symbolic verification into Cargo and CI workflows."
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"

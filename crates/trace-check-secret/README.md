@@ -1,5 +1,12 @@
 # trace-check-secret
 
+**trace-check — Automated side-channel security analysis for Rust**
+
+An open-source security testing framework that detects secret-dependent control
+flow and memory accesses in compiled cryptographic software. Integrates dynamic
+analysis, generated regression tests, and bounded symbolic verification into
+Cargo and CI workflows.
+
 Low-level secret marking for Valgrind Memcheck. Marking makes secret bytes
 undefined in Memcheck's shadow state without changing their actual values.
 Secret-dependent branches and addresses can then produce diagnostics.

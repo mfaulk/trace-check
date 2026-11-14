@@ -1,6 +1,6 @@
 [package]
 name = "trace-check-secret"
-description = "Mark Rust data as secret for Valgrind Memcheck secret-dependency analysis"
+description.workspace = true
 version.workspace = true
 edition.workspace = true
 license.workspace = true

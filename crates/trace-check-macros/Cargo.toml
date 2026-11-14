@@ -1,6 +1,6 @@
 [package]
 name = "trace-check-macros"
-description = "Attribute macros for trace-check constant-time contracts and tests"
+description.workspace = true
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -43,6 +43,8 @@ def check_archive(path, destination, name, version):
     metadata = manifest["package"]
     assert metadata["name"] == name
     assert metadata["version"] == version
+    workspace = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["package"]
+    assert metadata["description"] == workspace["description"]
     assert metadata["license"] == "MIT OR Apache-2.0"
     assert metadata["repository"] == "https://github.com/mfaulk/trace-check"
     supported_rust = "1.88" if name == "trace-check-macros" else "1.97"

@@ -1,6 +1,6 @@
 [package]
 name = "trace-check-test"
-description = "Write constant-time assertions as ordinary Rust tests"
+description.workspace = true
 version.workspace = true
 edition.workspace = true
 license.workspace = true

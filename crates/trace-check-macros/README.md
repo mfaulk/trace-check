@@ -1,5 +1,12 @@
 # trace-check-macros
 
+**trace-check — Automated side-channel security analysis for Rust**
+
+An open-source security testing framework that detects secret-dependent control
+flow and memory accesses in compiled cryptographic software. Integrates dynamic
+analysis, generated regression tests, and bounded symbolic verification into
+Cargo and CI workflows.
+
 Attribute macros for `trace-check` constant-time contracts and security tests.
 Most users should depend on `trace-check-test`, which re-exports these macros
 along with the runtime support needed by analysis adapters.

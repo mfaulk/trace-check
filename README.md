@@ -1,21 +1,14 @@
-# trace-check
+# trace-check — Automated side-channel security analysis for Rust
 
-Declare security properties in Rust code and check them like unit tests.
-`trace-check` detects secret-dependent execution that can leak sensitive data
-through timing and cache side channels.
+An open-source security testing framework that detects secret-dependent control
+flow and memory accesses in compiled cryptographic software. Integrates dynamic
+analysis, generated regression tests, and bounded symbolic verification into
+Cargo and CI workflows.
 
-A function can return the right answer while revealing information about its
-inputs. Ordinary tests check the answer; `trace-check` examines how the optimized
-program executes. Annotate a function to identify its secret parameters, then
-run a Cargo command to check for branches and memory accesses that depend on
-those secrets. The checks can run in CI to catch regressions, and findings can
-be saved and replayed.
-
-The native checker generates inputs and analyzes compiled code with Valgrind
-Memcheck. You can also write targeted security tests, use BINSEC for bounded
-relational verification, or screen and compare WebAssembly execution. These
-methods check different aspects of execution; a passing test is not proof of
-constant-time security. The project is experimental.
+Declare security properties with annotations and check them like unit tests.
+Ordinary tests check the answer; `trace-check` examines how the optimized program
+executes. A passing check is scoped to its artifact and modeled observations,
+not proof of constant-time security. The project is experimental.
 
 ## Quick start
 

@@ -1,6 +1,6 @@
 [package]
 name = "cargo-trace-check"
-description = "Cargo subcommand running constant-time checks under Valgrind Memcheck"
+description.workspace = true
 version.workspace = true
 edition.workspace = true
 license.workspace = true

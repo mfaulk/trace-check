@@ -60,7 +60,10 @@ This script has no option to perform an upload.
 
 All five crates share version `0.1.0`, license `MIT OR Apache-2.0`, repository
 metadata. The CLI, engine, and runtime crates require Rust 1.97; the macro crate
-requires Rust 1.88 and is tested on that compiler. Each archive carries its own README and both
+requires Rust 1.88 and is tested on that compiler. The project description is
+inherited from
+`[workspace.package].description` so crate listings use the same wording as the
+README and GitHub repository. Each archive carries its own README and both
 license texts. Update copied license texts together if their contents change;
 the validator checks that they match the root copies.
 

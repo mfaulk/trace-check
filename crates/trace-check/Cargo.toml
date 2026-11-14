@@ -1,6 +1,6 @@
 [package]
 name = "trace-check"
-description = "Constant-time contract analysis for compiled Rust and WebAssembly"
+description.workspace = true
 version.workspace = true
 edition.workspace = true
 license.workspace = true
