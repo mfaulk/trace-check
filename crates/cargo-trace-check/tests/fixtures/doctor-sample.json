@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "tool": "cargo-trace-check",
+  "tool_version": "0.1.0",
+  "required_ok": true,
+  "checks": [
+    {
+      "id": "platform",
+      "requirement": "required",
+      "status": "ok",
+      "verdict": "pass",
+      "detail": "x86_64-linux",
+      "duration_ms": 0
+    },
+    {
+      "id": "rust",
+      "requirement": "required",
+      "status": "ok",
+      "verdict": "pass",
+      "detail": "rustc 1.97.0, cargo 1.97.0 (floor 1.97)",
+      "duration_ms": 0
+    },
+    {
+      "id": "valgrind",
+      "requirement": "required",
+      "status": "ok",
+      "verdict": "pass",
+      "detail": "3.28.0 (supported range >= 3.22.0, < 4.0.0)",
+      "duration_ms": 0
+    },
+    {
+      "id": "valgrind-headers",
+      "requirement": "required",
+      "status": "ok",
+      "verdict": "pass",
+      "detail": "/usr/include (from the prefix of `valgrind` on PATH)",
+      "duration_ms": 0
+    },
+    {
+      "id": "c-compiler",
+      "requirement": "required",
+      "status": "ok",
+      "verdict": "pass",
+      "detail": "cc: cc (GCC) 14.2.1",
+      "duration_ms": 0
+    },
+    {
+      "id": "self-test",
+      "requirement": "required",
+      "status": "ok",
+      "verdict": "pass",
+      "detail": "planted secret-dependent branch detected; constant-time control clean; calibration and secret binding confirmed",
+      "duration_ms": 0
+    },
+    {
+      "id": "llvm-tools",
+      "requirement": "optional",
+      "status": "ok",
+      "verdict": "pass",
+      "detail": "LLVM version 20.1.8-rust-1.97.0-stable",
+      "duration_ms": 0
+    },
+    {
+      "id": "container-runtime",
+      "requirement": "optional",
+      "status": "missing",
+      "verdict": "warn",
+      "detail": "neither podman nor docker is usable",
+      "remediation": "Install podman (`sudo apt-get install podman` / `sudo dnf install podman`) or Docker (needed only for `verify`)",
+      "duration_ms": 0
+    },
+    {
+      "id": "analyzer-image",
+      "requirement": "optional",
+      "status": "skipped",
+      "verdict": "skip",
+      "detail": "no container runtime to hold the image",
+      "remediation": "Install a container runtime first (see container-runtime)",
+      "duration_ms": 0
+    }
+  ]
+}

@@ -5,6 +5,7 @@
 //! the binary directly also works, which is what the integration tests do.
 
 mod discover;
+mod doctor;
 mod dynamic_adapter;
 mod report;
 mod run;
@@ -237,6 +238,17 @@ enum Command {
         #[arg(long, value_enum, default_value_t = Format::Text)]
         format: Format,
     },
+    /// Check that native analysis works on this machine before running any.
+    ///
+    /// Verifies the platform, Rust, Valgrind, its headers and a C compiler,
+    /// then builds a tiny harness and runs it under Memcheck: the planted
+    /// secret-dependent branch must be detected and the constant-time control
+    /// must stay clean. Also reports the optional `--explore` and `verify`
+    /// backends. Exits 0 when every required check passes, 1 otherwise.
+    Doctor {
+        #[arg(long, value_enum, default_value_t = Format::Text)]
+        format: Format,
+    },
     /// List the discovered checks and contracts without running them.
     List {
         /// List the compiler-derived contract inventory instead of the test
@@ -283,6 +295,7 @@ fn main() -> ExitCode {
 
 fn execute(cli: Cli) -> Result<u8, String> {
     match cli.command {
+        Command::Doctor { format } => Ok(doctor::run(matches!(format, Format::Json))),
         Command::Test {
             filter,
             format,

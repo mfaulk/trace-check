@@ -186,6 +186,36 @@ jobs:
           TRACE_CHECK_REQUIRE_BACKEND: "1"
         run: cargo test --workspace --all-features --tests
 
+      # M12.2: the preflight a user runs first must pass on this runner
+      # (Ubuntu 24.04, Valgrind 3.22), including its real Memcheck self-test.
+      - name: Doctor passes on the CI runner
+        run: |
+          set -euo pipefail
+          cargo build --locked --release -p cargo-trace-check
+          ./target/release/cargo-trace-check doctor
+          ./target/release/cargo-trace-check doctor --format json > doctor.json
+          python3 -c 'import json; r = json.load(open("doctor.json")); assert r["required_ok"] is True, r'
+
+      # And it must fail, naming the cause, when header discovery is broken.
+      # The binary is run directly so VALGRIND_INCLUDE reaches only doctor's
+      # own self-test build, not the build of the CLI.
+      - name: Doctor fails when Valgrind's headers are hidden
+        run: |
+          set -euo pipefail
+          empty="$(mktemp -d)"
+          status=0
+          VALGRIND_INCLUDE="$empty" ./target/release/cargo-trace-check doctor --format json \
+            > doctor-unhealthy.json || status=$?
+          test "$status" -eq 1
+          python3 - <<'EOF'
+          import json
+          report = json.load(open("doctor-unhealthy.json"))
+          checks = {check["id"]: check for check in report["checks"]}
+          assert report["required_ok"] is False, report
+          assert checks["valgrind-headers"]["status"] == "incompatible", checks
+          assert "VALGRIND_INCLUDE" in checks["self-test"]["detail"], checks["self-test"]
+          EOF
+
       - name: Validate API documentation
         run: |
           RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps

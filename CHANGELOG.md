@@ -9,6 +9,8 @@
   screening, and differential execution tracing.
 - Enforce declared analysis requirements in CI and retain replayable findings.
 - Include worked cryptographic audit adapters and documented analysis limits.
+- Check a machine's readiness with `cargo trace-check doctor`, which runs a real
+  Memcheck self-test and prints a fix for every missing prerequisite.
 
 Release preparation adds registry-compatible packages and installed-CLI checks.
 The initial release has not been published to crates.io.

@@ -184,6 +184,10 @@ Observed event counts for `early_exit_opaque`, by mismatch position:
 
 ## Prerequisites
 
+[`cargo trace-check doctor`](#doctor--check-that-native-analysis-works-here)
+checks the native prerequisites and the optional backends below, and prints a fix
+for each one that is missing.
+
 * **Rust** — pinned by [`rust-toolchain.toml`](../rust-toolchain.toml) (1.97.0,
   the `wasm32-unknown-unknown` target, and the `llvm-tools` component).
   `rustup` installs all three automatically.
@@ -235,6 +239,58 @@ Observed event counts for `early_exit_opaque`, by mismatch position:
   every other command.
 
 ## Commands
+
+### `doctor` — check that native analysis works here
+
+```sh
+cargo trace-check doctor
+cargo trace-check doctor --format json
+```
+
+Run it first on a new machine or CI image. It needs no project and analyzes
+nothing of yours. Each check reports `PASS`, `FAIL`, `WARN` or `SKIP`, and every
+check that does not pass prints a `fix:` line with the command to run.
+
+| Check | Required | Passes when |
+| --- | --- | --- |
+| `platform` | yes | the host is `x86_64-linux` |
+| `rust` | yes | `rustc` and `cargo` of the active toolchain are at least the declared `rust-version` (1.97) |
+| `valgrind` | yes | `valgrind --version` is at least `MIN_VALGRIND_VERSION` (3.22.0, CI's Ubuntu 24.04 release) and below 4.0. #34 settles the supported range; the constant in `crates/cargo-trace-check/src/doctor.rs` is the one place to change it |
+| `valgrind-headers` | yes | `valgrind/memcheck.h` is found in the same order `trace-check-secret/build.rs` searches: `VALGRIND_INCLUDE`, `pkg-config`, the prefix of the `valgrind` on `PATH`, `/usr/include` |
+| `c-compiler` | yes | `$CC` (or `cc`) runs |
+| `self-test` | yes | see below |
+| `llvm-tools` | no | the active toolchain has `llvm-profdata` and `llvm-cov` (for `check --explore`) |
+| `container-runtime` | no | podman or docker is usable (for `verify`) |
+| `analyzer-image` | no | a runtime holds the pinned BINSEC image (for `verify`) |
+
+The **self-test** builds a small harness in a temporary directory, with the
+same `trace-check-test` resolution (`TRACE_CHECK_TEST_PATH`, the sibling source
+crate, or the exact registry version) and release profile that generated
+harnesses use, then runs it under Memcheck. It passes only if all of these hold:
+
+* the planted secret-dependent branch (`doctor_planted_branch`) is reported,
+* the constant-time control (`doctor_constant_time_control`) produces no finding,
+* the calibration and secret-binding controls fire,
+* the process ran under Valgrind and completed.
+
+A machine with no headers still builds `trace-check-secret`, but as an inert
+shim that marks nothing; the self-test names that cause rather than reporting a
+generic failure. It runs whenever the platform, Rust, Valgrind and C compiler
+checks pass, and is skipped (and so fails) otherwise. It typically takes a few
+seconds; a cold build of the support crates is the slow part.
+
+Exit status: `0` when every required check passes, `1` when any required check
+fails. Optional checks only warn and never change the exit status. A usage error
+exits `2`.
+
+`--format json` prints one document. `schema_version` (currently `1`) changes on
+any incompatible change. `required_ok` mirrors the exit status. `checks` is a
+fixed-order array of objects with `id`, `requirement` (`required` | `optional`),
+`status` (`ok` | `missing` | `incompatible` | `skipped`), `verdict` (`pass` |
+`fail` | `warn` | `skip`), `detail`, `remediation` (absent when the check passes)
+and `duration_ms`. Two runs on one machine are identical apart from
+`duration_ms`. A sample is in
+`crates/cargo-trace-check/tests/fixtures/doctor-sample.json`.
 
 ### `check` — generated constant-time testing
 
@@ -1180,8 +1236,8 @@ modeled secret, and are git-ignored except for the compact fixtures under
 
 | Code | Meaning |
 | --- | --- |
-| `0` | `demo`: every declared expectation reproduced. `screen`: every declaration held and the census did not drift. `compare`: `NO_DIFFERENCE_OBSERVED`. `verify`: every selected case met its declared expectation. |
-| `1` | `demo`: an expectation was not reproduced. `screen`: a finding, an unmet declaration, or baseline drift. `compare`: `DIFFERENCE_DETECTED`. `verify`: a violation was found where none was expected. |
+| `0` | `demo`: every declared expectation reproduced. `screen`: every declaration held and the census did not drift. `compare`: `NO_DIFFERENCE_OBSERVED`. `verify`: every selected case met its declared expectation. `doctor`: every required check passed. |
+| `1` | `demo`: an expectation was not reproduced. `screen`: a finding, an unmet declaration, or baseline drift. `compare`: `DIFFERENCE_DETECTED`. `verify`: a violation was found where none was expected. `doctor`: a required check failed. |
 | `2` | Error or `INCONCLUSIVE`: missing backend, build failure, timeout, trap, unparseable trace, missing symbol, invalid case file. |
 
 A missing tool, a trap, a timeout, an oversized capture, an unknown export, a

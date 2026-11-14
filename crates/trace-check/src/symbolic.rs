@@ -619,7 +619,8 @@ pub enum RuntimeState {
     WithImage,
 }
 
-fn probe_runtime(tool: &str) -> RuntimeState {
+/// Whether `tool` is a usable container runtime and holds [`ANALYZER_IMAGE`].
+pub fn probe_runtime(tool: &str) -> RuntimeState {
     let usable = Command::new(tool)
         .arg("--version")
         .stdout(Stdio::null())

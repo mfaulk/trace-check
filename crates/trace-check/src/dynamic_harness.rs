@@ -186,6 +186,20 @@ fn test_dependency(
     }
 }
 
+/// The `trace-check-test` dependency stanza every generated security harness
+/// uses: [`TEST_CRATE_ENV`], else this build's sibling crate, else the exact
+/// registry version.
+///
+/// Public so `cargo trace-check doctor` builds its self-test against the same
+/// resolution a real run uses.
+pub fn test_crate_dependency() -> Result<String, DynamicError> {
+    let override_path = std::env::var_os(TEST_CRATE_ENV).map(PathBuf::from);
+    test_dependency(
+        override_path.as_deref(),
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+    )
+}
+
 /// Generates the harness source for one contract.
 ///
 /// Deterministic: the same contract and library produce the same bytes, which
@@ -762,11 +776,7 @@ pub fn build(
     // deliberately does not depend on it at all: a harness that cannot call
     // `mark` cannot be argued into having marked anything.
     let test_dependency = if harness.kind.marks_secrets() {
-        let override_path = std::env::var_os(TEST_CRATE_ENV).map(PathBuf::from);
-        test_dependency(
-            override_path.as_deref(),
-            Path::new(env!("CARGO_MANIFEST_DIR")),
-        )?
+        test_crate_dependency()?
     } else {
         String::new()
     };
