@@ -25,6 +25,15 @@ cargo test --workspace --lib --bins
 cargo install --path crates/cargo-trace-check --locked
 ```
 
+Confirm the machine can run native checks before analyzing anything:
+
+```sh
+cargo trace-check doctor
+```
+
+It checks each prerequisite, then runs a known-leaky and a known-clean probe under
+Memcheck. Every failing check prints the command that fixes it.
+
 Run the checker on a bundled authentication-tag comparison:
 
 ```sh

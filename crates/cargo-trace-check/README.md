@@ -13,6 +13,7 @@ accesses in compiled code under Valgrind Memcheck.
 
 ```sh
 cargo install cargo-trace-check --version 0.1.0 --locked
+cargo trace-check doctor
 cargo trace-check check --all-contracts --ci
 cargo trace-check test
 ```
@@ -26,6 +27,15 @@ Generated harnesses use the matching registry version of `trace-check-test`.
 `TRACE_CHECK_TEST_PATH` can override it for local development. Symbolic `verify`
 requires a container runtime and the pinned BINSEC image; standalone bundled
 cases additionally require a checkout passed through `--workspace-root`.
+
+`cargo trace-check doctor` checks these prerequisites, builds a small probe
+harness and runs it under Memcheck, and passes only if a planted
+secret-dependent branch is detected and a constant-time control stays clean. It
+also reports the optional `llvm-tools` (for `check --explore`) and container
+runtime plus pinned image (for `verify`). Every failing check prints a fix.
+It exits 0 when every required check passes and 1 otherwise; optional backends
+never fail it. `--format json` prints a versioned report (`schema_version`,
+`required_ok`, and per-check `status`, `verdict` and `remediation`).
 
 A passing dynamic check means no modeled leak was observed; it is not a proof
 of constant-time security.
