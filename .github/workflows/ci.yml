@@ -871,6 +871,9 @@ jobs:
           rustup toolchain install 1.88.0 --profile minimal
           rustup run 1.88.0 rustc --version
 
+      - name: Macro crate supports Rust 1.88 annotation consumers
+        run: cargo +1.88.0 test --locked -p trace-check-macros --lib
+
       # M5: contract verification against a real Cargo library. Includes
       # `the_verdict_follows_the_library_implementation`, which rewrites one
       # function body in a copy of the library and requires the verdict to flip

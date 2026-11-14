@@ -7,7 +7,9 @@ upload workflow.
 ## Validate a release
 
 Use the pinned Rust 1.97.0 toolchain and Python 3.11 or newer. Rust 1.97 is the
-minimum tested and declared supported compiler; earlier versions are not tested.
+minimum tested and declared supported compiler for the CLI and runtime crates.
+The annotation-only `trace-check-macros` crate supports Rust 1.88 so symbolic
+analysis can honor a library's older toolchain pin.
 Native smoke tests require Linux x86-64, a C compiler, Valgrind 3.28.0 or newer,
 and its client-request headers. Install the headers before compiling the support
 crates; set `VALGRIND_INCLUDE` if they are outside the discovered include paths.
@@ -57,7 +59,8 @@ This script has no option to perform an upload.
 ## Release contents
 
 All five crates share version `0.1.0`, license `MIT OR Apache-2.0`, repository
-metadata, and Rust support policy. Each archive carries its own README and both
+metadata. The CLI, engine, and runtime crates require Rust 1.97; the macro crate
+requires Rust 1.88 and is tested on that compiler. Each archive carries its own README and both
 license texts. Update copied license texts together if their contents change;
 the validator checks that they match the root copies.
 

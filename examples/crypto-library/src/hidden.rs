@@ -60,7 +60,7 @@ pub fn nested_modes(index: u8, stage: u8, gate: u8, trigger: u8) -> u8 {
     if trigger != 0x5a {
         return substitute(index);
     }
-    substitute_indexed(index)
+    core::hint::black_box(substitute_indexed(index))
 }
 
 /// Vulnerable behind an exact 32-bit public equality.
@@ -72,7 +72,7 @@ pub fn nested_modes(index: u8, stage: u8, gate: u8, trigger: u8) -> u8 {
 #[constant_time(secret = "index")]
 pub fn magic_gate(index: u8, token: u32) -> u8 {
     if token == MAGIC {
-        substitute_indexed(index)
+        core::hint::black_box(substitute_indexed(index))
     } else {
         substitute(index)
     }
@@ -88,7 +88,7 @@ pub fn magic_gate(index: u8, token: u32) -> u8 {
 #[constant_time(secret = "index")]
 pub fn threshold_window(index: u8, level: u32) -> u8 {
     if level >= THRESHOLD && level - THRESHOLD < WINDOW {
-        substitute_indexed(index)
+        core::hint::black_box(substitute_indexed(index))
     } else {
         substitute(index)
     }
@@ -107,7 +107,7 @@ pub fn secret_gated(key: u8, mode: u8) -> u8 {
         return substitute(key);
     }
     if key & 0xc0 == 0xc0 {
-        substitute_indexed(key)
+        core::hint::black_box(substitute_indexed(key))
     } else {
         substitute(key)
     }
@@ -170,5 +170,5 @@ pub fn header_gate(key: u8, header: &[u8; 8]) -> u8 {
     if header[7] != 0x7f {
         return substitute(key);
     }
-    substitute_indexed(key)
+    core::hint::black_box(substitute_indexed(key))
 }

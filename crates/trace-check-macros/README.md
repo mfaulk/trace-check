@@ -17,7 +17,7 @@ The annotation preserves the function body and emits a contract descriptor for
 the analyzer. `dynamic = false` omits the test adapter, allowing macro-only and
 `no_std` consumers; it does not itself verify the function.
 
-Requires Rust 1.97 or newer (the minimum tested version). Licensed under
+Requires Rust 1.88 or newer (the minimum tested version). Licensed under
 MIT OR Apache-2.0; see the included license files.
 
 See the [project README](https://github.com/mfaulk/trace-check#readme),

@@ -206,5 +206,6 @@ analyzed. See [../../docs/MILESTONE-05.md](../../docs/MILESTONE-05.md).
 The deliberately vulnerable `substitute_indexed` control uses `#[inline(never)]`
 to keep its symbol distinct from forwarding attribution probes. This preserves
 the fixture's diagnostic identity; the secret-indexed load remains optimized.
-The leaky arm of `substitute_mode` consumes its result through `black_box` so a
-tail call cannot remove the caller from the diagnostic stack.
+Leaky callers in `substitute_mode`, the hidden-path fixtures, and the forwarding
+attribution probe consume results through `black_box` so tail calls cannot remove
+the declared function from the diagnostic stack.

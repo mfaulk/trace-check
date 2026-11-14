@@ -45,7 +45,8 @@ def check_archive(path, destination, name, version):
     assert metadata["version"] == version
     assert metadata["license"] == "MIT OR Apache-2.0"
     assert metadata["repository"] == "https://github.com/mfaulk/trace-check"
-    assert metadata["rust-version"] == "1.97"
+    supported_rust = "1.88" if name == "trace-check-macros" else "1.97"
+    assert metadata["rust-version"] == supported_rust
     assert metadata["publish"] == ["crates-io"]
     assert (package / metadata["readme"]).is_file()
     for license_name in ("LICENSE-MIT", "LICENSE-APACHE"):
