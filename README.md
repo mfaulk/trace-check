@@ -106,7 +106,9 @@ every hardware timing effect. See [methodology](docs/methodology.md) and
 
 ## Examples and documentation
 
-Start with the [consumer crate](examples/consumer-crate/README.md) or
+For a first run on a standalone crate, with an insecure and a constant-time
+tag comparison side by side, see [first-check](examples/first-check/README.md).
+Then read the [consumer crate](examples/consumer-crate/README.md) or
 [cryptographic example library](examples/crypto-library/README.md). Practical
 audits cover [RustCrypto `crypto-bigint`](docs/audits/crypto-bigint/findings.md),
 [ML-KEM](docs/audits/ml-kem/findings.md), and
