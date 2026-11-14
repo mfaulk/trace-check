@@ -113,6 +113,12 @@ $ echo $?
 Demo wall-clock on the machine that generated this excerpt: 23 s (tests, both checks and the disassembly guard; CLI install excluded).
 <!-- END generated -->
 
+Measured in CI on `ubuntu-24.04` with apt Valgrind 3.22
+([run 43651977740](https://github.com/mfaulk/trace-check/actions/runs/43651977740)):
+63 s for the whole `--self-test` step, including packaging the release archives
+and installing the CLI from them. Of that, the demo itself (tests, both checks
+and the disassembly guard) took 16.6 s.
+
 ## What CI asserts
 
 `.github/workflows/demos.yml` runs `ci/verify-first-check.py --self-test`, which
