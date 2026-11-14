@@ -1,0 +1,18 @@
+# What each contract is expected to produce when this demo is checked.
+#
+# `tag_eq_ct` is an ordinary security contract: a leak in it fails the run.
+# `tag_eq_insecure` leaks on purpose, so it is declared an analyzer regression:
+# detecting its leak is the demo working. That declaration covers this one
+# function; nothing here disables enforcement for the other.
+schema_version = 1
+description = "First check: an insecure and a constant-time tag comparison."
+
+[check."first_check::tag_eq_insecure"]
+description = "insecure: returns at the first differing byte"
+rationale = "the volatile load keeps the per-byte branch after optimization, so how many bytes are compared depends on the secret tag"
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"
+
+[check."first_check::tag_eq_ct"]
+description = "constant-time: subtle::ConstantTimeEq folds all 16 bytes"
+rationale = "no early exit and no secret-dependent load"

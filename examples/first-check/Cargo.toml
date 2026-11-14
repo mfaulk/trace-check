@@ -1,0 +1,20 @@
+[package]
+name = "first-check"
+description = "A first trace-check run: an insecure and a constant-time tag comparison"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Its own workspace, so it is checked exactly as a user's crate would be: with
+# its own lockfile, from its own directory, by the installed CLI.
+[workspace]
+
+[dependencies]
+# Exact versions: a recorded result describes one compiled artifact, and a
+# caret requirement would let a patch release change it.
+subtle = { version = "=2.6.1", default-features = false }
+# A registry dependency, never a path into the checkout. Until the crates are
+# published (#35), ci/verify-first-check.py serves it from this checkout's
+# release archives through a `[patch.crates-io]` in a private CARGO_HOME.
+trace-check-test = "=0.1.0"

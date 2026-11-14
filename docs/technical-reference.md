@@ -1317,7 +1317,13 @@ ci/verify-workflow.py            refuses a CI step that selects a workspace
                                  package from inside an out-of-workspace example
 ci/mutations/                    the explicit patches those experiments apply
 docs/adapter-guide.md            writing an audit adapter for another library
+examples/first-check/            standalone intro demo: insecure vs constant-time
+                                 tag comparison, run by the installed CLI
+ci/verify-first-check.py         installs the CLI from release archives, runs that
+                                 demo, asserts verdicts, leak site and the branch
+                                 in the disassembly; --self-test, --write-readme
 .github/workflows/ci.yml         pinned Linux CI (M1-M3/M6-M9 job + M4/M5/M10 analyzer job)
+.github/workflows/demos.yml      demos on the installed CLI (examples/first-check)
 ```
 
 ## Development
