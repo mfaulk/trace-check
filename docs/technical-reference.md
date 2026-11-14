@@ -62,16 +62,32 @@ See [docs/limitations.md](limitations.md) for the full boundary, and
 
 ### Troubleshooting inconclusive native checks
 
-A successful build does not establish that the analysis will complete. During
-README validation with Rust 1.97.0 and Valgrind 3.28.0, the bundled tag comparison
-and the standalone README example returned `INCONCLUSIVE` (exit 2): generated
-checks reported unattributed findings in `core::fmt`, and the hand-written test
-reported a finding at its assertion. The deliberately vulnerable
-`crypto::lookup::substitute_indexed` example also returned `INCONCLUSIVE` because
-its secret-binding control failed. The causes have not been established.
-These runs establish neither a clean result nor a confirmed violation of the
-annotated functions. Inspect the findings and control results before interpreting
-the summary; `INCONCLUSIVE` must remain a failing CI result.
+Inspect the findings and control results before interpreting the summary.
+`INCONCLUSIVE` must remain a failing CI result. Missing instrumentation, failed
+calibration, failed secret-binding controls, or findings that cannot be attributed
+to the declared function prevent a clean result.
+
+The runtime reloads returned values after declassification and generated harnesses
+reload secrets after marking. These barriers prevent the optimizer from reusing
+register copies with stale shadow state; regression tests exercise both clean
+comparisons and deliberately vulnerable scalar lookups. Calls use opaque function
+pointers to retain a target symbol. Compiler-merged function aliases can still
+make attribution inconclusive; the analyzer does not guess from an alias name.
+
+### Installed CLI and support crates
+
+Registry installations resolve the exact matching `trace-check-test` version for
+generated security harnesses; they do not require the project's source tree.
+Source builds use the sibling support crate. `TRACE_CHECK_TEST_PATH` overrides
+that dependency with a local package directory and is validated before building.
+
+Repository demonstrations (`trace-check demo`, `screen`, `native`, and
+`cargo trace-check verify` without `--contract`) need the bundled examples in a
+source checkout. For an installed binary, pass `--workspace-root /path/to/trace-check`.
+User-library `test`, `check`, and `verify --contract` operate on the selected
+library's manifest and do not require these bundled examples.
+
+See [publishing.md](publishing.md) for archive validation and release instructions.
 
 ## Why four backends: the gap each one closes
 
@@ -333,10 +349,10 @@ backend, in opposite directions:
 | Fixture | `generated` | `symbolic` | Why |
 | --- | --- | --- | --- |
 | `cbaudit::hidden::magic_gate` | `NO_LEAK_OBSERVED` | `LEAK_DETECTED` | the leak sits behind an exact public-input equality: generated inputs never guess it, a solver solves for it |
-| `crypto::tag::verify_tag_early_exit` | `LEAK_DETECTED` | `VERIFIED_BOUNDED` | the dynamic backend's artifact keeps the per-byte branch; the symbolic backend's vectorizes it away |
+| `crypto::lookup::substitute_mode` (test-only restricted symbolic domain) | `LEAK_DETECTED` | `VERIFIED_BOUNDED` | generated inputs reach the leaking mode; symbolic verification explicitly assumes `TC_PUBLIC_MODE = 0`, the clean mode |
 
-Both are two honest answers about two compilations — which is why each result
-carries the hash of the executable it analyzed. A leak from a backend the
+These are answers about each backend's artifact and input domain — which is
+why reports retain both artifact hashes and symbolic domain restrictions. A leak from a backend the
 fixture declared *clean* is a real surprise and still fails: the declaration
 excuses only the finding it predicted. A fixture that declares nothing for a
 required analysis cannot pass it either, since there is no claim to reproduce.

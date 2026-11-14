@@ -24,12 +24,12 @@ use trace_check::symbolic::CaseFile;
 #[derive(Parser)]
 #[command(
     name = "cargo-trace-check",
-    about = "Run constant-time checks as ordinary Rust tests",
-    long_about = "Builds this package's tests with optimization and debug symbols, discovers \
+    about = env!("CARGO_PKG_DESCRIPTION"),
+    long_about = concat!(env!("CARGO_PKG_DESCRIPTION"), "\n\n", "Builds this package's tests with optimization and debug symbols, discovers \
                   #[ct_test] functions and #[constant_time] contracts, and runs each check in \
                   its own process under Valgrind Memcheck.\n\n\
                   A passing check means no modeled secret-dependent behavior was observed on \
-                  the paths the test exercised. It is not a proof of constant-time behavior."
+                  the paths the test exercised. It is not a proof of constant-time behavior.")
 )]
 struct Cli {
     #[command(subcommand)]

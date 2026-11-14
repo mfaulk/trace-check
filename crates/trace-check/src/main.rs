@@ -23,11 +23,11 @@ const EXIT_ERROR: u8 = 2;
 #[derive(Parser)]
 #[command(
     name = "trace-check",
-    about = "Detect secret-dependent execution paths by comparing WASM instruction traces",
-    long_about = "Compares the ordered instruction paths of a compiled WASM module across paired \
+    about = env!("CARGO_PKG_DESCRIPTION"),
+    long_about = concat!(env!("CARGO_PKG_DESCRIPTION"), "\n\n", "Compares the ordered instruction paths of a compiled WASM module across paired \
                   inputs that differ only in a modeled secret. Reports instruction-path \
                   equivalence only; it does not measure timing and cannot certify constant-time \
-                  behavior."
+                  behavior.")
 )]
 struct Cli {
     #[command(subcommand)]

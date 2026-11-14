@@ -26,7 +26,7 @@ supplied = "public-symbolic"
 
 [verify."crypto::tag::verify_tag_early_exit"]
 description = "educational: the naive early exit, which the compiler erased"
-rationale = "written with a per-byte branch, vectorized at opt-level 3 into the same branchless sequence as verify_tag. Declared VERIFIED_BOUNDED rather than manufacturing a leak -- the compiled code genuinely has none. Note that the M3 dynamic backend DOES report a branch here, because its build is a different artifact"
+rationale = "written with a per-byte branch, vectorized at opt-level 3 into the same branchless sequence as verify_tag. Both out-of-line analysis artifacts erase the branch; VERIFIED_BOUNDED is scoped to the symbolic domain and artifact"
 max_depth = 8000
 checks = ["control-flow", "memory-access"]
 expected_outcome = "VERIFIED_BOUNDED"
@@ -128,9 +128,9 @@ kind = "share-prefix"
 
 [check."crypto::tag::verify_tag_early_exit"]
 description = "educational: the naive early exit"
-rationale = "the symbolic backend reports VERIFIED_BOUNDED because its freestanding artifact vectorizes the per-byte branch away. This build is a different artifact and keeps the branch, so the dynamic backend finds it -- the same function, two honest answers about two compilations"
+rationale = "the out-of-line generated artifact vectorizes the per-byte branch away too; this educational fixture reports the compiled behavior rather than inferring a leak from source"
 expectation = "analyzer-regression"
-expected_outcome = "LEAK_DETECTED"
+expected_outcome = "NO_LEAK_OBSERVED"
 
 [check."crypto::tag::verify_tag_volatile_early_exit"]
 description = "vulnerable: an early exit the optimizer cannot vectorize"

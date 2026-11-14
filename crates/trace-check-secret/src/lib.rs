@@ -1,28 +1,7 @@
-//! Mark Rust data as secret for Valgrind Memcheck secret-dependency analysis.
-//!
-//! Memcheck tracks per-bit whether a value is *defined* and reports when an
-//! undefined value influences a conditional branch, a memory address, or a
-//! syscall argument. Marking a secret's shadow state as undefined turns that
-//! machinery into a leak detector: "undefined" stands in for "secret", and
-//! Memcheck's propagation through arithmetic, copies, registers and spills
-//! comes for free.
-//!
-//! Nothing is erased. [`Secret::new`] changes Memcheck's bookkeeping only; the
-//! real bytes stay readable and the program computes the same answers.
-//!
-//! # The two ways this goes wrong
-//!
-//! **Silent inactivity.** Outside Valgrind every client request is a no-op, so
-//! an uninstrumented run finds nothing — which must never be read as a pass.
-//! Call [`run_mode`] and refuse to interpret a clean result when it reports
-//! [`RunMode::Native`]. The analysis backend enforces this.
-//!
-//! **Missing declassification.** A secret-derived result that reaches
-//! `println!` or an assertion produces Memcheck findings inside `core::fmt`
-//! that have nothing to do with the function under test. Declassify outputs
-//! with [`declassify`] before ordinary use. The cost of forgetting is noise;
-//! the cost of over-declassifying is suppressed findings, so keep the sites
-//! few and explicit.
+//! Secret marking changes Memcheck shadow state without altering real bytes.
+//! Instrumentation must be confirmed with `run_mode`; native and unsupported
+//! runs establish no security result. Declassification affects storage, so
+//! callers must reload it before using a previously tainted register value.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -181,6 +160,9 @@ impl<T: ?Sized> fmt::Debug for Secret<'_, T> {
 /// Restores definedness for `value`, declassifying a secret-derived result so
 /// it can be printed, asserted on, or returned without producing findings that
 /// belong to the harness rather than the function under test.
+///
+/// This changes shadow memory, not previously loaded register copies. Use
+/// `trace_check_test::finish` for an owned result with an optimizer reload barrier.
 pub fn declassify<T: ?Sized>(value: &T) {
     let addr = value as *const T as *const u8 as *mut u8;
     let len = core::mem::size_of_val(value);

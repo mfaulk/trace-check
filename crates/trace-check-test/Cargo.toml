@@ -1,14 +1,19 @@
 [package]
 name = "trace-check-test"
-description = "Write constant-time assertions as ordinary Rust tests"
+description.workspace = true
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-publish = false
+rust-version.workspace = true
+repository.workspace = true
+readme = "README.md"
+publish = ["crates-io"]
+keywords = ["constant-time", "side-channel", "security", "testing"]
+categories = ["cryptography", "development-tools::testing"]
 
 [dependencies]
-trace-check-secret = { path = "../trace-check-secret" }
-trace-check-macros = { path = "../trace-check-macros" }
+trace-check-secret = { path = "../trace-check-secret", version = "=0.1.0" }
+trace-check-macros = { path = "../trace-check-macros", version = "=0.1.0" }
 
 [dev-dependencies]
 trybuild = "1"

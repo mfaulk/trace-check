@@ -10,5 +10,5 @@ use trace_check_macros::constant_time;
 /// target when `left::probe` was the contract under study.
 #[constant_time(secret = "key")]
 pub fn probe(key: u8) -> u8 {
-    crate::lookup::substitute_indexed(key)
+    core::hint::black_box(crate::lookup::substitute_indexed(key))
 }

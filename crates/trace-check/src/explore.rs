@@ -1,42 +1,7 @@
-//! Coverage-guided input discovery: typed mutations, a seed queue, and
-//! deterministic retention.
-//!
-//! Exploration answers *which inputs are worth analyzing?* and nothing else. It
-//! never classifies a finding, never marks a secret, and never produces an
-//! outcome. What it produces is a corpus, which [`crate::check`] then runs in
-//! the uninstrumented security artifact exactly as it runs M6's own corpus.
-//!
-//! # The baseline is never replaced
-//!
-//! Every case M6 would have generated is kept, and exploration adds to it. This
-//! is not politeness about backward compatibility: a coverage heuristic that
-//! displaced boundary cases would quietly stop finding the vulnerabilities
-//! boundary generation is good at, and the loss would show up as *less*
-//! security checking under a flag named for more.
-//!
-//! # Why mutation works here when random generation does not
-//!
-//! The fixtures in `examples/crypto-library/src/hidden.rs` guard a leak behind
-//! a conjunction over several public parameters. Random generation has to
-//! satisfy all of them at once; boundary and pairwise generation move one and
-//! two parameters away from base and so cannot satisfy three at any budget.
-//!
-//! Mutation does not have to. Satisfying the *first* predicate executes a
-//! region nothing else reached, so that input is retained as a seed, and the
-//! search for the second predicate starts from an input that already satisfies
-//! the first. The conjunction is climbed one conjunct at a time. That is the
-//! entire mechanism, and the M7.1 spike measured the gradient it depends on.
-//!
-//! # Determinism
-//!
-//! The retained corpus is a pure function of (descriptor, baseline corpus,
-//! explore seed, candidate budget, round size, discovery artifact). Mutation
-//! choices come from one `splitmix64` stream advanced in a fixed order over a
-//! queue whose order is itself fixed; coverage decoding is parallel but writes
-//! into per-case slots, so thread scheduling cannot reach the result. A
-//! wall-clock limit is the one thing that can cut a run short, and it is
-//! reported separately from the budget so a shorter run is visible rather than
-//! inferred.
+//! Discovery produces candidate inputs, never security outcomes. It retains
+//! every baseline case and adds mutations in a deterministic order; only an
+//! explicit wall-clock limit may truncate that order. Candidates are analyzed
+//! separately in the security artifact.
 
 use std::collections::{BTreeSet, HashSet};
 use std::fmt;
@@ -132,7 +97,7 @@ pub enum Operator {
     /// Replace one byte.
     ByteReplace,
     /// Substitute a value from the interesting-byte table at a fixed byte
-    /// position. The deterministic stage's operator; see [`State::propose`].
+    /// position. The deterministic stage's operator; see `State::propose`.
     Interesting,
     /// Replace a short run of bytes.
     RangeReplace,

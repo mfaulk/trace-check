@@ -1,21 +1,14 @@
-# trace-check
+# trace-check — Automated side-channel security analysis for Rust
 
-Declare security properties in Rust code and check them like unit tests.
-`trace-check` detects secret-dependent execution that can leak sensitive data
-through timing and cache side channels.
+An open-source security testing framework that detects secret-dependent control
+flow and memory accesses in compiled cryptographic software. Integrates dynamic
+analysis, generated regression tests, and bounded symbolic verification into
+Cargo and CI workflows.
 
-A function can return the right answer while revealing information about its
-inputs. Ordinary tests check the answer; `trace-check` examines how the optimized
-program executes. Annotate a function to identify its secret parameters, then
-run a Cargo command to check for branches and memory accesses that depend on
-those secrets. The checks can run in CI to catch regressions, and findings can
-be saved and replayed.
-
-The native checker generates inputs and analyzes compiled code with Valgrind
-Memcheck. You can also write targeted security tests, use BINSEC for bounded
-relational verification, or screen and compare WebAssembly execution. These
-methods check different aspects of execution; a passing test is not proof of
-constant-time security. The project is experimental.
+Declare security properties with annotations and check them like unit tests.
+Ordinary tests check the answer; `trace-check` examines how the optimized program
+executes. A passing check is scoped to its artifact and modeled observations,
+not proof of constant-time security. The project is experimental.
 
 ## Quick start
 
@@ -40,7 +33,8 @@ cargo trace-check check --contract crypto::tag::verify_tag \
 ```
 
 The example also includes intentionally vulnerable functions for testing the
-checker. Keep the checkout: generated checks currently use its support crates.
+checker. Keep the checkout when using this source installation; its support
+crates are used by generated checks.
 See the [technical reference](docs/technical-reference.md#prerequisites) for
 backend-specific setup, including WebAssembly and symbolic analysis.
 
@@ -103,7 +97,7 @@ checks as ignored, since they need the analysis runner.
 | `LEAK_DETECTED` | A modeled secret-dependent branch or memory access was detected. |
 | `NO_LEAK_OBSERVED` | No modeled leak was seen for the inputs and paths tested. |
 | `VERIFIED_BOUNDED` | Symbolic analysis found no leak within the declared domain and bounds. |
-| [`INCONCLUSIVE`](docs/technical-reference.md#troubleshooting-inconclusive-native-checks) | The analysis could not establish a trustworthy result. |
+| `INCONCLUSIVE` | The analysis could not establish a trustworthy result. |
 
 Detected violations and incomplete analyses exit nonzero. Results apply to a
 particular compiled artifact and modeled observations, not
@@ -124,3 +118,6 @@ See the [technical reference](docs/technical-reference.md) for commands and
 development instructions, and the [audit adapter guide](docs/adapter-guide.md)
 for integrating another library. Research notes and development history live
 in [docs/](docs/).
+
+Release validation and the publishing procedure are in [docs/publishing.md](docs/publishing.md).
+Licensed under [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE).

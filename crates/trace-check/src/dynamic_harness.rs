@@ -1,53 +1,6 @@
-//! Generating an ordinary Rust harness around a real library function, and
-//! running a batch of generated cases under Memcheck.
-//!
-//! This is M6's artifact source. Where [`crate::harness`] builds a freestanding
-//! `no_std` static ELF because BINSEC must not explore program startup, this
-//! module builds a **conventional** Rust binary: the existing Valgrind runtime
-//! is what consumes it, so there is nothing to gain from freestanding code and a
-//! `std` library to lose.
-//!
-//! # Two artifacts from one generator
-//!
-//! M7 added a second [`HarnessKind`]. The security harness marks the declared
-//! secrets and runs under Memcheck; the discovery harness marks nothing, writes
-//! one LLVM coverage profile per case, and exists only to find interesting
-//! inputs ([`crate::coverage`]).
-//!
-//! They come from the same generator rather than from two, because the part
-//! that must not diverge is the part a shared generator cannot diverge in: the
-//! decoders, the compile-time descriptor check, and the positional argument
-//! mapping. An input selected in one artifact is only worth running in the
-//! other if it means the same thing in both. Everything that *should* differ —
-//! marking, calibration, instrumentation, the dependency on
-//! `trace-check-test` — differs structurally, so neither artifact can be
-//! argued into having done the other's job.
-//!
-//! # What keeps the result about the real function
-//!
-//! **The harness contains no algorithm.** It decodes a generated corpus, marks
-//! the declared secret, calls the library, and declassifies the result.
-//!
-//! **The call is type-checked by rustc.** The generated call names the real
-//! parameter types in the real order, and the harness embeds the contract
-//! descriptor it was generated from and compares it against the library's own at
-//! compile time. A signature that moved does not compile.
-//!
-//! **Marking is bound to the storage the call receives.** Each case hands the
-//! bytes it is about to pass to
-//! [`trace_check_test::calibration::secret_binding_probe`]. Calibration alone
-//! cannot establish that: it marks its own byte and succeeds whether or not the
-//! developer's secret ever reached the function.
-//!
-//! # Why the target is *not* reified here
-//!
-//! M5 has to launder the target through a function pointer, because rustc marks
-//! small non-generic functions cross-crate-inlinable and a dissolved target
-//! leaves no symbol for the analyzer to start at. The M6.1 spike measured the
-//! dynamic case and found a plain cross-crate call keeps the target in the
-//! primary stack within [`crate::memcheck::ATTRIBUTION_DEPTH`], so the simpler
-//! form is used. A target that *is* inlined away shows up as a finding that
-//! cannot be attributed, which is reported rather than guessed at.
+//! Security and coverage harnesses share argument decoding and call mapping.
+//! Only the security harness marks secrets; coverage artifacts cannot establish
+//! a security result. Each harness checks its descriptor against the library.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -200,42 +153,36 @@ pub struct DynamicHarness {
     pub marked_bytes: u64,
 }
 
-/// Locates the `trace-check-test` package the generated harness depends on.
-///
-/// A generated harness needs the marking API, and the developer's library may
-/// not depend on it at all — an annotation-only consumer with
-/// `dynamic = false` deliberately does not. So the harness brings its own.
-///
-/// None of these crates is published yet, so the path is resolved from this
-/// build rather than from a registry. [`TEST_CRATE_ENV`] overrides it. When
-/// neither works the error says so instead of emitting a manifest that cannot
-/// resolve.
-pub fn test_crate_path() -> Result<PathBuf, DynamicError> {
-    if let Some(from_env) = std::env::var_os(TEST_CRATE_ENV) {
-        let path = PathBuf::from(from_env);
-        if path.join("Cargo.toml").is_file() {
-            return Ok(path);
-        }
-        return Err(DynamicError::TestCrateMissing {
-            tried: path.display().to_string(),
-            from_env: true,
-        });
-    }
-    // `crates/trace-check` -> `crates/trace-check-test`, which holds while the
-    // workspace layout does.
-    let sibling = Path::new(env!("CARGO_MANIFEST_DIR"))
+fn test_dependency(
+    override_path: Option<&Path>,
+    manifest_dir: &Path,
+) -> Result<String, DynamicError> {
+    let sibling = manifest_dir
         .parent()
-        .map(|crates| crates.join("trace-check-test"));
-    match sibling {
-        Some(path) if path.join("Cargo.toml").is_file() => Ok(path),
-        Some(path) => Err(DynamicError::TestCrateMissing {
-            tried: path.display().to_string(),
-            from_env: false,
-        }),
-        None => Err(DynamicError::TestCrateMissing {
-            tried: env!("CARGO_MANIFEST_DIR").to_string(),
-            from_env: false,
-        }),
+        .map(|dir| dir.join("trace-check-test"));
+    let path = match override_path {
+        Some(path) if !path.join("Cargo.toml").is_file() => {
+            return Err(DynamicError::TestCrateMissing {
+                tried: path.display().to_string(),
+                from_env: true,
+            });
+        }
+        Some(path) => Some(path.to_path_buf()),
+        None => sibling.filter(|path| path.join("Cargo.toml").is_file()),
+    };
+    match path {
+        Some(path) => {
+            let path = std::fs::canonicalize(&path)
+                .map_err(|error| DynamicError::Io(format!("{}: {error}", path.display())))?;
+            Ok(format!(
+                "[dependencies.trace-check-test]\npath = {:?}\n\n",
+                path.display().to_string()
+            ))
+        }
+        None => Ok(format!(
+            "[dependencies.trace-check-test]\nversion = \"={}\"\n\n",
+            env!("CARGO_PKG_VERSION")
+        )),
     }
 }
 
@@ -549,6 +496,14 @@ fn render_source(contract: &Contract, kind: HarnessKind) -> Result<String, Dynam
                 parameter.name
             ));
         }
+        // Reload through an opaque reference after marking: a scalar retained
+        // in a register before the client request still has public shadow state.
+        for parameter in descriptor.secrets() {
+            out.push_str(&format!(
+                "\x20   let {0} = *::trace_check_test::launder(&{0});\n",
+                parameter.name
+            ));
+        }
         // The binding control, over the bytes the call is about to receive.
         for parameter in descriptor.secrets() {
             let bytes = match &parameter.repr {
@@ -580,6 +535,19 @@ fn render_source(contract: &Contract, kind: HarnessKind) -> Result<String, Dynam
         .map(|parameter| format!("__guard_{}", parameter.name))
         .collect();
 
+    // An opaque function pointer preserves a target symbol for attribution,
+    // including small functions rustc would otherwise inline across crates.
+    let target = format!(
+        "std::hint::black_box({} as fn({}) -> {})",
+        contract.call_path(),
+        parameters
+            .iter()
+            .map(|parameter| parameter.repr.describe())
+            .collect::<Vec<_>>()
+            .join(", "),
+        descriptor.returns.describe()
+    );
+
     if discovery {
         // The call, then the profile, then the marker. The marker comes last so
         // a case credited as complete is one whose coverage was already on
@@ -590,7 +558,7 @@ fn render_source(contract: &Contract, kind: HarnessKind) -> Result<String, Dynam
                 "\x20   {}({});\n\
                  \x20   let written = write_profile(&format!(\"{{profile_dir}}/case-{{id}}.profraw\"));\n\
                  \x20   println!(\"{CASE_MARKER} {{nonce}} {{id}} produced=unit written={{written}}\");\n",
-                contract.call_path(),
+                target,
                 arguments.join(", ")
             )),
             _ => out.push_str(&format!(
@@ -599,7 +567,7 @@ fn render_source(contract: &Contract, kind: HarnessKind) -> Result<String, Dynam
                  \x20   // Consumed through a barrier so the call cannot be elided as dead.\n\
                  \x20   let produced = std::hint::black_box(produced);\n\
                  \x20   println!(\"{CASE_MARKER} {{nonce}} {{id}} produced={{}} written={{written}}\", produced as u64);\n",
-                contract.call_path(),
+                target,
                 arguments.join(", ")
             )),
         }
@@ -610,7 +578,7 @@ fn render_source(contract: &Contract, kind: HarnessKind) -> Result<String, Dynam
                     "\x20   {}({});\n\
                      \x20   drop(({},));\n\
                      \x20   println!(\"{CASE_MARKER} {{nonce}} {{id}} produced=unit\");\n",
-                    contract.call_path(),
+                    target,
                     arguments.join(", "),
                     guards.join(", ")
                 ));
@@ -623,7 +591,7 @@ fn render_source(contract: &Contract, kind: HarnessKind) -> Result<String, Dynam
                      \x20   // produce findings inside `core::fmt`.\n\
                      \x20   let produced = ::trace_check_test::finish(produced);\n\
                      \x20   println!(\"{CASE_MARKER} {{nonce}} {{id}} produced={{}}\", produced as u64);\n",
-                    contract.call_path(),
+                    target,
                     arguments.join(", "),
                     guards.join(", ")
                 ));
@@ -794,10 +762,11 @@ pub fn build(
     // deliberately does not depend on it at all: a harness that cannot call
     // `mark` cannot be argued into having marked anything.
     let test_dependency = if harness.kind.marks_secrets() {
-        format!(
-            "[dependencies.trace-check-test]\npath = {:?}\n\n",
-            test_crate_path()?.display().to_string()
-        )
+        let override_path = std::env::var_os(TEST_CRATE_ENV).map(PathBuf::from);
+        test_dependency(
+            override_path.as_deref(),
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+        )?
     } else {
         String::new()
     };
@@ -1279,7 +1248,7 @@ mod tests {
         assert!(
             harness
                 .source
-                .contains("crypto::lookup::substitute_mode(index, mode)"),
+                .contains("crypto::lookup::substitute_mode as fn(u8, u8) -> u8)(index, mode)"),
             "{}",
             harness.source
         );
@@ -1300,9 +1269,9 @@ mod tests {
         assert!(harness
             .source
             .contains("let expected: [u8; 16] = decode_bytes(fields[0], 16)?"));
-        assert!(harness
-            .source
-            .contains("crypto::tag::verify_tag(&expected, &supplied)"));
+        assert!(harness.source.contains(
+            "crypto::tag::verify_tag as fn(&[u8; 16], &[u8; 16]) -> bool)(&expected, &supplied)"
+        ));
         assert_eq!(harness.marked_bytes, 16);
         assert_eq!(harness.secret_parameters, vec!["expected"]);
     }
@@ -1435,7 +1404,9 @@ mod tests {
     fn a_unit_return_is_handled() {
         let json = r#"{"schema_version":1,"function":"absorb","parameters":[{"name":"value","position":0,"role":"secret","repr":"u32","rust_type":"u32"}],"returns":{"repr":"unit","rust_type":""}}"#;
         let harness = generate(&contract(json, "crypto::reduce", "absorb")).expect("generated");
-        assert!(harness.source.contains("crypto::reduce::absorb(value);"));
+        assert!(harness
+            .source
+            .contains("crypto::reduce::absorb as fn(u32) -> ())(value);"));
         assert!(harness.source.contains("produced=unit"));
         assert_eq!(harness.marked_bytes, 4);
     }
@@ -1634,12 +1605,41 @@ trace-check-run-complete: deadbeef cases=2
         assert!(error.to_string().contains("not a pass"), "{error}");
     }
 
-    /// The `trace-check-test` package is locatable from this build, which is
-    /// what the generated manifest depends on.
+    // Installed builds use the matching registry version without a source checkout.
+    #[test]
+    fn installed_harness_uses_a_versioned_registry_dependency() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let dependency = test_dependency(None, dir.path()).expect("registry dependency");
+        assert_eq!(
+            dependency,
+            format!(
+                "[dependencies.trace-check-test]\nversion = \"={}\"\n\n",
+                env!("CARGO_PKG_VERSION")
+            )
+        );
+    }
+
+    // An explicit development override takes precedence and must name a package.
+    #[test]
+    fn an_explicit_test_dependency_requires_a_manifest() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        assert!(test_dependency(Some(dir.path()), dir.path()).is_err());
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"trace-check-test\"\n",
+        )
+        .expect("manifest");
+        assert!(test_dependency(Some(dir.path()), dir.path())
+            .expect("path dependency")
+            .contains("path ="));
+    }
+
+    // Source checkouts use the sibling support crate for unpublished development changes.
     #[test]
     fn the_test_crate_is_locatable() {
-        let path = test_crate_path().expect("found");
-        assert!(path.join("Cargo.toml").is_file(), "{}", path.display());
+        let dependency =
+            test_dependency(None, Path::new(env!("CARGO_MANIFEST_DIR"))).expect("found");
+        assert!(dependency.contains("path ="), "{dependency}");
     }
 
     /// An override naming a directory without a manifest is an explicit error

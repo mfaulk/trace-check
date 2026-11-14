@@ -1,20 +1,6 @@
-//! M10.0: one contract, two backends, one invocation, one enforcement decision.
-//!
-//! The feasibility gate for unified verification. Every test here drives the
-//! real `crypto-bigint` audit library from M9 through
-//! [`trace_check::run_contract_coverage`], so the generated result comes from
-//! Valgrind over a generated corpus and the symbolic result comes from BINSEC
-//! over a bounded search — no mocked outcomes, because a mocked policy
-//! evaluator would prove nothing about whether the two backends can be
-//! scheduled and their evidence kept apart.
-//!
-//! The load-bearing assertion is not that the run passes. It is that the two
-//! results are bound to **different executables** and that neither can
-//! discharge the other's obligation.
-//!
-//! These tests skip when no container runtime or analyzer image is present, but
-//! `TRACE_CHECK_REQUIRE_SYMBOLIC=1` — which CI sets — turns a missing backend
-//! into a failure, so a skip can never be mistaken for a pass.
+//! Unified enforcement exercises real Memcheck and BINSEC runs, bound to their
+//! own artifacts and input domains. Missing analyzers may skip local tests;
+//! `TRACE_CHECK_REQUIRE_SYMBOLIC=1` makes missing backends fail in CI.
 
 use std::path::{Path, PathBuf};
 
@@ -479,30 +465,32 @@ fn a_fixture_may_declare_a_different_outcome_per_backend() {
     assert_no_blocking_reason_names(&report, DISAGREES);
 }
 
-/// The same disagreement inverted: generated testing finds the leak and
-/// symbolic verification does not.
-///
-/// `crypto::tag::verify_tag_early_exit` is written with a per-byte branch. The
-/// symbolic backend's freestanding artifact vectorizes it away and verifies
-/// bounded; the dynamic backend's artifact keeps the branch and finds it. Two
-/// honest answers about two compilations, which is why the artifact hashes are
-/// part of the evidence. A model that took the generated declaration as the
-/// contract's would have failed the symbolic result here.
+// Full-domain generated testing and mode-zero symbolic verification keep separate expectations.
 #[test]
 fn the_inverse_disagreement_is_enforced_too() {
     if !analyzer_available() {
         return;
     }
-    const INVERTED: &str = "crypto::tag::verify_tag_early_exit";
-    let base = std::fs::read_to_string(
-        workspace_root()
-            .join("examples/crypto-library")
-            .join(CONFIG_FILE),
-    )
-    .expect("the bundled configuration is committed");
+    const INVERTED: &str = "crypto::lookup::substitute_mode";
     let config = write_config(&format!(
-        "{base}\n[policy]\nmode = \"strict\"\ndefault_required = [\"generated\"]\n\n\
-         [policy.contracts.\"{INVERTED}\"]\nrequired = [\"generated\", \"symbolic\"]\n"
+        r#"schema_version = 1
+[check."{INVERTED}"]
+expectation = "analyzer-regression"
+expected_outcome = "LEAK_DETECTED"
+
+[verify."{INVERTED}"]
+max_depth = 8000
+checks = ["control-flow", "memory-access"]
+assumptions = ["TC_PUBLIC_MODE = 0"]
+expected_outcome = "VERIFIED_BOUNDED"
+
+[policy]
+mode = "strict"
+default_required = ["generated"]
+
+[policy.contracts."{INVERTED}"]
+required = ["generated", "symbolic"]
+"#
     ));
     let workspace = Workspace::ephemeral().expect("a private workspace");
     let library = Library::resolve(
@@ -530,12 +518,12 @@ fn the_inverse_disagreement_is_enforced_too() {
             .evidence_for(Analysis::Generated)
             .map(|e| e.outcome),
         Some(Outcome::LeakDetected),
-        "the dynamic artifact keeps the per-byte branch"
+        "generated inputs reach the leaking public mode"
     );
     assert_eq!(
         contract.evidence_for(Analysis::Symbolic).map(|e| e.outcome),
         Some(Outcome::VerifiedBounded),
-        "the symbolic artifact vectorizes it away"
+        "symbolic verification is bounded to the clean public mode"
     );
     for analysis in [Analysis::Generated, Analysis::Symbolic] {
         assert_eq!(
@@ -552,6 +540,15 @@ fn the_inverse_disagreement_is_enforced_too() {
     // reason they are allowed to disagree.
     let generated = contract.evidence_for(Analysis::Generated).expect("present");
     let symbolic = contract.evidence_for(Analysis::Symbolic).expect("present");
+    assert_eq!(
+        symbolic
+            .symbolic
+            .as_ref()
+            .expect("symbolic conditions")
+            .input_domain,
+        ["TC_PUBLIC_MODE = 0"],
+        "the clean result must retain its narrower domain"
+    );
     assert_ne!(generated.artifact_sha256, symbolic.artifact_sha256);
 }
 

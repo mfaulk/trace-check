@@ -1,5 +1,11 @@
 # Milestone 10 — Unified Multi-Backend Verification and CI Enforcement
 
+> Release-preparation update: the historical inverse-disagreement fixture
+> `crypto::tag::verify_tag_early_exit` now compiles branchlessly in both artifacts.
+> Its replacement test uses `crypto::lookup::substitute_mode`: generated testing
+> reaches the leaking mode while symbolic verification explicitly restricts its
+> domain to `TC_PUBLIC_MODE = 0`. The result retains that restriction in evidence.
+
 **Status:** Implemented. M10.0–M10.8 complete, with a review round recorded in
 §11; the outstanding items are in §13.
 **Branch:** `feat/m10-unified-verification`, then one branch per package

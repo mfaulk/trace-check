@@ -1,37 +1,7 @@
-//! Attribute macros for constant-time contracts and tests.
-//!
-//! Both macros are deliberately thin. Neither performs analysis — that is the
-//! runner's job — and `#[constant_time]` never alters the compiled body of the
-//! function it annotates.
-//!
-//! # Three properties the generated code is responsible for
-//!
-//! **Discovery must not execute ordinary tests.** Metadata is emitted by
-//! *separate* generated tests whose names begin with `__trace_check_`, so the
-//! runner can enumerate with libtest's `--list` and then execute only those.
-//! An earlier design ran every test in "list mode", which executed the
-//! consumer's whole unit-test suite during discovery.
-//!
-//! **An unrun check must not look like a passing test.** Generated tests carry
-//! `#[ignore]`, so plain `cargo test` reports them as `ignored` rather than
-//! `ok`. A developer must not see a green test for a security assertion that
-//! never ran.
-//!
-//! **A contract is only covered if its function was actually invoked.** A
-//! `target` is not a mere label: `#[constant_time]` emits a `#[cfg(test)]`
-//! counter and an `#[inline(never)]` adapter, and `#[ct_test(target = …)]`
-//! fails unless that counter advanced during the analyzed call. The adapter
-//! delegates to the untouched function, so the code being analyzed is the real
-//! one.
-//!
-//! **Symbolic verification needs the contract in a non-test build.** The
-//! adapter, the counter and the metadata test are M3's dynamic-coverage
-//! machinery and stay `#[cfg(test)]`. The *descriptor* — identity, parameter
-//! roles, representations and widths, read straight off the signature — is
-//! emitted unconditionally as `#[doc(hidden)]` string constants, because a
-//! verification harness links the ordinary library build. A `&'static str`
-//! const is not codegen'd unless something reads it, so a production build is
-//! unchanged.
+//! Contract annotations preserve the original function body. Ignored metadata
+//! tests allow discovery without executing ordinary tests; ignored security
+//! tests cannot silently pass under `cargo test`. Test adapters count actual
+//! contract invocations, while descriptors remain available in non-test builds.
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
@@ -47,7 +17,7 @@ use syn::{
 ///
 /// ```ignore
 /// #[constant_time(secret = "expected")]
-/// pub fn verify_tag(expected: &[u8; 32], supplied: &[u8; 32]) -> bool { … }
+/// pub fn verify_tag(expected: &[u8; 32], supplied: &[u8; 32]) -> bool { /* implementation */ }
 /// ```
 ///
 /// Emits:
@@ -313,7 +283,7 @@ const INVENTORY_SCHEMA: u16 = 1;
 ///
 /// # Why the text is private
 ///
-/// The record lives inside an anonymous `const _: () = { … }` block, so it is
+/// The record lives inside an anonymous `const _: () = { /* implementation */ }` block, so it is
 /// not exported in crate metadata. `lib.rmeta` sits in the same archive and
 /// carries no such section, which is what makes "find the section" an exact
 /// question rather than a byte search that could also match a copy of the text
@@ -386,7 +356,7 @@ fn inventory_record(
 ///
 /// ```ignore
 /// #[ct_test]
-/// fn tag_compare_is_constant_time() { … }
+/// fn tag_compare_is_constant_time() { /* implementation */ }
 ///
 /// #[ct_test(target = "verify_tag")]
 /// fn covers_the_contract() {

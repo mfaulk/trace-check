@@ -155,10 +155,10 @@ sequence as `verify_tag`, so the compiled code has no secret-dependent control
 flow and `VERIFIED_BOUNDED` is the honest verdict. It is kept rather than
 rewritten into a manufactured leak.
 
-The M3 dynamic backend **does** report a branch for the same function, because
-its build is a different artifact: the `memcheck` profile enables LTO and the
-loop survives. One source, two artifacts, two verdicts — which is exactly why
-every report pins the build it describes.
+The generated dynamic artifact also vectorizes this function after the harness
+preserves it as an out-of-line call, so its declared result is `NO_LEAK_OBSERVED`.
+Earlier harness shapes retained a branch; the fixture expectations track the
+current compiled artifact rather than assuming source-level control flow.
 
 `reduce_once` is the same lesson for arithmetic: the `if` became a conditional
 move.
@@ -202,3 +202,10 @@ its inputs are named globals, the build uses no LTO, and the target is called
 through a laundered function pointer so cross-crate inlining cannot dissolve it.
 Every report records all of it and states that no production binary was
 analyzed. See [../../docs/MILESTONE-05.md](../../docs/MILESTONE-05.md).
+
+The deliberately vulnerable `substitute_indexed` control uses `#[inline(never)]`
+to keep its symbol distinct from forwarding attribution probes. This preserves
+the fixture's diagnostic identity; the secret-indexed load remains optimized.
+Leaky callers in `substitute_mode`, the hidden-path fixtures, and the forwarding
+attribution probe consume results through `black_box` so tail calls cannot remove
+the declared function from the diagnostic stack.

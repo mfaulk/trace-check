@@ -1,31 +1,7 @@
-//! Building a verification artifact out of a real Cargo library.
-//!
-//! This is M5's second artifact source. Where M4 compiles one hand-written
-//! `no_std` file with `rustc`, this module generates a `no_std` harness
-//! *package*, takes the developer's library as an ordinary Cargo path
-//! dependency, and links the two into the same kind of freestanding static ELF
-//! the M4 engine already analyzes. The symbolic engine is untouched.
-//!
-//! # The three things that make the result about the real function
-//!
-//! **The harness contains no algorithm.** It declares symbolic globals, reads
-//! them, calls the library, and halts. Changing the library therefore changes
-//! the verdict, which is the standing regression that proves there is no copy.
-//!
-//! **The call is type-checked by rustc, not by this tool.** The generated call
-//! names the real parameter types in the real order, and the harness embeds the
-//! contract descriptor it was generated from and compares it against the
-//! library's own at compile time. A signature that changed under us does not
-//! compile.
-//!
-//! **The target is kept out of line on purpose.** rustc marks small
-//! non-generic functions cross-crate-inlinable by default, so a four-instruction
-//! library function dissolves into the harness and leaves no symbol at all —
-//! measured, not hypothesised. The harness therefore reifies the target as a
-//! function pointer and launders it through `black_box`, which forces a
-//! distinct callable instance to exist. The cost is recorded rather than
-//! hidden: the verified instance is an out-of-line copy, and a production
-//! caller that inlines the function gets code this run did not analyze.
+//! Verification harnesses call the real library through a type-checked,
+//! opaque function pointer and verify its contract descriptor at compile time.
+//! This preserves an out-of-line target for symbolic analysis; production code
+//! that inlines the function is a different artifact.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -229,7 +205,7 @@ impl Workspace {
 
     /// Target directory for M8's contract-inventory build.
     ///
-    /// Separate from [`Workspace::target_dir`] on purpose: the inventory build
+    /// Separate from `Workspace::target_dir` on purpose: the inventory build
     /// forces `lto = off`, because an LTO rlib holds bitcode and carries no
     /// ELF sections to read records from. Sharing a target directory with the
     /// analysis builds would mean each invalidating the other's cache on every
